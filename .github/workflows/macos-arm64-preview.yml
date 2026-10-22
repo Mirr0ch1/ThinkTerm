@@ -1,0 +1,75 @@
+name: macos arm64 preview
+
+# Builds an ad-hoc-signed ThinkTerm.app for Apple silicon from any branch, so a
+# change can be tried on a Mac without Apple Developer credentials. The release
+# workflow remains the one that signs with a Developer ID and notarizes; this
+# only has to produce something runnable.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Version tag stamped into the bundle
+        required: false
+        default: '0.2.9'
+
+jobs:
+  macos:
+    name: macos arm64
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
+      TAG_NAME: ${{ inputs.tag }}
+      CARGO_PROFILE: release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      # wezterm-version's build.rs prefers a .tag file over the version it
+      # derives from git, which is why the release workflow writes one too.
+      - name: Stamp version
+        run: echo "$TAG_NAME" > .tag
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          # wasm32 is for the browser client the packaging step builds.
+          targets: aarch64-apple-darwin,wasm32-unknown-unknown
+
+      - name: Install Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      # ci/build-web.sh refuses a wasm-bindgen CLI that does not match the
+      # crate the workspace pins, so the version is read from Cargo.toml
+      # rather than written here twice.
+      - name: Install wasm-bindgen
+        run: |
+          set -euo pipefail
+          version=$(grep -E '^wasm-bindgen = "=' Cargo.toml | sed -E 's/.*"=([0-9.]+)".*/\1/')
+          cargo install wasm-bindgen-cli --version "$version" --locked
+          wasm-bindgen --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-arm64-preview
+
+      - name: Install system deps
+        run: env CI=yes PATH=$PATH ./get-deps
+
+      - name: Build and package
+        run: bash ci/macos-package.sh --build --arch arm64 adhoc "$TAG_NAME"
+
+      - name: Upload the app
+        uses: actions/upload-artifact@v7
+        with:
+          name: ThinkTerm-macos-arm64
+          path: ThinkTerm-macos-*.zip
+          if-no-files-found: error
