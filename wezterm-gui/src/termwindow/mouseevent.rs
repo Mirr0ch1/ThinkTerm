@@ -9704,6 +9704,35 @@ impl super::TermWindow {
                     self.scroll_to_bottom(&pane);
                 }
 
+                // A link belongs to the terminal even when the application
+                // has grabbed the mouse. Programs such as OpenCode handle
+                // clicks themselves; over an SSH session their "open" would
+                // run on the remote host, where there is often no browser.
+                // Keep a plain click on a link here, and swallow its release
+                // so the application does not see half a click.
+                if self.hyperlink_press_claimed
+                    && matches!(event.kind, WMEK::Release(MousePress::Left))
+                {
+                    self.hyperlink_press_claimed = false;
+                    return;
+                }
+                if mouse_reporting
+                    && event.modifiers.is_empty()
+                    && matches!(event.kind, WMEK::Press(MousePress::Left))
+                    && matches!(
+                        &event_trigger_type,
+                        MouseEventTrigger::Down {
+                            streak: 1,
+                            button: MouseButton::Left,
+                        }
+                    )
+                    && self.current_highlight.is_some()
+                {
+                    self.hyperlink_press_claimed = true;
+                    self.do_open_link_at_mouse_cursor(&pane);
+                    return;
+                }
+
                 // normalize delta and streak to make mouse assignment
                 // easier to wrangle
                 match event_trigger_type {
