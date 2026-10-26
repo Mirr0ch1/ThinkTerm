@@ -1875,6 +1875,24 @@ impl WindowInner {
         set_view_rounded_clip(*self.view, radius);
     }
 
+    /// Reapply the window's corner radius to the surfaces that carry it.
+    /// `config_did_change` runs while the window is being built, before
+    /// AppKit has necessarily settled `_cornerRadius`; the same pass after
+    /// `show` picks up the real value.
+    fn refresh_window_corner_clip(&self) {
+        let radius = window_corner_radius(*self.window);
+        unsafe {
+            if let Some((glass, _)) = &self.glass {
+                let () = msg_send![**glass, setCornerRadius: radius];
+                set_view_rounded_clip(**glass, radius);
+            }
+            if let Some(backing) = &self.glass_backing {
+                set_view_rounded_clip(**backing, radius);
+            }
+        }
+        self.update_content_corner_clip();
+    }
+
     fn update_titlebar_background(&self) {
         unsafe {
             if let Some(titlebar_view_container) = get_titlebar_view_container(&self.window) {
@@ -1990,6 +2008,9 @@ impl WindowInner {
 
             self.window.makeKeyAndOrderFront_(nil);
             self.update_titlebar_background();
+            // Now that the window is on screen, AppKit has its real corner
+            // radius; apply it to the glass and the content view.
+            self.refresh_window_corner_clip();
         }
         // A window that opens out of sight -- on another Space, behind a
         // full-screen app -- never changes occlusion state, so no
@@ -2463,7 +2484,7 @@ impl WindowInner {
         self.apply_decorations();
         // After `apply_decorations`: it decides whether the content view is
         // full-window, which is when the window's rounded corners apply to it.
-        self.update_content_corner_clip();
+        self.refresh_window_corner_clip();
     }
 }
 
