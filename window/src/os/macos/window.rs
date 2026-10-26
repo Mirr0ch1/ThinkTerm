@@ -820,6 +820,27 @@ fn window_corner_radius(window: id) -> CGFloat {
     }
 }
 
+/// Clip `view` and everything it hosts to the window's rounded corners.
+///
+/// `NSGlassEffectView` rounds its own material, but its content view is a
+/// separate surface and is not clipped by that shape by default: the terminal
+/// then shows square corners inside the rounded glass. The effect view keeps
+/// the radius on its layer, so making the layer mask is enough for the glass
+/// and for the blur it can sit on.
+fn clip_view_to_rounded_corners(view: id, radius: CGFloat) {
+    if radius <= 0.0 {
+        return;
+    }
+    unsafe {
+        let _: () = msg_send![view, setWantsLayer: YES];
+        let layer: id = msg_send![view, layer];
+        if !layer.is_null() {
+            let () = msg_send![layer, setCornerRadius: radius];
+            let () = msg_send![layer, setMasksToBounds: YES];
+        }
+    }
+}
+
 fn function_key_to_keycode(function_key: char) -> KeyCode {
     // FIXME: CTRL-C is 0x3, should it be normalized to C here
     // using the unmod string?  Or should be normalize the 0x3
@@ -1890,10 +1911,12 @@ impl WindowInner {
             }
             if let Some(look) = look {
                 let frame = NSView::frame(*self.view);
+                let radius = window_corner_radius(*self.window);
                 let glass: id = msg_send![class!(NSGlassEffectView), alloc];
                 let glass = StrongPtr::new(msg_send![glass, initWithFrame: frame]);
                 let () = msg_send![*glass, setStyle: look.style];
-                let () = msg_send![*glass, setCornerRadius: window_corner_radius(*self.window)];
+                let () = msg_send![*glass, setCornerRadius: radius];
+                clip_view_to_rounded_corners(*glass, radius);
                 let () = msg_send![
                     *glass,
                     setAutoresizingMask: NSViewHeightSizable | NSViewWidthSizable
@@ -1906,6 +1929,7 @@ impl WindowInner {
                     let () = msg_send![*backing, setBlendingMode: 0isize];
                     let () = msg_send![*backing, setState: 1isize];
                     let () = msg_send![*backing, setMaterial: 21isize];
+                    clip_view_to_rounded_corners(*backing, radius);
                     let () = msg_send![
                         *backing,
                         setAutoresizingMask: NSViewHeightSizable | NSViewWidthSizable
