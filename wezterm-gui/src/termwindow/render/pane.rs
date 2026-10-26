@@ -76,9 +76,34 @@ fn visible_render_columns(
     requested_cols.min((visible_width / cell_width).floor().max(0.0) as usize)
 }
 
+/// How far a pane nav bar's content sits below the centre of its band.
+///
+/// A pane along the window's top edge has the window's top padding below its
+/// nav bar, between the bar and the first terminal row. Centring the pill in
+/// the bar alone leaves that padding entirely underneath it, so the pill reads
+/// as sitting too high. Give half of it to the top, inside the bar's own
+/// padding, and the space above and below the pill match. Panes below the top
+/// edge have no such padding; a terminal bar lifts the top panes' bars above
+/// it, and their rows start at its edge instead.
+fn pane_nav_content_inset(
+    pane_top: usize,
+    lift: f32,
+    padding_top: f32,
+    nav_height: usize,
+    button_size: usize,
+) -> usize {
+    if pane_top != 0 || lift > 0.0 {
+        return 0;
+    }
+    let room = nav_height.saturating_sub(button_size) / 2;
+    ((padding_top * 0.5).round().max(0.0) as usize).min(room)
+}
+
 #[cfg(test)]
 mod pane_geometry_tests {
-    use super::{clamp_pane_horizontal_span, visible_render_columns};
+    use super::{
+        clamp_pane_horizontal_span, pane_nav_content_inset, visible_render_columns,
+    };
 
     #[test]
     fn stale_pane_geometry_stops_at_the_sidebar_edge() {
@@ -107,6 +132,23 @@ mod pane_geometry_tests {
         assert_eq!(visible_render_columns(100, 354.0, 802.0, 10.0), 44);
         assert_eq!(visible_render_columns(30, 354.0, 802.0, 10.0), 30);
         assert_eq!(visible_render_columns(100, 900.0, 802.0, 10.0), 0);
+    }
+
+    #[test]
+    fn only_a_top_pane_without_a_lifted_bar_balances_the_top_padding() {
+        // A 60px bar with a 40px pill has 10px of room above and below the
+        // pill. 17px of window padding below the bar makes the band 77px and
+        // its true centre 18.5px from either edge; rounding the half padding
+        // up gives 19px above and 18px below.
+        assert_eq!(pane_nav_content_inset(0, 0.0, 17.0, 60, 40), 9);
+        // Panes below the top have no window padding between them.
+        assert_eq!(pane_nav_content_inset(1, 0.0, 17.0, 60, 40), 0);
+        // A terminal bar at the top already supplies the separation.
+        assert_eq!(pane_nav_content_inset(0, 24.0, 17.0, 60, 40), 0);
+        // Never move the pill out of its own bar.
+        assert_eq!(pane_nav_content_inset(0, 0.0, 200.0, 60, 40), 10);
+        // A bar squeezed to less than a pill has no room to give.
+        assert_eq!(pane_nav_content_inset(0, 0.0, 17.0, 30, 40), 0);
     }
 }
 
@@ -295,6 +337,17 @@ impl crate::TermWindow {
         ))
     }
 
+    /// How far a top pane's nav bar paints and takes clicks below its own
+    /// height: the window's top padding separates the bar from the first
+    /// terminal row, and belongs to the header's band rather than showing as
+    /// terminal ground with the pill at one edge of it.
+    fn pane_nav_top_band_extra(&self, pos: &PositionedPane) -> f32 {
+        if pos.top != 0 || self.pane_nav_lift(pos) > 0.0 {
+            return 0.0;
+        }
+        self.padding_left_top().1.max(0.0)
+    }
+
     /// Horizontal span (x, width) of a pane's chrome: the cell-aligned
     /// content only covers `cols * cell_width`, so extend outward to the
     /// window/sidebar edges (absorbing padding and the column remainder)
@@ -423,7 +476,7 @@ impl crate::TermWindow {
                 ground.min_x(),
                 pane_y - self.pane_nav_lift(pos),
                 ground.width(),
-                nav_height,
+                nav_height + self.pane_nav_top_band_extra(pos),
             )
         };
         let mut rects = Vec::with_capacity(2);
@@ -1054,10 +1107,11 @@ impl crate::TermWindow {
         let muted_fg = chrome.secondary_text;
         let tab_fg = if pos.is_active { foreground } else { muted_fg };
 
+        let band_height = nav_height as f32 + self.pane_nav_top_band_extra(pos);
         self.filled_rectangle(
             layers,
             0,
-            euclid::rect(pane_x, pane_y, pane_width, nav_height as f32),
+            euclid::rect(pane_x, pane_y, pane_width, band_height),
             background,
         )
         .context("pane nav background")?;
@@ -1066,7 +1120,7 @@ impl crate::TermWindow {
             x: pane_x.max(0.0) as usize,
             y: pane_y.max(0.0) as usize,
             width: pane_width.max(0.0) as usize,
-            height: nav_height,
+            height: band_height.ceil() as usize,
             item_type: UIItemType::PaneNav {
                 pane_id: pos.pane.pane_id(),
                 pane_index: pos.index,
@@ -1077,8 +1131,18 @@ impl crate::TermWindow {
         let (icon_size, action_icon_size, button_size) = self.pane_nav_button_metrics(nav_height);
         // Centred, like the collapsed strip and the window tab row above. It
         // used to carry a 4px downward nudge, which left 12px of air over the
-        // capsule and 4 under it — the row read as sagging.
-        let button_y = pane_y as usize + nav_height.saturating_sub(button_size) / 2;
+        // capsule and 4 under it — the row read as sagging. A top pane's window
+        // padding lies below this bar; see `pane_nav_content_inset`.
+        let (_, padding_top) = self.padding_left_top();
+        let content_inset = pane_nav_content_inset(
+            pos.top,
+            self.pane_nav_lift(pos),
+            padding_top,
+            nav_height,
+            button_size,
+        );
+        let button_y =
+            pane_y as usize + nav_height.saturating_sub(button_size) / 2 + content_inset;
         let mut button_x = (pane_x + pane_width) as usize;
         let mut actions = vec![
             (SvgIcon::Plus, PaneNavAction::NewTab),
