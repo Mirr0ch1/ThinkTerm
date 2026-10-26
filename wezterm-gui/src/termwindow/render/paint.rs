@@ -767,6 +767,52 @@ pub(crate) fn sticky_allow_images(
     }
 }
 
+/// Where the visible ink of the bottom quote starts.
+///
+/// The quote lives in the gutter below the last row. Centring its line box
+/// there is not enough: when the gutter is shorter than the line box -- which
+/// the default half-cell bottom padding is, for a quote set smaller than the
+/// terminal -- the box is pushed down and its glyphs are clipped by the window
+/// edge. Centre the *ink* in the gutter, and when it cannot fit with
+/// `bottom_margin` to spare, move it up so that margin survives and the quote
+/// overlaps the line box of the last row rather than being cut off.
+fn bottom_quote_ink_top(
+    grid_bottom: f32,
+    content_bottom: f32,
+    ink_height: f32,
+    bottom_margin: f32,
+) -> f32 {
+    let gutter = (content_bottom - grid_bottom).max(0.0);
+    if gutter >= ink_height + bottom_margin * 2.0 {
+        grid_bottom + (gutter - ink_height) / 2.0
+    } else {
+        (content_bottom - bottom_margin - ink_height).max(0.0)
+    }
+}
+
+#[cfg(test)]
+mod bottom_quote_tests {
+    use super::bottom_quote_ink_top;
+
+    #[test]
+    fn a_quote_with_room_is_centred_in_the_gutter() {
+        assert_eq!(bottom_quote_ink_top(100.0, 200.0, 20.0, 4.0), 140.0);
+    }
+
+    #[test]
+    fn a_quote_that_just_fits_keeps_its_bottom_margin() {
+        // 20px of gutter, 20px of ink: centring would leave no room below,
+        // so it moves up by the margin and overlaps the last line's box.
+        assert_eq!(bottom_quote_ink_top(100.0, 120.0, 20.0, 4.0), 96.0);
+    }
+
+    #[test]
+    fn a_quote_that_cannot_fit_is_not_pushed_below_the_window() {
+        assert_eq!(bottom_quote_ink_top(100.0, 110.0, 20.0, 4.0), 86.0);
+        assert_eq!(bottom_quote_ink_top(0.0, 10.0, 30.0, 4.0), 0.0);
+    }
+}
+
 impl crate::TermWindow {
     fn paint_frontend_handoff_overlay(
         &mut self,
@@ -3712,8 +3758,9 @@ impl crate::TermWindow {
         let quote_font = self
             .fonts
             .command_palette_font_with_size_and_weight(quote_font_size, 500)?;
+        let quote_font_metrics = quote_font.metrics();
         let quote_metrics =
-            crate::utilsprites::RenderMetrics::with_font_metrics(&quote_font.metrics());
+            crate::utilsprites::RenderMetrics::with_font_metrics(&quote_font_metrics);
         let quote_height = quote_metrics.cell_size.height as f32;
 
         let inset = 10.0;
@@ -3731,7 +3778,30 @@ impl crate::TermWindow {
             .measure_text_width(&quote_font, &display_text)
             .min(max_width);
         let x = (grid_left + self.terminal_size.pixel_width as f32 - inset - text_width).max(0.0);
-        let y = (grid_bottom + ((gutter_height - quote_height) / 2.0).max(0.0)).max(0.0);
+
+        // The line box carries leading above the glyphs, so centring it alone
+        // leaves the quote reading low in the gutter. Centre the ink instead
+        // where the font tells us enough to measure it; scripts whose ink is
+        // taller than their capitals keep the conservative line box.
+        let descender = quote_font_metrics.descender.get() as f32;
+        let (ink_height, ink_top_offset) = match quote_font_metrics
+            .cap_height
+            .map(|height| height.get() as f32)
+            .filter(|_| quote.is_ascii())
+        {
+            Some(cap_height) => (
+                (cap_height - descender).max(1.0),
+                (quote_height + descender - cap_height).max(0.0),
+            ),
+            None => (quote_height, 0.0),
+        };
+        let ink_top = bottom_quote_ink_top(
+            grid_bottom,
+            content_bottom,
+            ink_height,
+            self.ui_px(4) as f32,
+        );
+        let y = (ink_top - ink_top_offset).max(0.0);
         // Opaque, and deliberately so. These carried `.mul_alpha(0.46)` and
         // `.mul_alpha(0.38)`, but the glyph shader discarded a vertex alpha
         // until it was fixed to honour one, so the quote has always rendered
