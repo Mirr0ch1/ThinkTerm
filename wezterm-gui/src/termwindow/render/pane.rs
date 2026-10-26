@@ -20,7 +20,7 @@ use crate::termwindow::ui::tokens::{
     PANE_NAV_ACTION_ICON_SIZE, PANE_NAV_BUTTON_GAP, PANE_NAV_ICON_GAP, PANE_NAV_INSET,
     PANE_NAV_TAB_GAP, PANE_NAV_TAB_RADIUS, TAB_CLOSE_HOVER_INSET, TAB_CLOSE_HOVER_RADIUS,
     TAB_CONTENT_INSET, TAB_ICON_CIRCLE_INSET, TAB_ICON_GLYPH_RATIO, TAB_ICON_SIZE,
-    TAB_VERTICAL_PADDING,
+    TAB_VERTICAL_PADDING, TERMINAL_GRID_CORNER_RADIUS,
 };
 use crate::termwindow::{PaneNavAction, ScrollHit, ScrollTrack, UIItem, UIItemType};
 use crate::ui::draw::DrawContext;
@@ -97,9 +97,21 @@ fn pane_nav_content_inset(
     ((padding_top * 0.5).round().max(0.0) as usize).min(room)
 }
 
+/// Whether a program has painted both the top and bottom edges of its grid
+/// with a background of its own. A shell prompt can colour the top-left
+/// corner; requiring the bottom edge as well keeps its first glyph out of a
+/// corner mask, while a TUI whose rightmost cells are not represented in the
+/// local line width still rounds.
+fn painted_grid_corners(corners: [bool; 4]) -> bool {
+    (corners[0] || corners[1]) && (corners[2] || corners[3])
+}
+
 #[cfg(test)]
 mod pane_geometry_tests {
-    use super::{clamp_pane_horizontal_span, pane_nav_content_inset, visible_render_columns};
+    use super::{
+        clamp_pane_horizontal_span, painted_grid_corners, pane_nav_content_inset,
+        visible_render_columns,
+    };
 
     #[test]
     fn stale_pane_geometry_stops_at_the_sidebar_edge() {
@@ -128,6 +140,18 @@ mod pane_geometry_tests {
         assert_eq!(visible_render_columns(100, 354.0, 802.0, 10.0), 44);
         assert_eq!(visible_render_columns(30, 354.0, 802.0, 10.0), 30);
         assert_eq!(visible_render_columns(100, 900.0, 802.0, 10.0), 0);
+    }
+
+    #[test]
+    fn only_a_painted_surface_is_rounded() {
+        assert!(!painted_grid_corners([false, false, false, false]));
+        // A prompt or a one-off coloured cell must not lose its glyph.
+        assert!(!painted_grid_corners([true, false, false, false]));
+        assert!(!painted_grid_corners([true, true, false, false]));
+        // Top and bottom edges painted: a background that reaches both.
+        assert!(painted_grid_corners([true, false, true, false]));
+        assert!(painted_grid_corners([true, true, true, false]));
+        assert!(painted_grid_corners([true, true, true, true]));
     }
 
     #[test]
@@ -2298,6 +2322,7 @@ impl crate::TermWindow {
             struct LineRender<'a, 'b> {
                 scroll_px: f32,
                 pane_clip: QuadClipRect,
+                clip_rect: RectF,
                 row_count: usize,
                 cut_rows: usize,
                 term_window: &'a mut crate::TermWindow,
@@ -2330,6 +2355,9 @@ impl crate::TermWindow {
                 double_width_rows: Vec<StableRowIndex>,
                 /// The selection's corners are rounded (the setting).
                 selection_rounded: bool,
+                /// The program has painted the grid's corners with a
+                /// background of its own: round the painted surface.
+                grid_round_corners: bool,
                 error: Option<anyhow::Error>,
             }
 
@@ -2386,20 +2414,27 @@ impl crate::TermWindow {
             // Cut at the pane area's bottom too: a window tab row brought down
             // pushes the rows lower, and the last of them go under a terminal
             // bar at the bottom rather than through it.
-            let pane_clip = QuadClipRect::from_top_left_pixels(
+            let clip_rect = euclid::rect(
                 left_pixel_x,
                 content_top,
-                left_pixel_x
-                    + render_dims.cols as f32 * pane_render_metrics.cell_size.width as f32,
+                render_dims.cols as f32 * pane_render_metrics.cell_size.width as f32,
                 (pane_top_pixel_y
                     + render_dims.viewport_rows as f32
                         * pane_render_metrics.cell_size.height as f32)
-                    .min(self.pane_area_bottom()),
+                    .min(self.pane_area_bottom())
+                    - content_top,
+            );
+            let pane_clip = QuadClipRect::from_top_left_pixels(
+                clip_rect.min_x(),
+                clip_rect.min_y(),
+                clip_rect.max_x(),
+                clip_rect.max_y(),
                 &self.dimensions,
             );
             let mut render = LineRender {
                 scroll_px,
                 pane_clip,
+                clip_rect,
                 row_count,
                 cut_rows,
                 term_window: self,
@@ -2429,6 +2464,7 @@ impl crate::TermWindow {
                 layers,
                 double_width_rows: vec![],
                 selection_rounded: crate::native_settings::selection_rounded(),
+                grid_round_corners: false,
                 error: None,
             };
 
@@ -2731,6 +2767,30 @@ impl crate::TermWindow {
 
             impl<'a, 'b> WithPaneLines for LineRender<'a, 'b> {
                 fn with_lines_mut(&mut self, stable_top: StableRowIndex, lines: &mut [&mut Line]) {
+                    // A full-screen TUI paints its own background into the
+                    // grid's corner cells. Only then round the painted surface:
+                    // a shell's prompt starts at the top-left cell and must not
+                    // have its first glyph covered by a corner mask.
+                    let cols = self.dims.cols;
+                    if cols >= 2 && lines.len() >= 2 {
+                        let last = lines.len() - 1;
+                        let painted = |line_idx: usize, col: usize| {
+                            lines
+                                .get(line_idx)
+                                .and_then(|line| line.get_cell(col))
+                                .is_some_and(|cell| {
+                                    cell.attrs().background() != ColorAttribute::Default
+                                })
+                        };
+                        let corners = [
+                            painted(0, 0) || painted(0, 1),
+                            painted(0, cols - 1) || painted(0, cols - 2),
+                            painted(last, 0) || painted(last, 1),
+                            painted(last, cols - 1) || painted(last, cols - 2),
+                        ];
+                        self.grid_round_corners = painted_grid_corners(corners);
+                    }
+
                     self.term_window
                         .find_pending_paste(self.pane_id, stable_top, lines, self.dims.cols);
                     let spans = self.selection_spans(stable_top, lines);
@@ -2785,6 +2845,61 @@ impl crate::TermWindow {
                             return;
                         }
                     }
+                }
+            }
+
+            impl<'a, 'b> LineRender<'a, 'b> {
+                /// Round the painted grid after its text and cursor, when the
+                /// program has filled the corners with a background of its
+                /// own. The corner wedges have their alpha cleared, so a
+                /// see-through window shows the glass behind them instead of a
+                /// painted approximation of it.
+                fn paint_grid_corner_masks(&mut self) -> anyhow::Result<()> {
+                    if !self.grid_round_corners
+                        || !self.term_window.chrome_see_through()
+                        || !self.term_window.window_background.is_empty()
+                    {
+                        return Ok(());
+                    }
+                    let cell = self.render_metrics.cell_size;
+                    let width = self.dims.cols as f32 * cell.width as f32;
+                    let height = self.dims.viewport_rows as f32 * cell.height as f32;
+                    if width <= 0.0 || height <= 0.0 {
+                        return Ok(());
+                    }
+                    let grid = euclid::rect(self.left_pixel_x, self.top_pixel_y, width, height);
+                    let visible = grid
+                        .intersection(&self.clip_rect)
+                        .and_then(|grid| {
+                            grid.intersection(&self.term_window.terminal_content_rect())
+                        })
+                        .unwrap_or(grid);
+                    if visible.is_empty() {
+                        return Ok(());
+                    }
+                    let Some(gl_state) = self.term_window.render_state.as_ref() else {
+                        return Ok(());
+                    };
+                    let erase = gl_state.layer_for_zindex(
+                        crate::termwindow::TERMINAL_CORNER_ERASE_ZINDEX,
+                    )?;
+                    let mut erase_layers = erase.quad_allocator();
+                    let ctx = DrawContext::new(
+                        gl_state,
+                        self.term_window.dimensions,
+                        &self.render_metrics,
+                    );
+                    let radius = ctx.px(TERMINAL_GRID_CORNER_RADIUS);
+                    ctx.draw_rounded_preview_chrome(
+                        &mut erase_layers,
+                        2,
+                        visible,
+                        self.clip_rect,
+                        LinearRgba::with_srgba(255, 255, 255, 255),
+                        LinearRgba::TRANSPARENT,
+                        radius,
+                    )
+                    .context("erase terminal grid corner wedges")
                 }
             }
 
@@ -2851,6 +2966,7 @@ impl crate::TermWindow {
                     content_bottom,
                 )?;
             }
+            render.paint_grid_corner_masks()?;
             if let Some(generation) = output_generation {
                 render
                     .term_window
