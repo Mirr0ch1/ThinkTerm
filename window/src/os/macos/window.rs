@@ -820,6 +820,25 @@ fn window_corner_radius(window: id) -> CGFloat {
     }
 }
 
+/// Clip `view` and everything it hosts to the window's rounded corners, or
+/// stop clipping it when `radius` is zero.
+///
+/// `NSGlassEffectView` rounds its own material, but its content view is a
+/// separate surface and is not clipped by that shape by default: the terminal
+/// then shows square corners inside the rounded glass. A see-through window
+/// without the glass has the same problem, so the content view itself is
+/// clipped to the radius the window reports.
+fn set_view_rounded_clip(view: id, radius: CGFloat) {
+    unsafe {
+        let _: () = msg_send![view, setWantsLayer: YES];
+        let layer: id = msg_send![view, layer];
+        if !layer.is_null() {
+            let () = msg_send![layer, setCornerRadius: radius.max(0.0)];
+            let () = msg_send![layer, setMasksToBounds: if radius > 0.0 { YES } else { NO }];
+        }
+    }
+}
+
 fn function_key_to_keycode(function_key: char) -> KeyCode {
     // FIXME: CTRL-C is 0x3, should it be normalized to C here
     // using the unmod string?  Or should be normalize the 0x3
@@ -1837,6 +1856,25 @@ impl WindowInner {
         }
     }
 
+    /// A see-through window lets the desktop show through the corners unless
+    /// its content follows the window's rounded shape. AppKit rounds the frame
+    /// but does not always clip the full-size content view underneath it; the
+    /// terminal then showed square corners inside the rounded window. Clip the
+    /// content view while the window is see-through, and let it square up again
+    /// when it is opaque or no longer draws full-size content.
+    fn update_content_corner_clip(&self) {
+        let full_size = unsafe {
+            NSWindow::styleMask(*self.window)
+                .contains(NSWindowStyleMask::NSFullSizeContentViewWindowMask)
+        };
+        let radius = if full_size && self.config.window_background_opacity < 1.0 {
+            window_corner_radius(*self.window)
+        } else {
+            0.0
+        };
+        set_view_rounded_clip(*self.view, radius);
+    }
+
     fn update_titlebar_background(&self) {
         unsafe {
             if let Some(titlebar_view_container) = get_titlebar_view_container(&self.window) {
@@ -1890,10 +1928,12 @@ impl WindowInner {
             }
             if let Some(look) = look {
                 let frame = NSView::frame(*self.view);
+                let radius = window_corner_radius(*self.window);
                 let glass: id = msg_send![class!(NSGlassEffectView), alloc];
                 let glass = StrongPtr::new(msg_send![glass, initWithFrame: frame]);
                 let () = msg_send![*glass, setStyle: look.style];
-                let () = msg_send![*glass, setCornerRadius: window_corner_radius(*self.window)];
+                let () = msg_send![*glass, setCornerRadius: radius];
+                set_view_rounded_clip(*glass, radius);
                 let () = msg_send![
                     *glass,
                     setAutoresizingMask: NSViewHeightSizable | NSViewWidthSizable
@@ -1906,6 +1946,7 @@ impl WindowInner {
                     let () = msg_send![*backing, setBlendingMode: 0isize];
                     let () = msg_send![*backing, setState: 1isize];
                     let () = msg_send![*backing, setMaterial: 21isize];
+                    set_view_rounded_clip(*backing, radius);
                     let () = msg_send![
                         *backing,
                         setAutoresizingMask: NSViewHeightSizable | NSViewWidthSizable
@@ -2420,6 +2461,9 @@ impl WindowInner {
         self.update_window_background_blur();
         self.update_titlebar_background();
         self.apply_decorations();
+        // After `apply_decorations`: it decides whether the content view is
+        // full-window, which is when the window's rounded corners apply to it.
+        self.update_content_corner_clip();
     }
 }
 
