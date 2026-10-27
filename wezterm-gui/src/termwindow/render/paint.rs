@@ -805,25 +805,16 @@ fn gate_message(gate: &wezterm_client::domain::RemoteFrontendGate) -> Option<(St
 
 /// Where the visible ink of the bottom quote starts.
 ///
-/// The quote lives in the gutter below the last row. Centring its line box
-/// there is not enough: when the gutter is shorter than the line box -- which
-/// the default half-cell bottom padding is, for a quote set smaller than the
-/// terminal -- the box is pushed down and its glyphs are clipped by the window
-/// edge. Centre the *ink* in the gutter, and when it cannot fit with
-/// `bottom_margin` to spare, move it up so that margin survives and the quote
-/// overlaps the line box of the last row rather than being cut off.
-fn bottom_quote_ink_top(
-    grid_bottom: f32,
-    content_bottom: f32,
-    ink_height: f32,
-    bottom_margin: f32,
-) -> f32 {
-    let gutter = (content_bottom - grid_bottom).max(0.0);
-    if gutter >= ink_height + bottom_margin * 2.0 {
-        grid_bottom + (gutter - ink_height) / 2.0
-    } else {
-        (content_bottom - bottom_margin - ink_height).max(0.0)
-    }
+/// The quote lives in the gutter below the last row, but that gutter is only
+/// what the terminal grid left over: it grows by whole cells as the window
+/// grows and shrinks back when a row is added. Measuring the quote from the
+/// grid therefore makes it step up and down in cell-sized jumps while the
+/// window edge is dragged, instead of following the edge. Anchor the ink to
+/// the window's bottom edge, with a small margin, so it tracks the edge pixel
+/// for pixel. When the gutter is shorter than the quote, the ink rises over
+/// the last row's line box instead of being pushed out of the window.
+fn bottom_quote_ink_top(content_bottom: f32, ink_height: f32, bottom_margin: f32) -> f32 {
+    (content_bottom - bottom_margin - ink_height).max(0.0)
 }
 
 #[cfg(test)]
@@ -831,21 +822,23 @@ mod bottom_quote_tests {
     use super::bottom_quote_ink_top;
 
     #[test]
-    fn a_quote_with_room_is_centred_in_the_gutter() {
-        assert_eq!(bottom_quote_ink_top(100.0, 200.0, 20.0, 4.0), 140.0);
+    fn a_quote_sits_a_margin_above_the_window_bottom() {
+        assert_eq!(bottom_quote_ink_top(200.0, 20.0, 4.0), 176.0);
     }
 
     #[test]
-    fn a_quote_that_just_fits_keeps_its_bottom_margin() {
-        // 20px of gutter, 20px of ink: centring would leave no room below,
-        // so it moves up by the margin and overlaps the last line's box.
-        assert_eq!(bottom_quote_ink_top(100.0, 120.0, 20.0, 4.0), 96.0);
+    fn the_quote_follows_the_bottom_edge_pixel_for_pixel() {
+        // The terminal grid stops in whole rows, so its bottom moves in
+        // cell-sized steps. The quote must move with the window edge, not
+        // with the grid: one pixel of window is one pixel of quote.
+        assert_eq!(bottom_quote_ink_top(200.0, 20.0, 4.0), 176.0);
+        assert_eq!(bottom_quote_ink_top(199.0, 20.0, 4.0), 175.0);
     }
 
     #[test]
     fn a_quote_that_cannot_fit_is_not_pushed_below_the_window() {
-        assert_eq!(bottom_quote_ink_top(100.0, 110.0, 20.0, 4.0), 86.0);
-        assert_eq!(bottom_quote_ink_top(0.0, 10.0, 30.0, 4.0), 0.0);
+        assert_eq!(bottom_quote_ink_top(10.0, 20.0, 4.0), 0.0);
+        assert_eq!(bottom_quote_ink_top(0.0, 20.0, 4.0), 0.0);
     }
 }
 
@@ -3835,12 +3828,7 @@ impl crate::TermWindow {
             ),
             None => (quote_height, 0.0),
         };
-        let ink_top = bottom_quote_ink_top(
-            grid_bottom,
-            content_bottom,
-            ink_height,
-            self.ui_px(4) as f32,
-        );
+        let ink_top = bottom_quote_ink_top(content_bottom, ink_height, self.ui_px(4) as f32);
         let y = (ink_top - ink_top_offset).max(0.0);
         // Opaque, and deliberately so. These carried `.mul_alpha(0.46)` and
         // `.mul_alpha(0.38)`, but the glyph shader discarded a vertex alpha
