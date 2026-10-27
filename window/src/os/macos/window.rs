@@ -1381,9 +1381,12 @@ impl WindowOps for Window {
             let _pool = NSAutoreleasePool::new(nil);
             let panel: id = msg_send![class!(NSOpenPanel), openPanel];
             let panel = StrongPtr::retain(panel);
-            let () = msg_send![*panel, setCanChooseFiles: options.allow_files as BOOL];
-            let () = msg_send![*panel, setCanChooseDirectories: options.allow_directories as BOOL];
-            let () = msg_send![*panel, setAllowsMultipleSelection: options.multiple as BOOL];
+            let can_files: BOOL = if options.allow_files { YES } else { NO };
+            let can_directories: BOOL = if options.allow_directories { YES } else { NO };
+            let multiple: BOOL = if options.multiple { YES } else { NO };
+            let () = msg_send![*panel, setCanChooseFiles: can_files];
+            let () = msg_send![*panel, setCanChooseDirectories: can_directories];
+            let () = msg_send![*panel, setAllowsMultipleSelection: multiple];
             let () = msg_send![*panel, setCanCreateDirectories: NO];
             let () = msg_send![*panel, setResolvesAliases: YES];
             let title = nsstring(&options.title);
