@@ -1669,6 +1669,17 @@ remote-files-listing-refused = L’hôte distant n’a pas pu lister les fichier
 remote-files-listing-too-large = La liste des fichiers distants est trop grande
 download-completed = Téléchargement terminé
 download-completed-body = Téléchargé dans { $path }
+download-card-preparing = Préparation…
+download-card-canceling = Annulation…
+download-card-failed = Échec du téléchargement
+download-card-saved-to = Enregistré dans { $path }
+download-card-items = { $count ->
+        [one] { $count } élément
+       *[other] { $count } éléments
+    }
+download-open-file = Ouvrir le fichier
+download-open-folder = Ouvrir le dossier
+download-open-downloads = Ouvrir le dossier de téléchargement
 
 ## Why a plugin's ask was not done. Plugins show these as they are.
 plugin-answer-no-terminal = aucun terminal à côté du panneau

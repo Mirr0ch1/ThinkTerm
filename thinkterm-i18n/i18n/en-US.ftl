@@ -1675,6 +1675,17 @@ remote-files-listing-refused = The remote host could not list files: { $detail }
 remote-files-listing-too-large = The remote file listing is too large
 download-completed = Download completed
 download-completed-body = Downloaded { $path }
+download-card-preparing = Preparing…
+download-card-canceling = Canceling…
+download-card-failed = Download failed
+download-card-saved-to = Saved to { $path }
+download-card-items = { $count ->
+        [one] { $count } item
+       *[other] { $count } items
+    }
+download-open-file = Open File
+download-open-folder = Open Folder
+download-open-downloads = Open Download Folder
 
 ## Why a plugin's ask was not done. Plugins show these as they are.
 plugin-answer-no-terminal = no terminal is beside the panel

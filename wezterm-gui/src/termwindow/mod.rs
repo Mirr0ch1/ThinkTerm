@@ -879,6 +879,12 @@ pub enum UIItemType {
     /// A row in the transfer strip. Clicking cancels it while it runs and
     /// dismisses it once it has finished.
     RightSidebarRemoteTransfer(u64),
+    /// A control on the floating download card: cancel a running transfer,
+    /// dismiss a finished one, or open what it downloaded.
+    DownloadCardCancel(u64),
+    DownloadCardDismiss(u64),
+    DownloadCardOpen(u64),
+    DownloadCardOpenDownloads(u64),
     /// The area a plugin's panel draws in: the pointer and the wheel over it
     /// go to the panel's player.
     RightSidebarPluginPanel,
@@ -2147,6 +2153,7 @@ pub fn tooltip_label_for(item_type: &UIItemType) -> Option<String> {
         UIItemType::WorkspaceSidebarSshHosts => "tooltip-sidebar-ssh-hosts",
         UIItemType::WorkspaceSidebarLiveOverview => "tooltip-sidebar-live-overview",
         UIItemType::WorkspaceSidebarNotifications => "tooltip-sidebar-notifications",
+        UIItemType::DownloadCardDismiss(_) => "right-dismiss",
         UIItemType::RightSidebarAgent(crate::agent_status::AgentPanelAction::ViewOptions) => {
             "tooltip-sidebar-view-options"
         }
@@ -3498,6 +3505,9 @@ pub struct TermWindow {
     /// its own lease and must outlive the panel switching between trees.
     right_sidebar_remote_transfers: Vec<remote_files::RemoteTransfer>,
     right_sidebar_remote_transfer_next_id: u64,
+    /// Downloads that have stopped, held for the floating card after the
+    /// transfer row may already have been trimmed out of the strip.
+    download_toasts: Vec<render::download_card::DownloadToast>,
     /// The directory a file drag is currently hovering over, so the row can be
     /// highlighted and the drop knows where it would land.
     right_sidebar_remote_drop_target: Option<remote_files::RemotePath>,
@@ -5268,6 +5278,7 @@ impl TermWindow {
             right_sidebar_remote_files_lease: None,
             right_sidebar_remote_transfers: Vec::new(),
             right_sidebar_remote_transfer_next_id: 0,
+            download_toasts: Vec::new(),
             right_sidebar_remote_drop_target: None,
             right_sidebar_local_drop_target: None,
             pending_local_copy: None,

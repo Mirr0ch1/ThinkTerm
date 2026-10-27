@@ -1629,6 +1629,14 @@ remote-files-listing-refused = リモートホストでファイルを一覧で�
 remote-files-listing-too-large = リモートのファイル一覧が大きすぎます
 download-completed = ダウンロードが完了しました
 download-completed-body = { $path } にダウンロードしました
+download-card-preparing = 準備しています…
+download-card-canceling = キャンセルしています…
+download-card-failed = ダウンロードに失敗しました
+download-card-saved-to = { $path } に保存しました
+download-card-items = { $count } 項目
+download-open-file = ファイルを開く
+download-open-folder = フォルダーを開く
+download-open-downloads = ダウンロードフォルダーを開く
 
 ## Why a plugin's ask was not done. Plugins show these as they are.
 plugin-answer-no-terminal = パネルの隣にターミナルがありません

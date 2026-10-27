@@ -1747,6 +1747,10 @@ impl super::TermWindow {
             | UIItemType::RightSidebarRemoteFileBack
             | UIItemType::RightSidebarRemoteFileCopyText
             | UIItemType::RightSidebarRemoteTransfer(_)
+            | UIItemType::DownloadCardCancel(_)
+            | UIItemType::DownloadCardDismiss(_)
+            | UIItemType::DownloadCardOpen(_)
+            | UIItemType::DownloadCardOpenDownloads(_)
             | UIItemType::ContextMenuBackdrop
             | UIItemType::ContextMenuItem(_)
             | UIItemType::CommandPalette
@@ -1925,6 +1929,10 @@ impl super::TermWindow {
             | UIItemType::RightSidebarRemoteFileBack
             | UIItemType::RightSidebarRemoteFileCopyText
             | UIItemType::RightSidebarRemoteTransfer(_)
+            | UIItemType::DownloadCardCancel(_)
+            | UIItemType::DownloadCardDismiss(_)
+            | UIItemType::DownloadCardOpen(_)
+            | UIItemType::DownloadCardOpenDownloads(_)
             | UIItemType::ContextMenuBackdrop
             | UIItemType::ContextMenuItem(_)
             | UIItemType::CommandPalette
@@ -4218,6 +4226,12 @@ impl super::TermWindow {
             | UIItemType::RightSidebarRemoteTransfer(_) => {
                 self.mouse_event_right_sidebar_remote_file(item.clone(), event, context);
             }
+            UIItemType::DownloadCardCancel(_)
+            | UIItemType::DownloadCardDismiss(_)
+            | UIItemType::DownloadCardOpen(_)
+            | UIItemType::DownloadCardOpenDownloads(_) => {
+                self.mouse_event_download_card(item.clone(), event, context);
+            }
             UIItemType::UpdateCapsule => self.mouse_event_update_capsule(false, event, context),
             UIItemType::UpdateCapsuleDismiss => {
                 self.mouse_event_update_capsule(true, event, context)
@@ -4677,6 +4691,12 @@ impl super::TermWindow {
             }
             UIItemType::WorkspaceSidebarResize => {
                 self.mouse_event_workspace_sidebar_resize(item, event, context);
+            }
+            UIItemType::DownloadCardCancel(_)
+            | UIItemType::DownloadCardDismiss(_)
+            | UIItemType::DownloadCardOpen(_)
+            | UIItemType::DownloadCardOpenDownloads(_) => {
+                self.mouse_event_download_card(item.clone(), event, context);
             }
             UIItemType::UpdateCapsule => self.mouse_event_update_capsule(false, event, context),
             UIItemType::UpdateCapsuleDismiss => {
@@ -5734,6 +5754,28 @@ impl super::TermWindow {
             _ => {}
         }
         self.invalidate_or_reflow_right_sidebar(previous_width, context);
+    }
+
+    fn mouse_event_download_card(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::Hand));
+        if event.kind != WMEK::Press(MousePress::Left) {
+            return;
+        }
+        match item.item_type {
+            UIItemType::DownloadCardCancel(id) => self.cancel_download_transfer(id),
+            UIItemType::DownloadCardDismiss(id) => self.dismiss_download_toast(id),
+            UIItemType::DownloadCardOpen(id) => self.open_download_toast(id),
+            UIItemType::DownloadCardOpenDownloads(id) => {
+                self.open_download_toast_folder(id)
+            }
+            _ => return,
+        }
+        context.invalidate();
     }
 
     fn mouse_event_update_capsule(

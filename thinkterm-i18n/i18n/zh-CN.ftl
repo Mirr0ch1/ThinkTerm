@@ -1629,6 +1629,14 @@ remote-files-listing-refused = 远程主机无法列出文件：{ $detail }
 remote-files-listing-too-large = 远程文件列表太大了
 download-completed = 下载完成
 download-completed-body = 已下载到 { $path }
+download-card-preparing = 正在准备…
+download-card-canceling = 正在取消…
+download-card-failed = 下载失败
+download-card-saved-to = 已保存到 { $path }
+download-card-items = { $count } 个项目
+download-open-file = 打开文件
+download-open-folder = 打开文件夹
+download-open-downloads = 打开下载目录
 
 ## Why a plugin's ask was not done. Plugins show these as they are.
 plugin-answer-no-terminal = 面板旁边没有终端

@@ -495,6 +495,10 @@ pub(crate) struct RemoteTransfer {
     /// empty; every retryable remote transfer must have both `source` and
     /// `origin`.
     pub origin: Option<RemoteOperationOrigin>,
+    /// Where a download landed. Set when the destination is known — at start
+    /// for a single file, once the tree has been reserved for a folder — so
+    /// the finished card can open it. `None` for every other kind of transfer.
+    pub destination: Option<PathBuf>,
 }
 
 impl RemoteTransfer {

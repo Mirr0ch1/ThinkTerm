@@ -1675,6 +1675,17 @@ remote-files-listing-refused = Der entfernte Host konnte keine Dateien auflisten
 remote-files-listing-too-large = Die entfernte Dateiliste ist zu groß
 download-completed = Download abgeschlossen
 download-completed-body = Geladen nach { $path }
+download-card-preparing = Wird vorbereitet…
+download-card-canceling = Wird abgebrochen…
+download-card-failed = Download fehlgeschlagen
+download-card-saved-to = Gespeichert in { $path }
+download-card-items = { $count ->
+        [one] { $count } Element
+       *[other] { $count } Elemente
+    }
+download-open-file = Datei öffnen
+download-open-folder = Ordner öffnen
+download-open-downloads = Download-Ordner öffnen
 
 ## Why a plugin's ask was not done. Plugins show these as they are.
 plugin-answer-no-terminal = neben dem Panel ist kein Terminal

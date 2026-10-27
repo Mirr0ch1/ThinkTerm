@@ -21,6 +21,7 @@ use crate::termwindow::remote_files::{
 use crate::termwindow::remote_walk::{
     plan_remote_walk, RemoteWalkEntry, RemoteWalkMode, RemoteWalkPlan,
 };
+use crate::termwindow::render::download_card::DownloadToast;
 use crate::termwindow::transfer_walk::{
     apply_conflict_choice, destination_escapes_source, destination_stays_within, is_same_file,
     plan_transfer, ConflictChoice, DestinationRoot, OverwritePolicy, TransferEntryKind,
@@ -15634,6 +15635,7 @@ impl crate::TermWindow {
             status: RemoteTransferStatus::Running,
             source: None,
             origin: Some(origin.clone()),
+            destination: None,
         });
         self.trim_remote_transfers();
 
@@ -15802,6 +15804,7 @@ impl crate::TermWindow {
             status: RemoteTransferStatus::Failed(message),
             source,
             origin,
+            destination: None,
         });
         self.trim_remote_transfers();
     }
@@ -15870,6 +15873,7 @@ impl crate::TermWindow {
             status: RemoteTransferStatus::Running,
             source: Some(retry),
             origin: Some(origin.clone()),
+            destination: None,
         });
         self.trim_remote_transfers();
 
@@ -16257,6 +16261,7 @@ impl crate::TermWindow {
             status: RemoteTransferStatus::Running,
             source: None,
             origin: None,
+            destination: None,
         });
         self.trim_remote_transfers();
         self.invalidate_window();
@@ -16453,6 +16458,9 @@ impl crate::TermWindow {
             status: RemoteTransferStatus::Running,
             source: Some(retry),
             origin: Some(origin),
+            // Known from the reservation onwards; the card can open it as soon
+            // as the bytes land.
+            destination: Some(local.clone()),
         });
         self.trim_remote_transfers();
         self.invalidate_window();
@@ -16533,6 +16541,8 @@ impl crate::TermWindow {
             status: RemoteTransferStatus::Running,
             source: Some(retry),
             origin: Some(origin.clone()),
+            // A folder's free name is reserved only when the walk is done.
+            destination: None,
         });
         self.trim_remote_transfers();
         self.invalidate_window();
@@ -16687,6 +16697,7 @@ impl crate::TermWindow {
                 )
             });
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let destination = result.as_ref().ok().cloned();
                 let status = match &result {
                     Ok(destination) => {
                         let mut detail = format!("Saved to {}", destination.display());
@@ -16703,7 +16714,7 @@ impl crate::TermWindow {
                         None => RemoteTransferStatus::Failed(failure.message.clone()),
                     },
                 };
-                term_window.finish_remote_transfer(id, status);
+                term_window.finish_remote_transfer_with_destination(id, status, destination);
                 if connection_died {
                     term_window
                         .release_remote_files_lease_if_connection(&connection_key, connection_id);
@@ -17030,6 +17041,7 @@ impl crate::TermWindow {
             // tree, and "run it again" deserves a fresh look, not a replay.
             source: None,
             origin: Some(origin.clone()),
+            destination: None,
         });
         self.trim_remote_transfers();
         self.invalidate_window();
@@ -17547,14 +17559,99 @@ impl crate::TermWindow {
     }
 
     fn finish_remote_transfer(&mut self, id: u64, status: RemoteTransferStatus) {
-        if let Some(transfer) = self
+        let now = Instant::now();
+        let toast = if let Some(transfer) = self
             .right_sidebar_remote_transfers
             .iter_mut()
             .find(|transfer| transfer.id == id)
         {
             transfer.status = status;
+            if transfer.kind == RemoteTransferKind::Download {
+                let canceled = match &transfer.status {
+                    RemoteTransferStatus::Failed(message) => {
+                        message.starts_with(REMOTE_TRANSFER_CANCELED)
+                    }
+                    RemoteTransferStatus::FailedWithLeftover { message, .. } => {
+                        message.starts_with(REMOTE_TRANSFER_CANCELED)
+                    }
+                    _ => false,
+                };
+                if canceled {
+                    None
+                } else {
+                    let is_folder = matches!(
+                        &transfer.source,
+                        Some(RemoteTransferSource::DownloadFolder { .. })
+                    );
+                    match &transfer.status {
+                        RemoteTransferStatus::Done(_) => transfer.destination.clone().map(|path| {
+                            let item_count = transfer.progress.items().map(|(done, _)| done);
+                            let size = if item_count.is_none() {
+                                transfer.progress.total()
+                            } else {
+                                None
+                            };
+                            DownloadToast::done(
+                                id,
+                                transfer.name.clone(),
+                                path,
+                                is_folder,
+                                size,
+                                item_count,
+                                now,
+                            )
+                        }),
+                        RemoteTransferStatus::Failed(message) => Some(DownloadToast::failed(
+                            id,
+                            transfer.name.clone(),
+                            transfer.destination.clone(),
+                            is_folder,
+                            message.clone(),
+                            now,
+                        )),
+                        RemoteTransferStatus::FailedWithLeftover { message, .. } => {
+                            Some(DownloadToast::failed(
+                                id,
+                                transfer.name.clone(),
+                                transfer.destination.clone(),
+                                is_folder,
+                                message.clone(),
+                                now,
+                            ))
+                        }
+                        RemoteTransferStatus::Running => None,
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(toast) = toast {
+            self.push_download_toast(toast);
         }
         self.trim_remote_transfers();
+    }
+
+    /// A folder's free name is reserved only once its walk is complete, so its
+    /// destination arrives with the result rather than at creation.
+    fn finish_remote_transfer_with_destination(
+        &mut self,
+        id: u64,
+        status: RemoteTransferStatus,
+        destination: Option<PathBuf>,
+    ) {
+        if let Some(transfer) = self
+            .right_sidebar_remote_transfers
+            .iter_mut()
+            .find(|transfer| transfer.id == id)
+        {
+            if destination.is_some() {
+                transfer.destination = destination;
+            }
+        }
+        self.finish_remote_transfer(id, status);
     }
 
     pub(crate) fn request_right_sidebar_remote_files_connect(&mut self, explicit: bool) {
