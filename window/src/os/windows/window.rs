@@ -47,8 +47,8 @@ use winapi::um::objbase::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use winapi::um::shellapi::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use winapi::um::shellscalingapi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use winapi::um::shobjidl::{
-    IFileOpenDialog, FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM,
-    FOS_NOCHANGEDIR, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS,
+    IFileOpenDialog, FILEOPENDIALOGOPTIONS, FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST,
+    FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS,
 };
 use winapi::um::shobjidl_core::{
     CLSID_FileOpenDialog, IShellItem, IShellItemArray, SIGDN_FILESYSPATH,
@@ -409,17 +409,19 @@ unsafe fn pick_paths_dialog(
 
         let title = wide_null(&options.title);
         let choose = wide_null(&options.prompt);
-        let mut dialog_options = FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR;
+        let mut dialog_options = FOS_FORCEFILESYSTEM as u32
+            | FOS_PATHMUSTEXIST as u32
+            | FOS_NOCHANGEDIR as u32;
         if options.multiple {
-            dialog_options |= FOS_ALLOWMULTISELECT;
+            dialog_options |= FOS_ALLOWMULTISELECT as u32;
         }
         // The Windows dialog has one mode: files or folders. The caller uses
         // its menu fallback when it needs both, so this combination means
         // "files" here.
         if options.allow_directories && !options.allow_files {
-            dialog_options |= FOS_PICKFOLDERS;
+            dialog_options |= FOS_PICKFOLDERS as u32;
         }
-        let dialog_options = std::mem::transmute(dialog_options as u32);
+        let dialog_options: FILEOPENDIALOGOPTIONS = std::mem::transmute(dialog_options);
         hresult_to_result(
             (*dialog).SetOptions(dialog_options),
             "IFileDialog::SetOptions",
