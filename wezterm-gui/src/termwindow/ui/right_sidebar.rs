@@ -14078,6 +14078,17 @@ impl crate::TermWindow {
                 chrome,
                 foreground,
                 muted_fg,
+                upload_x,
+                refresh_y,
+                upload_size,
+                SvgIcon::Upload,
+                UIItemType::RightSidebarRemoteFileUpload,
+            )?;
+            self.paint_files_preview_header_icon_button(
+                layers,
+                chrome,
+                foreground,
+                muted_fg,
                 refresh_x,
                 refresh_y,
                 refresh_size,
@@ -15517,6 +15528,12 @@ impl crate::TermWindow {
             return false;
         };
 
+        // A Finder drag does not always activate the target window. Bring it
+        // forward as part of accepting the drop, so the running card is
+        // visible at once rather than after the focus flag catches up.
+        if let Some(window) = self.window.as_ref() {
+            window.focus();
+        }
         self.upload_paths_to_directory(paths, &directory, coords);
         true
     }
@@ -15602,34 +15619,51 @@ impl crate::TermWindow {
             return;
         };
 
+        // Ask where first. The selected folder is the default, but showing it
+        // in the menu makes the destination explicit and lets the user cancel
+        // and pick another row in the tree before choosing files.
+        let path = directory.as_str().to_string();
+        let mut items = Vec::new();
         if window.supports_combined_path_picker() {
-            self.pick_remote_upload_paths(true, true, directory, origin, anchor);
-            return;
+            items.push(self.context_menu_application_item_with_icon(
+                right_sidebar_arg("right-upload-to", "path", path),
+                ContextMenuIcon::Folder,
+                crate::termwindow::ContextMenuApplicationAction::UploadFromPicker {
+                    allow_files: true,
+                    allow_directories: true,
+                    directory,
+                    origin,
+                    anchor,
+                },
+                true,
+            ));
+        } else {
+            items.push(self.context_menu_application_item_with_icon(
+                right_sidebar_arg("right-upload-files-to", "path", path.clone()),
+                ContextMenuIcon::File,
+                crate::termwindow::ContextMenuApplicationAction::UploadFromPicker {
+                    allow_files: true,
+                    allow_directories: false,
+                    directory: directory.clone(),
+                    origin: origin.clone(),
+                    anchor,
+                },
+                true,
+            ));
+            items.push(self.context_menu_application_item_with_icon(
+                right_sidebar_arg("right-upload-folder-to", "path", path),
+                ContextMenuIcon::Folder,
+                crate::termwindow::ContextMenuApplicationAction::UploadFromPicker {
+                    allow_files: false,
+                    allow_directories: true,
+                    directory,
+                    origin,
+                    anchor,
+                },
+                true,
+            ));
         }
-
-        let files = self.context_menu_application_item_with_icon(
-            crate::i18n::tr("right-upload-files"),
-            ContextMenuIcon::File,
-            crate::termwindow::ContextMenuApplicationAction::UploadFromPicker {
-                files: true,
-                directory: directory.clone(),
-                origin: origin.clone(),
-                anchor,
-            },
-            true,
-        );
-        let folder = self.context_menu_application_item_with_icon(
-            crate::i18n::tr("right-upload-folder"),
-            ContextMenuIcon::Folder,
-            crate::termwindow::ContextMenuApplicationAction::UploadFromPicker {
-                files: false,
-                directory,
-                origin,
-                anchor,
-            },
-            true,
-        );
-        self.show_term_context_menu(&window, anchor, vec![files, folder]);
+        self.show_term_context_menu(&window, anchor, items);
     }
 
     /// Open the platform picker and, if it returned paths, upload them. The
@@ -17954,6 +17988,9 @@ impl crate::TermWindow {
             .or_else(|| self.right_sidebar_remote_file_search.kind_for_path(&path));
         match kind {
             Some(RemoteFileKind::Directory) => {
+                // Selecting a folder is also how the Upload button learns
+                // where the next files should go; expanding it is unchanged.
+                self.right_sidebar_remote_files.selected = Some(path.clone());
                 let effects = self
                     .right_sidebar_remote_files
                     .transition(RemoteFilesEvent::ToggleDirectory(path));

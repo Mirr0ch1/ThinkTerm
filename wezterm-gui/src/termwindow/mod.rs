@@ -728,7 +728,8 @@ pub(crate) enum ContextMenuApplicationAction {
     /// The header's Upload button on a platform whose native dialog cannot
     /// offer files and folders together: choose which one this picker is for.
     UploadFromPicker {
-        files: bool,
+        allow_files: bool,
+        allow_directories: bool,
         directory: remote_files::RemotePath,
         origin: remote_files::RemoteOperationOrigin,
         anchor: ::window::Point,

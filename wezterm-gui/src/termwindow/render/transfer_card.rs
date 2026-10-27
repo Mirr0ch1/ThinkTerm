@@ -259,13 +259,22 @@ impl crate::TermWindow {
     /// at each other's height.
     pub(crate) fn paint_transfer_cards(&mut self) -> anyhow::Result<()> {
         let now = Instant::now();
+        let focused = crate::termwindow::app_has_focus();
         let hidden = self.transfer_cards_hidden();
-        let views = self.transfer_card_views();
+        let mut views = self.transfer_card_views();
+
+        // A running card is the immediate answer to a drop from Finder, and
+        // the window's focus flag can lag behind the drop by a frame or two.
+        // Keep running cards visible in that gap; finished notices still wait
+        // for the app to be looked at again.
+        if !focused {
+            views.retain(|view| matches!(view, CardView::Running { .. }));
+        }
 
         if views.is_empty() {
             // Nothing to show: let finished cards start their clock from the
             // moment the app is next looked at, rather than expire unseen.
-            if hidden {
+            if hidden || !focused {
                 for toast in &mut self.transfer_toasts {
                     if toast.closing_at.is_none() && toast.paused_at.is_none() {
                         toast.paused_at = Some(now);
@@ -276,14 +285,24 @@ impl crate::TermWindow {
         }
 
         if hidden {
-            // Pause rather than expire: a menu or another app must not eat the
-            // completion notice.
+            // Pause rather than expire: a menu must not eat the completion
+            // notice.
             for toast in &mut self.transfer_toasts {
                 if toast.closing_at.is_none() && toast.paused_at.is_none() {
                     toast.paused_at = Some(now);
                 }
             }
             return Ok(());
+        }
+
+        if !focused {
+            // Running cards paint below; keep the finished ones' clocks held
+            // until someone is looking at the window again.
+            for toast in &mut self.transfer_toasts {
+                if toast.closing_at.is_none() && toast.paused_at.is_none() {
+                    toast.paused_at = Some(now);
+                }
+            }
         }
 
         let settings = crate::native_settings::load_shared();
@@ -662,7 +681,6 @@ impl crate::TermWindow {
         self.context_menu.is_some()
             || self.command_palette.is_some()
             || self.get_modal().is_some()
-            || !crate::termwindow::app_has_focus()
     }
 
     fn transfer_card_views(&self) -> Vec<CardView> {
