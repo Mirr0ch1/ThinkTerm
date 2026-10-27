@@ -14125,16 +14125,29 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    /// The transfers the strip still reports. Downloads are excluded: their
+    /// floating card is the single place their progress and completion appear,
+    /// so a second spinner here would just duplicate it.
+    fn remote_transfer_strip_indices(&self) -> Vec<usize> {
+        self.right_sidebar_remote_transfers
+            .iter()
+            .enumerate()
+            .filter(|(_, transfer)| transfer.kind != RemoteTransferKind::Download)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
     /// How many strip rows fit in `available` vertical pixels.
     ///
     /// Capped twice: by a fixed count, and by never taking more than half of
     /// what is left. Dropping thirty files at once must not collapse the tree
     /// to nothing or push rows up over the header.
     fn transfer_strip_rows(&self, available: usize, row_height: usize) -> usize {
-        if self.right_sidebar_remote_transfers.is_empty() {
+        let visible = self.remote_transfer_strip_indices();
+        if visible.is_empty() {
             return 0;
         }
-        self.right_sidebar_remote_transfers
+        visible
             .len()
             .min(REMOTE_TRANSFER_STRIP_MAX)
             .min((available / 2) / row_height.max(1))
@@ -14163,16 +14176,14 @@ impl crate::TermWindow {
         }
         // When some are hidden, the last visible row reports how many rather
         // than letting them vanish silently.
-        let hidden = self
-            .right_sidebar_remote_transfers
-            .len()
-            .saturating_sub(strip_rows);
+        let visible = self.remote_transfer_strip_indices();
+        let hidden = visible.len().saturating_sub(strip_rows);
         let painted = if hidden > 0 {
             strip_rows.saturating_sub(1)
         } else {
             strip_rows
         };
-        for index in 0..painted {
+        for &index in visible.iter().take(painted) {
             self.paint_remote_transfer_row(
                 layers,
                 ui_font,
@@ -15796,6 +15807,19 @@ impl crate::TermWindow {
         let origin = source
             .as_ref()
             .and_then(|_| self.current_remote_operation_origin());
+        let is_folder = matches!(&source, Some(RemoteTransferSource::DownloadFolder { .. }));
+        let retryable = source.is_some() && origin.is_some();
+        let toast = (kind == RemoteTransferKind::Download).then(|| {
+            DownloadToast::failed(
+                id,
+                name.clone(),
+                None,
+                is_folder,
+                message.clone(),
+                retryable,
+                Instant::now(),
+            )
+        });
         self.right_sidebar_remote_transfers.push(RemoteTransfer {
             id,
             kind,
@@ -15807,6 +15831,9 @@ impl crate::TermWindow {
             destination: None,
         });
         self.trim_remote_transfers();
+        if let Some(toast) = toast {
+            self.push_download_toast(toast);
+        }
     }
 
     /// Keep the strip from growing without bound: finished entries are the
@@ -17390,16 +17417,19 @@ impl crate::TermWindow {
     }
 
     /// Run a failed transfer again from its recorded source.
-    pub(crate) fn retry_remote_transfer(&mut self, id: u64, anchor: Point) {
+    /// Run a finished transfer again. Returns whether a new attempt actually
+    /// started, so the floating card knows whether it should replace its
+    /// failure notice or keep it.
+    pub(crate) fn retry_remote_transfer(&mut self, id: u64, anchor: Point) -> bool {
         let Some(index) = self
             .right_sidebar_remote_transfers
             .iter()
             .position(|transfer| transfer.id == id)
         else {
-            return;
+            return false;
         };
         let Some(origin) = self.right_sidebar_remote_transfers[index].origin.clone() else {
-            return;
+            return false;
         };
         if !self.remote_operation_origin_matches(&origin) {
             // Keep the row and its source intact so switching back makes the
@@ -17409,11 +17439,11 @@ impl crate::TermWindow {
                 "Switch Files back to the original host to retry".to_string(),
             );
             self.invalidate_window();
-            return;
+            return false;
         }
         let transfer = self.right_sidebar_remote_transfers.remove(index);
         let Some(source) = transfer.source else {
-            return;
+            return false;
         };
         match source {
             RemoteTransferSource::Upload {
@@ -17429,6 +17459,7 @@ impl crate::TermWindow {
             }
         }
         self.invalidate_window();
+        true
     }
 
     /// Everything a transfer worker needs from the panel's lease. Takes an
@@ -17583,6 +17614,7 @@ impl crate::TermWindow {
                         &transfer.source,
                         Some(RemoteTransferSource::DownloadFolder { .. })
                     );
+                    let retryable = transfer.can_retry();
                     match &transfer.status {
                         RemoteTransferStatus::Done(_) => transfer.destination.clone().map(|path| {
                             let item_count = transfer.progress.items().map(|(done, _)| done);
@@ -17607,6 +17639,7 @@ impl crate::TermWindow {
                             transfer.destination.clone(),
                             is_folder,
                             message.clone(),
+                            retryable,
                             now,
                         )),
                         RemoteTransferStatus::FailedWithLeftover { message, .. } => {
@@ -17616,6 +17649,7 @@ impl crate::TermWindow {
                                 transfer.destination.clone(),
                                 is_folder,
                                 message.clone(),
+                                retryable,
                                 now,
                             ))
                         }

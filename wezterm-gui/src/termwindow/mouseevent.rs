@@ -1749,6 +1749,7 @@ impl super::TermWindow {
             | UIItemType::RightSidebarRemoteTransfer(_)
             | UIItemType::DownloadCardCancel(_)
             | UIItemType::DownloadCardDismiss(_)
+            | UIItemType::DownloadCardRetry(_)
             | UIItemType::DownloadCardOpen(_)
             | UIItemType::DownloadCardOpenDownloads(_)
             | UIItemType::ContextMenuBackdrop
@@ -1931,6 +1932,7 @@ impl super::TermWindow {
             | UIItemType::RightSidebarRemoteTransfer(_)
             | UIItemType::DownloadCardCancel(_)
             | UIItemType::DownloadCardDismiss(_)
+            | UIItemType::DownloadCardRetry(_)
             | UIItemType::DownloadCardOpen(_)
             | UIItemType::DownloadCardOpenDownloads(_)
             | UIItemType::ContextMenuBackdrop
@@ -4228,6 +4230,7 @@ impl super::TermWindow {
             }
             UIItemType::DownloadCardCancel(_)
             | UIItemType::DownloadCardDismiss(_)
+            | UIItemType::DownloadCardRetry(_)
             | UIItemType::DownloadCardOpen(_)
             | UIItemType::DownloadCardOpenDownloads(_) => {
                 self.mouse_event_download_card(item.clone(), event, context);
@@ -4694,6 +4697,7 @@ impl super::TermWindow {
             }
             UIItemType::DownloadCardCancel(_)
             | UIItemType::DownloadCardDismiss(_)
+            | UIItemType::DownloadCardRetry(_)
             | UIItemType::DownloadCardOpen(_)
             | UIItemType::DownloadCardOpenDownloads(_) => {
                 self.mouse_event_download_card(item.clone(), event, context);
@@ -5769,6 +5773,9 @@ impl super::TermWindow {
         match item.item_type {
             UIItemType::DownloadCardCancel(id) => self.cancel_download_transfer(id),
             UIItemType::DownloadCardDismiss(id) => self.dismiss_download_toast(id),
+            UIItemType::DownloadCardRetry(id) => {
+                self.retry_download_from_card(id, event.coords)
+            }
             UIItemType::DownloadCardOpen(id) => self.open_download_toast(id),
             UIItemType::DownloadCardOpenDownloads(id) => {
                 self.open_download_toast_folder(id)

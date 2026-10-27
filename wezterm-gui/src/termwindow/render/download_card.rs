@@ -1,17 +1,20 @@
 //! The floating card that follows a remote download.
 //!
-//! The Files panel already reports transfers in a strip at its own bottom,
-//! but that strip is only visible while the panel is open on Files, and a
-//! long file name can push the percentage off the end of its single row. A
-//! download that takes a while should be visible from wherever the user is
-//! working, and the moment it finishes should say so plainly and offer the
-//! two things anyone wants next: open it, or open the folder it landed in.
+//! Downloads used to report themselves in the Files panel's transfer strip:
+//! one narrow row at the bottom of the panel, where a long file name could
+//! push the percentage off the end. They are no longer painted there at all;
+//! this card is the one place a download shows its progress and its result.
+//! It sits in the window's own bottom-right corner — over the right sidebar
+//! when that is open — and offers the two things anyone wants at the end:
+//! open what was downloaded, or open the folder it landed in.
 //!
 //! Running cards are derived from the transfer records, which already own
 //! the live progress. A finished card is a snapshot, kept separately so it
-//! can outlive the strip's three-row cap and the transfer row it came from.
+//! can outlive the transfer row it came from.
 
-use crate::termwindow::remote_files::{RemoteTransferKind, RemoteTransferProgress};
+use crate::termwindow::remote_files::{
+    RemoteTransferKind, RemoteTransferProgress, RemoteTransferStatus,
+};
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::{UIItem, UIItemType};
 use crate::ui::draw::DrawContext;
@@ -50,7 +53,6 @@ const STACK_GAP: f32 = 8.0;
 const CAPSULE_LIFT: f32 = 42.0;
 const MAX_CARDS: usize = 3;
 const DONE_TTL: Duration = Duration::from_secs(12);
-const FAILED_TTL: Duration = Duration::from_secs(12);
 const FADE_IN: Duration = Duration::from_millis(180);
 const FADE_OUT: Duration = Duration::from_millis(180);
 const FRAME: Duration = Duration::from_millis(16);
@@ -67,6 +69,9 @@ pub(crate) struct DownloadToast {
     pub is_folder: bool,
     pub size: Option<u64>,
     pub item_count: Option<u64>,
+    /// A failed download can be run again from its transfer row, provided the
+    /// row kept its source and host. Successes never offer Retry.
+    pub retryable: bool,
     pub outcome: DownloadToastOutcome,
     pub shown_at: Instant,
     pub paused_at: Option<Instant>,
@@ -96,6 +101,7 @@ impl DownloadToast {
             is_folder,
             size,
             item_count,
+            retryable: false,
             outcome: DownloadToastOutcome::Done,
             shown_at: now,
             paused_at: None,
@@ -109,6 +115,7 @@ impl DownloadToast {
         path: Option<PathBuf>,
         is_folder: bool,
         message: String,
+        retryable: bool,
         now: Instant,
     ) -> Self {
         Self {
@@ -118,6 +125,7 @@ impl DownloadToast {
             is_folder,
             size: None,
             item_count: None,
+            retryable,
             outcome: DownloadToastOutcome::Failed(message),
             shown_at: now,
             paused_at: None,
@@ -125,15 +133,14 @@ impl DownloadToast {
         }
     }
 
-    fn ttl(&self) -> Duration {
+    /// Success notices make way for the next download. A failure stays until
+    /// the user closes it or retries: it carries the only way back into a
+    /// transfer whose strip row is deliberately not shown.
+    fn deadline(&self) -> Option<Instant> {
         match self.outcome {
-            DownloadToastOutcome::Done => DONE_TTL,
-            DownloadToastOutcome::Failed(_) => FAILED_TTL,
+            DownloadToastOutcome::Done => Some(self.shown_at + DONE_TTL),
+            DownloadToastOutcome::Failed(_) => None,
         }
-    }
-
-    fn deadline(&self) -> Instant {
-        self.shown_at + self.ttl()
     }
 
     /// 0 to 1, transparent while arriving and leaving, opaque in between.
@@ -243,16 +250,27 @@ impl crate::TermWindow {
             content_bottom
         };
 
-        let right = self.dimensions.pixel_width as f32
-            - border.right.get() as f32
-            - self.right_sidebar_width() as f32
-            - px(MARGIN);
+        // The window's own bottom-right corner, not the terminal area's
+        // corner: when the right sidebar is open the card sits over it,
+        // because this card is now the only place a download reports itself.
+        let right =
+            self.dimensions.pixel_width as f32 - border.right.get() as f32 - px(MARGIN);
+        // Over the sidebar when it is open, so the card does not reach into
+        // the terminal; at the full width when the sidebar is put away.
+        let sidebar_room = self.right_sidebar_width() as f32 - px(MARGIN) * 2.0;
         let mut bottom = floor - px(MARGIN);
-        if self.update_capsule_visible() {
+        // The update capsule sits left of an open sidebar, so only the
+        // sidebar-less corner needs the card lifted above it.
+        if sidebar_room <= 0.0 && self.update_capsule_visible() {
             bottom -= px(CAPSULE_LIFT);
         }
         let available = (right - px(MARGIN)).max(px(240.0));
-        let width = px(CARD_WIDTH).min(available);
+        let width = if sidebar_room > 0.0 {
+            px(CARD_WIDTH).min(sidebar_room).max(px(240.0))
+        } else {
+            px(CARD_WIDTH)
+        }
+        .min(available);
 
         // One decision per finished card: two labelled buttons fit side by
         // side in most locales, but a long translation stacks them instead of
@@ -339,8 +357,11 @@ impl crate::TermWindow {
                         wants_frame = true;
                     } else if current.paused_at.is_none() {
                         // While the pointer rests on it the deadline is held;
-                        // a repaint every frame would only spin.
-                        self.update_next_frame_time(Some(current.deadline()));
+                        // a repaint every frame would only spin. A failure has
+                        // no deadline: it waits for Close or Retry.
+                        if let Some(deadline) = current.deadline() {
+                            self.update_next_frame_time(Some(deadline));
+                        }
                     }
                     let arrive = (now.duration_since(current.shown_at).as_secs_f32()
                         / FADE_IN.as_secs_f32())
@@ -465,6 +486,37 @@ impl crate::TermWindow {
         self.invalidate_window();
     }
 
+    /// Retry the failed download behind a card. If the recorded host is no
+    /// longer the one the Files panel shows, the retry refuses; put that
+    /// reason on the card instead of leaving the old error there.
+    pub(crate) fn retry_download_from_card(&mut self, id: u64, anchor: ::window::Point) {
+        if self.retry_remote_transfer(id, anchor) {
+            self.dismiss_download_toast(id);
+        } else if let Some(message) = self
+            .right_sidebar_remote_transfers
+            .iter()
+            .find(|transfer| transfer.id == id)
+            .and_then(|transfer| match &transfer.status {
+                RemoteTransferStatus::Failed(message)
+                | RemoteTransferStatus::FailedWithLeftover { message, .. } => {
+                    Some(message.clone())
+                }
+                _ => None,
+            })
+        {
+            if let Some(toast) = self
+                .download_toasts
+                .iter_mut()
+                .find(|toast| toast.id == id)
+            {
+                if let DownloadToastOutcome::Failed(existing) = &mut toast.outcome {
+                    *existing = message;
+                }
+            }
+        }
+        self.invalidate_window();
+    }
+
     /// Open the downloaded file, or the downloaded folder. If it was moved or
     /// deleted since the card appeared, fall back to the folder that held it.
     pub(crate) fn open_download_toast(&mut self, id: u64) {
@@ -515,7 +567,6 @@ impl crate::TermWindow {
         self.context_menu.is_some()
             || self.command_palette.is_some()
             || self.get_modal().is_some()
-            || (self.right_sidebar_collapsed && self.right_sidebar_presented())
             || !crate::termwindow::app_has_focus()
     }
 
@@ -611,8 +662,10 @@ impl crate::TermWindow {
                 // menu) held it still.
                 toast.shown_at += now.duration_since(paused);
             }
-            if toast.paused_at.is_none() && now >= toast.deadline() {
-                toast.closing_at = Some(now);
+            if let Some(deadline) = toast.deadline() {
+                if toast.paused_at.is_none() && now >= deadline {
+                    toast.closing_at = Some(now);
+                }
             }
         }
     }
@@ -883,7 +936,32 @@ impl crate::TermWindow {
             UIItemType::DownloadCardDismiss(toast.id),
         ));
 
+        let room = rect.size.width - pad * 2.0;
+        let buttons_y = detail_y + body_line + gap;
+
         if failed {
+            if toast.retryable {
+                let retry = crate::i18n::tr("right-retry");
+                let retry_rect =
+                    euclid::rect(rect.origin.x + pad, buttons_y, room, button_h);
+                self.paint_card_button(
+                    layers,
+                    body_font,
+                    body_metrics,
+                    card,
+                    chrome,
+                    retry_rect,
+                    SvgIcon::RotateCcw,
+                    &retry,
+                    true,
+                    alpha,
+                    &px,
+                )?;
+                ui_items.push(ui_item(
+                    retry_rect,
+                    UIItemType::DownloadCardRetry(toast.id),
+                ));
+            }
             return Ok(());
         }
 
@@ -893,8 +971,6 @@ impl crate::TermWindow {
             crate::i18n::tr("download-open-file")
         };
         let secondary = crate::i18n::tr("download-open-downloads");
-        let room = rect.size.width - pad * 2.0;
-        let buttons_y = detail_y + body_line + gap;
         let (primary_rect, secondary_rect) = if stacked {
             (
                 euclid::rect(rect.origin.x + pad, buttons_y, room, button_h),
@@ -1181,7 +1257,17 @@ fn card_height(
                     }
             }
             DownloadToastOutcome::Failed(_) => {
-                pad * 2.0 + title_line + gap * 0.5 + body_line + gap * 0.5 + body_line
+                pad * 2.0
+                    + title_line
+                    + gap * 0.5
+                    + body_line
+                    + gap * 0.5
+                    + body_line
+                    + if toast.retryable {
+                        gap + button_h
+                    } else {
+                        0.0
+                    }
             }
         },
     }
@@ -1237,11 +1323,11 @@ mod tests {
         assert_eq!(toast.alpha(now), 0.0);
         assert!(toast.alpha(now + FADE_IN) > 0.99);
         assert_eq!(toast.alpha(now + DONE_TTL), 1.0);
-        assert_eq!(toast.deadline(), now + DONE_TTL);
+        assert_eq!(toast.deadline(), Some(now + DONE_TTL));
     }
 
     #[test]
-    fn a_failure_card_carries_its_message_and_no_size() {
+    fn a_failure_card_waits_for_retry_or_close() {
         let now = Instant::now();
         let toast = DownloadToast::failed(
             2,
@@ -1249,6 +1335,7 @@ mod tests {
             None,
             false,
             "connection lost".to_string(),
+            true,
             now,
         );
         assert_eq!(
@@ -1257,6 +1344,8 @@ mod tests {
         );
         assert_eq!(toast.size, None);
         assert_eq!(toast.item_count, None);
+        assert!(toast.retryable);
+        assert_eq!(toast.deadline(), None);
     }
 
     #[test]

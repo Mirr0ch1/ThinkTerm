@@ -883,6 +883,7 @@ pub enum UIItemType {
     /// dismiss a finished one, or open what it downloaded.
     DownloadCardCancel(u64),
     DownloadCardDismiss(u64),
+    DownloadCardRetry(u64),
     DownloadCardOpen(u64),
     DownloadCardOpenDownloads(u64),
     /// The area a plugin's panel draws in: the pointer and the wheel over it
