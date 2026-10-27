@@ -499,6 +499,10 @@ pub(crate) struct RemoteTransfer {
     /// for a single file, once the tree has been reserved for a folder — so
     /// the finished card can open it. `None` for every other kind of transfer.
     pub destination: Option<PathBuf>,
+    /// The remote path an upload will occupy, when it is known. Used by the
+    /// finished card for "Uploaded to …" and Copy Path; `None` for downloads
+    /// and for a folder upload that never got as far as naming itself.
+    pub remote_destination: Option<RemotePath>,
 }
 
 impl RemoteTransfer {

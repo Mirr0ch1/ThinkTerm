@@ -21,7 +21,7 @@ use crate::termwindow::remote_files::{
 use crate::termwindow::remote_walk::{
     plan_remote_walk, RemoteWalkEntry, RemoteWalkMode, RemoteWalkPlan,
 };
-use crate::termwindow::render::download_card::DownloadToast;
+use crate::termwindow::render::transfer_card::TransferToast;
 use crate::termwindow::transfer_walk::{
     apply_conflict_choice, destination_escapes_source, destination_stays_within, is_same_file,
     plan_transfer, ConflictChoice, DestinationRoot, OverwritePolicy, TransferEntryKind,
@@ -76,7 +76,7 @@ use wezterm_font::{LoadedFont, LoadedFontId};
 use window::color::LinearRgba;
 use window::{
     Clipboard, ContextMenuIcon, ContextMenuItem, DeadKeyStatus, FolderPickerOptions,
-    IntegratedTitleButtonStyle, Point, Rect, RectF, WindowOps,
+    IntegratedTitleButtonStyle, PathPickerOptions, Point, Rect, RectF, WindowOps,
 };
 
 const RIGHT_SIDEBAR_SECTION_GAP: usize = 12;
@@ -13880,9 +13880,14 @@ impl crate::TermWindow {
         let refresh_x = content_x + content_width.saturating_sub(refresh_size);
         let refresh_y =
             content_top + self.ui_px(FILE_FILTER_HEIGHT).saturating_sub(refresh_size) / 2;
+        let upload_size = refresh_size;
+        let upload_gap = self.ui_px(SIDEBAR_INSET);
+        let upload_x = refresh_x.saturating_sub(upload_size + upload_gap);
         // The same filter box as a local project; the project's name heads
-        // the tree below it.
-        let filter_width = content_width.saturating_sub(refresh_size + self.ui_px(SIDEBAR_INSET));
+        // the tree below it. Leave room for both header buttons.
+        let filter_width = content_width.saturating_sub(
+            refresh_size + upload_size + upload_gap.saturating_mul(2),
+        );
         let filter_label = crate::i18n::tr("right-filter-files");
         let filter_input = self.right_sidebar_file_filter.clone();
         self.paint_snippet_text_box(
@@ -13902,6 +13907,17 @@ impl crate::TermWindow {
             self.right_sidebar_file_focus == Some(RightSidebarFileField::Filter),
             UIItemType::RightSidebarFileFilter,
             false,
+        )?;
+        self.paint_files_preview_header_icon_button(
+            layers,
+            chrome,
+            foreground,
+            muted_fg,
+            upload_x,
+            refresh_y,
+            upload_size,
+            SvgIcon::Upload,
+            UIItemType::RightSidebarRemoteFileUpload,
         )?;
         self.paint_files_preview_header_icon_button(
             layers,
@@ -14125,14 +14141,19 @@ impl crate::TermWindow {
         Ok(())
     }
 
-    /// The transfers the strip still reports. Downloads are excluded: their
-    /// floating card is the single place their progress and completion appear,
-    /// so a second spinner here would just duplicate it.
+    /// The transfers the strip still reports. Downloads and uploads are
+    /// excluded: their floating cards are the single place their progress and
+    /// completion appear, so a second spinner here would just duplicate them.
     fn remote_transfer_strip_indices(&self) -> Vec<usize> {
         self.right_sidebar_remote_transfers
             .iter()
             .enumerate()
-            .filter(|(_, transfer)| transfer.kind != RemoteTransferKind::Download)
+            .filter(|(_, transfer)| {
+                !matches!(
+                    transfer.kind,
+                    RemoteTransferKind::Download | RemoteTransferKind::Upload
+                )
+            })
             .map(|(index, _)| index)
             .collect()
     }
@@ -15496,9 +15517,27 @@ impl crate::TermWindow {
             return false;
         };
 
+        self.upload_paths_to_directory(paths, &directory, coords);
+        true
+    }
+
+    /// Upload each local path into `directory`. Shared by a drop and the
+    /// header's Upload button; the caller has already checked that the remote
+    /// connection is the one it means to write to.
+    fn upload_paths_to_directory(
+        &mut self,
+        paths: &[PathBuf],
+        directory: &RemotePath,
+        anchor: Point,
+    ) {
         for path in paths {
             if path.is_dir() {
-                self.start_remote_folder_upload(path.clone(), directory.clone(), coords, None);
+                self.start_remote_folder_upload(
+                    path.clone(),
+                    directory.clone(),
+                    anchor,
+                    None,
+                );
                 continue;
             }
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -15528,7 +15567,114 @@ impl crate::TermWindow {
             self.start_remote_upload(path.clone(), remote, directory.clone(), None);
         }
         self.invalidate_window();
-        true
+    }
+
+    /// Where the header's Upload button puts files: the selected directory,
+    /// the parent of a selected file, or the tree root.
+    fn right_sidebar_remote_upload_directory(&self) -> Option<RemotePath> {
+        let root = self.right_sidebar_remote_files.root.clone()?;
+        let Some(selected) = self.right_sidebar_remote_files.selected.as_ref() else {
+            return Some(root);
+        };
+        match self.right_sidebar_remote_files.kind_for_path(selected) {
+            Some(RemoteFileKind::Directory) => Some(selected.clone()),
+            _ => selected.parent().or(Some(root)),
+        }
+    }
+
+    /// The header's Upload button. macOS can put files and folders in one
+    /// native panel; the other platforms get a two-item menu because their
+    /// native dialogs cannot offer both at once.
+    pub(crate) fn begin_remote_upload_picker(&mut self, anchor: Point) {
+        let Some(directory) = self.right_sidebar_remote_upload_directory() else {
+            self.right_sidebar_remote_files.error_message =
+                Some("No remote folder is available to upload into".to_string());
+            self.invalidate_window();
+            return;
+        };
+        let Some(origin) = self.current_remote_operation_origin() else {
+            self.right_sidebar_remote_files.error_message =
+                Some("Remote Files is not connected".to_string());
+            self.invalidate_window();
+            return;
+        };
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+
+        if window.supports_combined_path_picker() {
+            self.pick_remote_upload_paths(true, true, directory, origin, anchor);
+            return;
+        }
+
+        let files = self.context_menu_application_item_with_icon(
+            crate::i18n::tr("right-upload-files"),
+            ContextMenuIcon::File,
+            crate::termwindow::ContextMenuApplicationAction::UploadFromPicker {
+                files: true,
+                directory: directory.clone(),
+                origin: origin.clone(),
+                anchor,
+            },
+            true,
+        );
+        let folder = self.context_menu_application_item_with_icon(
+            crate::i18n::tr("right-upload-folder"),
+            ContextMenuIcon::Folder,
+            crate::termwindow::ContextMenuApplicationAction::UploadFromPicker {
+                files: false,
+                directory,
+                origin,
+                anchor,
+            },
+            true,
+        );
+        self.show_term_context_menu(&window, anchor, vec![files, folder]);
+    }
+
+    /// Open the platform picker and, if it returned paths, upload them. The
+    /// origin is checked after the picker closes: its window can outlive a
+    /// switch to another host, and a remote absolute path means a different
+    /// object there.
+    pub(crate) fn pick_remote_upload_paths(
+        &mut self,
+        allow_files: bool,
+        allow_directories: bool,
+        directory: RemotePath,
+        origin: RemoteOperationOrigin,
+        anchor: Point,
+    ) {
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        let notify_window = window.clone();
+        let options = PathPickerOptions {
+            title: crate::i18n::tr("right-upload-picker-title"),
+            prompt: crate::i18n::tr("right-upload-picker-prompt"),
+            directory: None,
+            allow_files,
+            allow_directories,
+            multiple: true,
+        };
+        window.pick_paths_async(
+            options,
+            Box::new(move |paths| {
+                if paths.is_empty() {
+                    return;
+                }
+                notify_window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    if !term_window.remote_operation_origin_matches(&origin) {
+                        term_window.right_sidebar_remote_files.error_message = Some(
+                            "The panel moved to another host while the file picker was open"
+                                .to_string(),
+                        );
+                        term_window.invalidate_window();
+                        return;
+                    }
+                    term_window.upload_paths_to_directory(&paths, &directory, anchor);
+                })));
+            }),
+        );
     }
 
     /// Walk a dropped folder and upload it as a single transfer.
@@ -15638,6 +15784,7 @@ impl crate::TermWindow {
         // the confirmation has something on screen to be about.
         let id = self.next_remote_transfer_id();
         let progress = RemoteTransferProgress::default();
+        let remote_destination = directory.join_name(&name).ok();
         self.right_sidebar_remote_transfers.push(RemoteTransfer {
             id,
             kind: RemoteTransferKind::Upload,
@@ -15647,6 +15794,7 @@ impl crate::TermWindow {
             source: None,
             origin: Some(origin.clone()),
             destination: None,
+            remote_destination,
         });
         self.trim_remote_transfers();
 
@@ -15807,19 +15955,43 @@ impl crate::TermWindow {
         let origin = source
             .as_ref()
             .and_then(|_| self.current_remote_operation_origin());
-        let is_folder = matches!(&source, Some(RemoteTransferSource::DownloadFolder { .. }));
+        let remote_destination = match &source {
+            Some(RemoteTransferSource::Upload { remote, .. }) => Some(remote.clone()),
+            _ => None,
+        };
+        let remote_path = remote_destination
+            .as_ref()
+            .map(|path| path.as_str().to_string());
+        let remote_dir = remote_destination
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(|path| path.as_str().to_string());
+        let is_folder = matches!(&source, Some(RemoteTransferSource::DownloadFolder { .. }))
+            || matches!(&source, Some(RemoteTransferSource::Upload { local, .. }) if local.is_dir());
         let retryable = source.is_some() && origin.is_some();
-        let toast = (kind == RemoteTransferKind::Download).then(|| {
-            DownloadToast::failed(
+        let now = Instant::now();
+        let toast = match kind {
+            RemoteTransferKind::Download => Some(TransferToast::download_failed(
                 id,
                 name.clone(),
                 None,
                 is_folder,
                 message.clone(),
                 retryable,
-                Instant::now(),
-            )
-        });
+                now,
+            )),
+            RemoteTransferKind::Upload => Some(TransferToast::upload_failed(
+                id,
+                name.clone(),
+                remote_path,
+                remote_dir,
+                is_folder,
+                message.clone(),
+                retryable,
+                now,
+            )),
+            _ => None,
+        };
         self.right_sidebar_remote_transfers.push(RemoteTransfer {
             id,
             kind,
@@ -15829,10 +16001,11 @@ impl crate::TermWindow {
             source,
             origin,
             destination: None,
+            remote_destination,
         });
         self.trim_remote_transfers();
         if let Some(toast) = toast {
-            self.push_download_toast(toast);
+            self.push_transfer_toast(toast);
         }
     }
 
@@ -15901,6 +16074,7 @@ impl crate::TermWindow {
             source: Some(retry),
             origin: Some(origin.clone()),
             destination: None,
+            remote_destination: Some(remote.clone()),
         });
         self.trim_remote_transfers();
 
@@ -16289,6 +16463,7 @@ impl crate::TermWindow {
             source: None,
             origin: None,
             destination: None,
+            remote_destination: None,
         });
         self.trim_remote_transfers();
         self.invalidate_window();
@@ -16488,6 +16663,7 @@ impl crate::TermWindow {
             // Known from the reservation onwards; the card can open it as soon
             // as the bytes land.
             destination: Some(local.clone()),
+            remote_destination: None,
         });
         self.trim_remote_transfers();
         self.invalidate_window();
@@ -16570,6 +16746,7 @@ impl crate::TermWindow {
             origin: Some(origin.clone()),
             // A folder's free name is reserved only when the walk is done.
             destination: None,
+            remote_destination: None,
         });
         self.trim_remote_transfers();
         self.invalidate_window();
@@ -17069,6 +17246,7 @@ impl crate::TermWindow {
             source: None,
             origin: Some(origin.clone()),
             destination: None,
+            remote_destination: None,
         });
         self.trim_remote_transfers();
         self.invalidate_window();
@@ -17597,73 +17775,131 @@ impl crate::TermWindow {
             .find(|transfer| transfer.id == id)
         {
             transfer.status = status;
-            if transfer.kind == RemoteTransferKind::Download {
-                let canceled = match &transfer.status {
-                    RemoteTransferStatus::Failed(message) => {
-                        message.starts_with(REMOTE_TRANSFER_CANCELED)
-                    }
-                    RemoteTransferStatus::FailedWithLeftover { message, .. } => {
-                        message.starts_with(REMOTE_TRANSFER_CANCELED)
-                    }
-                    _ => false,
-                };
-                if canceled {
-                    None
+            let canceled = match &transfer.status {
+                RemoteTransferStatus::Failed(message) => {
+                    message.starts_with(REMOTE_TRANSFER_CANCELED)
+                }
+                RemoteTransferStatus::FailedWithLeftover { message, .. } => {
+                    message.starts_with(REMOTE_TRANSFER_CANCELED)
+                }
+                _ => false,
+            };
+            if canceled {
+                None
+            } else {
+                let item_count = transfer.progress.items().map(|(done, _)| done);
+                let size = if item_count.is_none() {
+                    transfer.progress.total()
                 } else {
-                    let is_folder = matches!(
-                        &transfer.source,
-                        Some(RemoteTransferSource::DownloadFolder { .. })
-                    );
-                    let retryable = transfer.can_retry();
-                    match &transfer.status {
-                        RemoteTransferStatus::Done(_) => transfer.destination.clone().map(|path| {
-                            let item_count = transfer.progress.items().map(|(done, _)| done);
-                            let size = if item_count.is_none() {
-                                transfer.progress.total()
-                            } else {
-                                None
-                            };
-                            DownloadToast::done(
+                    None
+                };
+                let retryable = transfer.can_retry();
+                let remote_path = transfer
+                    .remote_destination
+                    .as_ref()
+                    .map(|path| path.as_str().to_string());
+                let remote_dir = transfer
+                    .remote_destination
+                    .as_ref()
+                    .and_then(|path| path.parent())
+                    .map(|path| path.as_str().to_string());
+                match transfer.kind {
+                    RemoteTransferKind::Download => {
+                        let is_folder = matches!(
+                            &transfer.source,
+                            Some(RemoteTransferSource::DownloadFolder { .. })
+                        );
+                        match &transfer.status {
+                            RemoteTransferStatus::Done(_) => {
+                                transfer.destination.clone().map(|path| {
+                                    TransferToast::download_done(
+                                        id,
+                                        transfer.name.clone(),
+                                        path,
+                                        is_folder,
+                                        size,
+                                        item_count,
+                                        now,
+                                    )
+                                })
+                            }
+                            RemoteTransferStatus::Failed(message) => {
+                                Some(TransferToast::download_failed(
+                                    id,
+                                    transfer.name.clone(),
+                                    transfer.destination.clone(),
+                                    is_folder,
+                                    message.clone(),
+                                    retryable,
+                                    now,
+                                ))
+                            }
+                            RemoteTransferStatus::FailedWithLeftover { message, .. } => {
+                                Some(TransferToast::download_failed(
+                                    id,
+                                    transfer.name.clone(),
+                                    transfer.destination.clone(),
+                                    is_folder,
+                                    message.clone(),
+                                    retryable,
+                                    now,
+                                ))
+                            }
+                            RemoteTransferStatus::Running => None,
+                        }
+                    }
+                    RemoteTransferKind::Upload => {
+                        let is_folder = item_count.is_some()
+                            || matches!(
+                                &transfer.source,
+                                Some(RemoteTransferSource::Upload { local, .. }) if local.is_dir()
+                            );
+                        match &transfer.status {
+                            RemoteTransferStatus::Done(_) => Some(TransferToast::upload_done(
                                 id,
                                 transfer.name.clone(),
-                                path,
+                                remote_path,
+                                remote_dir,
                                 is_folder,
                                 size,
                                 item_count,
                                 now,
-                            )
-                        }),
-                        RemoteTransferStatus::Failed(message) => Some(DownloadToast::failed(
-                            id,
-                            transfer.name.clone(),
-                            transfer.destination.clone(),
-                            is_folder,
-                            message.clone(),
-                            retryable,
-                            now,
-                        )),
-                        RemoteTransferStatus::FailedWithLeftover { message, .. } => {
-                            Some(DownloadToast::failed(
-                                id,
-                                transfer.name.clone(),
-                                transfer.destination.clone(),
-                                is_folder,
-                                message.clone(),
-                                retryable,
-                                now,
-                            ))
+                            )),
+                            RemoteTransferStatus::Failed(message) => {
+                                Some(TransferToast::upload_failed(
+                                    id,
+                                    transfer.name.clone(),
+                                    remote_path,
+                                    remote_dir,
+                                    is_folder,
+                                    message.clone(),
+                                    retryable,
+                                    now,
+                                ))
+                            }
+                            RemoteTransferStatus::FailedWithLeftover { message, .. } => {
+                                Some(TransferToast::upload_failed(
+                                    id,
+                                    transfer.name.clone(),
+                                    remote_path,
+                                    remote_dir,
+                                    is_folder,
+                                    message.clone(),
+                                    retryable,
+                                    now,
+                                ))
+                            }
+                            RemoteTransferStatus::Running => None,
                         }
-                        RemoteTransferStatus::Running => None,
                     }
+                    _ => None,
                 }
-            } else {
-                None
             }
         } else {
             None
         };
         if let Some(toast) = toast {
-            self.push_download_toast(toast);
+            self.push_transfer_toast(toast);
         }
         self.trim_remote_transfers();
     }

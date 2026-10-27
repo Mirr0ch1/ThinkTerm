@@ -43,7 +43,7 @@ use window::color::LinearRgba;
 
 pub mod borders;
 pub mod corners;
-pub mod download_card;
+pub mod transfer_card;
 pub mod draw;
 pub mod edge_light;
 pub mod fancy_tab_bar;

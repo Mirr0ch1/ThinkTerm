@@ -1,20 +1,21 @@
-//! The floating card that follows a remote download.
+//! The floating card that follows a remote download or upload.
 //!
-//! Downloads used to report themselves in the Files panel's transfer strip:
+//! Transfers used to report themselves in the Files panel's transfer strip:
 //! one narrow row at the bottom of the panel, where a long file name could
-//! push the percentage off the end. They are no longer painted there at all;
-//! this card is the one place a download shows its progress and its result.
-//! It sits in the window's own bottom-right corner — over the right sidebar
-//! when that is open — and offers the two things anyone wants at the end:
-//! open what was downloaded, or open the folder it landed in.
+//! push the percentage off the end. Downloads and uploads are no longer
+//! painted there at all; this card is the one place they show progress and
+//! result. It sits in the window's own bottom-right corner — over the right
+//! sidebar when that is open.
 //!
-//! Running cards are derived from the transfer records, which already own
-//! the live progress. A finished card is a snapshot, kept separately so it
-//! can outlive the transfer row it came from.
+//! Downloads end with Open File/Folder and Open Download Folder; uploads end
+//! with Copy Path. Running cards are derived from the transfer records,
+//! which already own the live progress. A finished card is a snapshot, kept
+//! separately so it can outlive the transfer row it came from.
 
 use crate::termwindow::remote_files::{
     RemoteTransferKind, RemoteTransferProgress, RemoteTransferStatus,
 };
+use config::keyassignment::ClipboardCopyDestination;
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::{UIItem, UIItemType};
 use crate::ui::draw::DrawContext;
@@ -57,35 +58,42 @@ const FADE_IN: Duration = Duration::from_millis(180);
 const FADE_OUT: Duration = Duration::from_millis(180);
 const FRAME: Duration = Duration::from_millis(16);
 
-/// A download that has stopped, kept long enough to be read. It carries a
+/// A transfer that has stopped, kept long enough to be read. It carries a
 /// snapshot of what the card needs because the strip may trim the row it came
 /// from before this card is done; the id only ties it to the transfer that
 /// produced it.
 #[derive(Clone, Debug)]
-pub(crate) struct DownloadToast {
+pub(crate) struct TransferToast {
+    pub kind: RemoteTransferKind,
     pub id: u64,
     pub name: String,
+    /// Where a download landed. `None` for an upload.
     pub path: Option<PathBuf>,
+    /// The remote path an upload occupies, for Copy Path. `None` for a
+    /// download.
+    pub remote_path: Option<String>,
+    /// The remote directory an upload landed in, for the detail line.
+    pub remote_dir: Option<String>,
     pub is_folder: bool,
     pub size: Option<u64>,
     pub item_count: Option<u64>,
-    /// A failed download can be run again from its transfer row, provided the
+    /// A failed transfer can be run again from its transfer row, provided the
     /// row kept its source and host. Successes never offer Retry.
     pub retryable: bool,
-    pub outcome: DownloadToastOutcome,
+    pub outcome: TransferToastOutcome,
     pub shown_at: Instant,
     pub paused_at: Option<Instant>,
     pub closing_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum DownloadToastOutcome {
+pub(crate) enum TransferToastOutcome {
     Done,
     Failed(String),
 }
 
-impl DownloadToast {
-    pub(crate) fn done(
+impl TransferToast {
+    pub(crate) fn download_done(
         id: u64,
         name: String,
         path: PathBuf,
@@ -95,21 +103,52 @@ impl DownloadToast {
         now: Instant,
     ) -> Self {
         Self {
+            kind: RemoteTransferKind::Download,
             id,
             name,
             path: Some(path),
+            remote_path: None,
+            remote_dir: None,
             is_folder,
             size,
             item_count,
             retryable: false,
-            outcome: DownloadToastOutcome::Done,
+            outcome: TransferToastOutcome::Done,
             shown_at: now,
             paused_at: None,
             closing_at: None,
         }
     }
 
-    pub(crate) fn failed(
+    pub(crate) fn upload_done(
+        id: u64,
+        name: String,
+        remote_path: Option<String>,
+        remote_dir: Option<String>,
+        is_folder: bool,
+        size: Option<u64>,
+        item_count: Option<u64>,
+        now: Instant,
+    ) -> Self {
+        Self {
+            kind: RemoteTransferKind::Upload,
+            id,
+            name,
+            path: None,
+            remote_path,
+            remote_dir,
+            is_folder,
+            size,
+            item_count,
+            retryable: false,
+            outcome: TransferToastOutcome::Done,
+            shown_at: now,
+            paused_at: None,
+            closing_at: None,
+        }
+    }
+
+    pub(crate) fn download_failed(
         id: u64,
         name: String,
         path: Option<PathBuf>,
@@ -119,27 +158,58 @@ impl DownloadToast {
         now: Instant,
     ) -> Self {
         Self {
+            kind: RemoteTransferKind::Download,
             id,
             name,
             path,
+            remote_path: None,
+            remote_dir: None,
             is_folder,
             size: None,
             item_count: None,
             retryable,
-            outcome: DownloadToastOutcome::Failed(message),
+            outcome: TransferToastOutcome::Failed(message),
             shown_at: now,
             paused_at: None,
             closing_at: None,
         }
     }
 
-    /// Success notices make way for the next download. A failure stays until
+    pub(crate) fn upload_failed(
+        id: u64,
+        name: String,
+        remote_path: Option<String>,
+        remote_dir: Option<String>,
+        is_folder: bool,
+        message: String,
+        retryable: bool,
+        now: Instant,
+    ) -> Self {
+        Self {
+            kind: RemoteTransferKind::Upload,
+            id,
+            name,
+            path: None,
+            remote_path,
+            remote_dir,
+            is_folder,
+            size: None,
+            item_count: None,
+            retryable,
+            outcome: TransferToastOutcome::Failed(message),
+            shown_at: now,
+            paused_at: None,
+            closing_at: None,
+        }
+    }
+
+    /// Success notices make way for the next transfer. A failure stays until
     /// the user closes it or retries: it carries the only way back into a
     /// transfer whose strip row is deliberately not shown.
     fn deadline(&self) -> Option<Instant> {
         match self.outcome {
-            DownloadToastOutcome::Done => Some(self.shown_at + DONE_TTL),
-            DownloadToastOutcome::Failed(_) => None,
+            TransferToastOutcome::Done => Some(self.shown_at + DONE_TTL),
+            TransferToastOutcome::Failed(_) => None,
         }
     }
 
@@ -165,12 +235,13 @@ impl DownloadToast {
 /// One card's content, either a live transfer or a finished snapshot.
 enum CardView {
     Running {
+        kind: RemoteTransferKind,
         id: u64,
         name: String,
         progress: RemoteTransferProgress,
         canceling: bool,
     },
-    Toast(DownloadToast),
+    Toast(TransferToast),
 }
 
 impl CardView {
@@ -183,19 +254,19 @@ impl CardView {
 }
 
 impl crate::TermWindow {
-    /// Paint the running and recently finished download cards. Called after
+    /// Paint the running and recently finished transfer cards. Called after
     /// the update capsule, so the two can share the corner without guessing
     /// at each other's height.
-    pub(crate) fn paint_download_cards(&mut self) -> anyhow::Result<()> {
+    pub(crate) fn paint_transfer_cards(&mut self) -> anyhow::Result<()> {
         let now = Instant::now();
-        let hidden = self.download_cards_hidden();
-        let views = self.download_card_views();
+        let hidden = self.transfer_cards_hidden();
+        let views = self.transfer_card_views();
 
         if views.is_empty() {
             // Nothing to show: let finished cards start their clock from the
             // moment the app is next looked at, rather than expire unseen.
             if hidden {
-                for toast in &mut self.download_toasts {
+                for toast in &mut self.transfer_toasts {
                     if toast.closing_at.is_none() && toast.paused_at.is_none() {
                         toast.paused_at = Some(now);
                     }
@@ -207,7 +278,7 @@ impl crate::TermWindow {
         if hidden {
             // Pause rather than expire: a menu or another app must not eat the
             // completion notice.
-            for toast in &mut self.download_toasts {
+            for toast in &mut self.transfer_toasts {
                 if toast.closing_at.is_none() && toast.paused_at.is_none() {
                     toast.paused_at = Some(now);
                 }
@@ -280,12 +351,14 @@ impl crate::TermWindow {
             .iter()
             .map(|view| match view {
                 CardView::Running { .. } => false,
-                CardView::Toast(toast) => match toast.outcome {
-                    DownloadToastOutcome::Done => self
-                        .download_toast_buttons_stack(toast, &body_font, button_room, px)
-                        .unwrap_or(false),
-                    DownloadToastOutcome::Failed(_) => false,
-                },
+                CardView::Toast(toast)
+                    if toast.kind == RemoteTransferKind::Download
+                        && matches!(toast.outcome, TransferToastOutcome::Done) =>
+                {
+                    self.transfer_toast_buttons_stack(toast, &body_font, button_room, px)
+                        .unwrap_or(false)
+                }
+                CardView::Toast(_) => false,
             })
             .collect();
 
@@ -313,7 +386,7 @@ impl crate::TermWindow {
         }
         rects.reverse();
 
-        self.advance_download_toasts(now, &rects);
+        self.advance_transfer_toasts(now, &rects);
 
         let gl_state = self
             .render_state
@@ -345,7 +418,7 @@ impl crate::TermWindow {
                 CardView::Running { .. } => (1.0, 0.0),
                 CardView::Toast(toast) => {
                     let Some(current) = self
-                        .download_toasts
+                        .transfer_toasts
                         .iter()
                         .find(|candidate| candidate.id == toast.id)
                     else {
@@ -388,17 +461,18 @@ impl crate::TermWindow {
             // The whole surface swallows clicks, not just the buttons. The
             // buttons are pushed after this and win the reverse-order hit
             // test, so only empty parts of the card reach this item.
-            card_items.push(ui_item(rect, UIItemType::DownloadCardBackground));
+            card_items.push(ui_item(rect, UIItemType::TransferCardBackground));
 
             match view {
                 CardView::Running {
+                    kind,
                     id,
                     name,
                     progress,
                     canceling,
                 } => {
                     running = true;
-                    self.paint_running_download_card(
+                    self.paint_running_transfer_card(
                         &mut layers,
                         &ctx,
                         &title_font,
@@ -408,6 +482,7 @@ impl crate::TermWindow {
                         &card_colors,
                         &chrome,
                         rect,
+                        *kind,
                         *id,
                         name,
                         progress,
@@ -423,7 +498,7 @@ impl crate::TermWindow {
                     )?;
                 }
                 CardView::Toast(toast) => {
-                    self.paint_finished_download_card(
+                    self.paint_finished_transfer_card(
                         &mut layers,
                         &ctx,
                         &title_font,
@@ -464,7 +539,7 @@ impl crate::TermWindow {
         // Remove cards that finished fading this frame. They were painted at
         // (or very near) zero alpha, so the next frame's layout simply closes
         // the gap.
-        self.download_toasts.retain(|toast| {
+        self.transfer_toasts.retain(|toast| {
             toast
                 .closing_at
                 .map_or(true, |at| now.duration_since(at) < FADE_OUT)
@@ -473,30 +548,45 @@ impl crate::TermWindow {
         Ok(())
     }
 
-    /// Keep at most [`MAX_CARDS`] finished notices; a burst of downloads must
-    /// not grow the corner without bound. The Files strip remains the log.
-    pub(crate) fn push_download_toast(&mut self, toast: DownloadToast) {
-        self.download_toasts
+    /// Keep at most [`MAX_CARDS`] finished notices; a burst of transfers must
+    /// not grow the corner without bound. The Files strip remains the log for
+    /// everything that is not a download or upload.
+    pub(crate) fn push_transfer_toast(&mut self, toast: TransferToast) {
+        self.transfer_toasts
             .retain(|existing| existing.id != toast.id);
-        self.download_toasts.push(toast);
-        self.download_toasts.sort_by_key(|toast| toast.id);
-        while self.download_toasts.len() > MAX_CARDS {
-            self.download_toasts.remove(0);
+        self.transfer_toasts.push(toast);
+        self.transfer_toasts.sort_by_key(|toast| toast.id);
+        while self.transfer_toasts.len() > MAX_CARDS {
+            self.transfer_toasts.remove(0);
         }
         self.invalidate_window();
     }
 
-    pub(crate) fn dismiss_download_toast(&mut self, id: u64) {
-        self.download_toasts.retain(|toast| toast.id != id);
+    pub(crate) fn dismiss_transfer_toast(&mut self, id: u64) {
+        self.transfer_toasts.retain(|toast| toast.id != id);
         self.invalidate_window();
     }
 
-    /// Retry the failed download behind a card. If the recorded host is no
+    /// Put an uploaded item's remote path on the clipboard. Downloads use
+    /// their Open buttons instead; this is only offered for uploads.
+    pub(crate) fn copy_transfer_path(&mut self, id: u64) {
+        let Some(path) = self
+            .transfer_toasts
+            .iter()
+            .find(|toast| toast.id == id)
+            .and_then(|toast| toast.remote_path.clone())
+        else {
+            return;
+        };
+        self.copy_to_clipboard(ClipboardCopyDestination::Clipboard, path);
+    }
+
+    /// Retry the failed transfer behind a card. If the recorded host is no
     /// longer the one the Files panel shows, the retry refuses; put that
     /// reason on the card instead of leaving the old error there.
-    pub(crate) fn retry_download_from_card(&mut self, id: u64, anchor: ::window::Point) {
+    pub(crate) fn retry_transfer_from_card(&mut self, id: u64, anchor: ::window::Point) {
         if self.retry_remote_transfer(id, anchor) {
-            self.dismiss_download_toast(id);
+            self.dismiss_transfer_toast(id);
         } else if let Some(message) = self
             .right_sidebar_remote_transfers
             .iter()
@@ -510,11 +600,11 @@ impl crate::TermWindow {
             })
         {
             if let Some(toast) = self
-                .download_toasts
+                .transfer_toasts
                 .iter_mut()
                 .find(|toast| toast.id == id)
             {
-                if let DownloadToastOutcome::Failed(existing) = &mut toast.outcome {
+                if let TransferToastOutcome::Failed(existing) = &mut toast.outcome {
                     *existing = message;
                 }
             }
@@ -526,9 +616,9 @@ impl crate::TermWindow {
     /// deleted since the card appeared, fall back to the folder that held it.
     pub(crate) fn open_download_toast(&mut self, id: u64) {
         let Some(path) = self
-            .download_toasts
+            .transfer_toasts
             .iter()
-            .find(|toast| toast.id == id)
+            .find(|toast| toast.id == id && toast.kind == RemoteTransferKind::Download)
             .and_then(|toast| toast.path.clone())
         else {
             return;
@@ -545,9 +635,9 @@ impl crate::TermWindow {
     /// may have changed since this file was fetched.
     pub(crate) fn open_download_toast_folder(&mut self, id: u64) {
         let folder = self
-            .download_toasts
+            .transfer_toasts
             .iter()
-            .find(|toast| toast.id == id)
+            .find(|toast| toast.id == id && toast.kind == RemoteTransferKind::Download)
             .and_then(|toast| toast.path.as_deref())
             .and_then(Path::parent)
             .map(Path::to_path_buf)
@@ -557,7 +647,7 @@ impl crate::TermWindow {
         }
     }
 
-    pub(crate) fn cancel_download_transfer(&mut self, id: u64) {
+    pub(crate) fn cancel_transfer(&mut self, id: u64) {
         if let Some(transfer) = self
             .right_sidebar_remote_transfers
             .iter()
@@ -568,21 +658,25 @@ impl crate::TermWindow {
         }
     }
 
-    fn download_cards_hidden(&self) -> bool {
+    fn transfer_cards_hidden(&self) -> bool {
         self.context_menu.is_some()
             || self.command_palette.is_some()
             || self.get_modal().is_some()
             || !crate::termwindow::app_has_focus()
     }
 
-    fn download_card_views(&self) -> Vec<CardView> {
+    fn transfer_card_views(&self) -> Vec<CardView> {
         let mut running: Vec<CardView> = self
             .right_sidebar_remote_transfers
             .iter()
             .filter(|transfer| {
-                transfer.kind == RemoteTransferKind::Download && transfer.is_running()
+                matches!(
+                    transfer.kind,
+                    RemoteTransferKind::Download | RemoteTransferKind::Upload
+                ) && transfer.is_running()
             })
             .map(|transfer| CardView::Running {
+                kind: transfer.kind,
                 id: transfer.id,
                 name: transfer.name.clone(),
                 progress: transfer.progress.clone(),
@@ -590,7 +684,7 @@ impl crate::TermWindow {
             })
             .collect();
         let mut finished: Vec<CardView> = self
-            .download_toasts
+            .transfer_toasts
             .iter()
             .cloned()
             .map(CardView::Toast)
@@ -598,7 +692,7 @@ impl crate::TermWindow {
         running.sort_by_key(CardView::id);
         finished.sort_by_key(CardView::id);
 
-        // A live transfer outranks a notice: starting three small downloads
+        // A live transfer outranks a notice: starting three small transfers
         // must never push the progress of the big one out of the corner.
         if running.len() >= MAX_CARDS {
             running.drain(..running.len() - MAX_CARDS);
@@ -616,9 +710,9 @@ impl crate::TermWindow {
         views
     }
 
-    fn download_toast_buttons_stack(
+    fn transfer_toast_buttons_stack(
         &self,
-        toast: &DownloadToast,
+        toast: &TransferToast,
         body_font: &std::rc::Rc<wezterm_font::LoadedFont>,
         room: f32,
         px: impl Fn(f32) -> f32,
@@ -639,7 +733,7 @@ impl crate::TermWindow {
         Ok(primary.max(secondary) + icon + padding > half)
     }
 
-    fn advance_download_toasts(
+    fn advance_transfer_toasts(
         &mut self,
         now: Instant,
         rects: &[(u64, euclid::Rect<f32, window::PixelUnit>)],
@@ -651,7 +745,7 @@ impl crate::TermWindow {
             .collect();
         let visible: HashSet<u64> = rects.iter().map(|(id, _)| *id).collect();
 
-        for toast in &mut self.download_toasts {
+        for toast in &mut self.transfer_toasts {
             if toast.closing_at.is_some() {
                 continue;
             }
@@ -676,7 +770,7 @@ impl crate::TermWindow {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_running_download_card(
+    fn paint_running_transfer_card(
         &self,
         layers: &mut crate::quad::TripleLayerQuadAllocator,
         ctx: &DrawContext,
@@ -687,6 +781,7 @@ impl crate::TermWindow {
         card: &crate::ui::tokens::UiPalette,
         chrome: &crate::ui::tokens::UiPalette,
         rect: euclid::Rect<f32, window::PixelUnit>,
+        kind: RemoteTransferKind,
         id: u64,
         name: &str,
         progress: &RemoteTransferProgress,
@@ -718,7 +813,10 @@ impl crate::TermWindow {
             ctx,
             rect.origin.x + pad + px(ICON_DISC) / 2.0,
             title_y + title_line / 2.0,
-            SvgIcon::Download,
+            match kind {
+                RemoteTransferKind::Upload => SvgIcon::Upload,
+                _ => SvgIcon::Download,
+            },
             chrome.accent.mul_alpha(0.16 * alpha),
             chrome.accent.mul_alpha(alpha),
             &px,
@@ -758,10 +856,10 @@ impl crate::TermWindow {
                     muted
                 },
             )?;
-            ui_items.push(ui_item(cancel_rect, UIItemType::DownloadCardCancel(id)));
+            ui_items.push(ui_item(cancel_rect, UIItemType::TransferCardCancel(id)));
         }
 
-        let detail = running_detail(progress, canceling);
+        let detail = running_detail(progress, canceling, kind);
         let detail_y = title_y + title_line + gap * 0.5;
         self.paint_sidebar_text(
             layers,
@@ -817,7 +915,7 @@ impl crate::TermWindow {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_finished_download_card(
+    fn paint_finished_transfer_card(
         &self,
         layers: &mut crate::quad::TripleLayerQuadAllocator,
         ctx: &DrawContext,
@@ -828,7 +926,7 @@ impl crate::TermWindow {
         card: &crate::ui::tokens::UiPalette,
         chrome: &crate::ui::tokens::UiPalette,
         rect: euclid::Rect<f32, window::PixelUnit>,
-        toast: &DownloadToast,
+        toast: &TransferToast,
         stacked: bool,
         alpha: f32,
         pad: f32,
@@ -839,7 +937,7 @@ impl crate::TermWindow {
         ui_items: &mut Vec<UIItem>,
         px: impl Fn(f32) -> f32,
     ) -> anyhow::Result<()> {
-        let failed = matches!(toast.outcome, DownloadToastOutcome::Failed(_));
+        let failed = matches!(toast.outcome, TransferToastOutcome::Failed(_));
         let title_y = rect.origin.y + pad;
         let title_x = rect.origin.x + pad + px(ICON_DISC) + gap * 0.75;
         let title_right = rect.max_x() - pad;
@@ -878,10 +976,11 @@ impl crate::TermWindow {
             &px,
         )?;
 
-        let title = if failed {
-            crate::i18n::tr("download-card-failed")
-        } else {
-            crate::i18n::tr("download-completed")
+        let title = match (toast.kind, failed) {
+            (RemoteTransferKind::Upload, true) => crate::i18n::tr("upload-card-failed"),
+            (RemoteTransferKind::Upload, false) => crate::i18n::tr("upload-completed"),
+            (_, true) => crate::i18n::tr("download-card-failed"),
+            (_, false) => crate::i18n::tr("download-completed"),
         };
         self.paint_sidebar_text(
             layers,
@@ -912,8 +1011,11 @@ impl crate::TermWindow {
 
         let detail_y = name_y + body_line + gap * 0.5;
         let detail = match &toast.outcome {
-            DownloadToastOutcome::Done => done_detail(toast),
-            DownloadToastOutcome::Failed(message) => message.clone(),
+            TransferToastOutcome::Done => match toast.kind {
+                RemoteTransferKind::Upload => upload_done_detail(toast),
+                _ => download_done_detail(toast),
+            },
+            TransferToastOutcome::Failed(message) => message.clone(),
         };
         self.paint_sidebar_text(
             layers,
@@ -938,7 +1040,7 @@ impl crate::TermWindow {
         .context("download card close icon")?;
         ui_items.push(ui_item(
             close_rect,
-            UIItemType::DownloadCardDismiss(toast.id),
+            UIItemType::TransferCardDismiss(toast.id),
         ));
 
         let room = rect.size.width - pad * 2.0;
@@ -964,7 +1066,33 @@ impl crate::TermWindow {
                 )?;
                 ui_items.push(ui_item(
                     retry_rect,
-                    UIItemType::DownloadCardRetry(toast.id),
+                    UIItemType::TransferCardRetry(toast.id),
+                ));
+            }
+            return Ok(());
+        }
+
+        if toast.kind == RemoteTransferKind::Upload {
+            if toast.remote_path.is_some() {
+                let copy = crate::i18n::tr("right-copy-path");
+                let copy_rect =
+                    euclid::rect(rect.origin.x + pad, buttons_y, room, button_h);
+                self.paint_card_button(
+                    layers,
+                    body_font,
+                    body_metrics,
+                    card,
+                    chrome,
+                    copy_rect,
+                    SvgIcon::Copy,
+                    &copy,
+                    false,
+                    alpha,
+                    &px,
+                )?;
+                ui_items.push(ui_item(
+                    copy_rect,
+                    UIItemType::TransferCardCopyPath(toast.id),
                 ));
             }
             return Ok(());
@@ -1018,7 +1146,7 @@ impl crate::TermWindow {
         )?;
         ui_items.push(ui_item(
             primary_rect,
-            UIItemType::DownloadCardOpen(toast.id),
+            UIItemType::TransferCardOpen(toast.id),
         ));
 
         self.paint_card_button(
@@ -1036,7 +1164,7 @@ impl crate::TermWindow {
         )?;
         ui_items.push(ui_item(
             secondary_rect,
-            UIItemType::DownloadCardOpenDownloads(toast.id),
+            UIItemType::TransferCardOpenDownloads(toast.id),
         ));
 
         Ok(())
@@ -1154,7 +1282,7 @@ impl crate::TermWindow {
     }
 }
 
-fn done_detail(toast: &DownloadToast) -> String {
+fn download_done_detail(toast: &TransferToast) -> String {
     let mut parts = Vec::new();
     if let Some(size) = toast.size {
         parts.push(format_size(size));
@@ -1162,13 +1290,31 @@ fn done_detail(toast: &DownloadToast) -> String {
     if let Some(count) = toast.item_count {
         let mut args = fluent_bundle::FluentArgs::new();
         args.set("count", count as i64);
-        parts.push(crate::i18n::tr_args("download-card-items", &args));
+        parts.push(crate::i18n::tr_args("transfer-card-items", &args));
     }
     if let Some(path) = &toast.path {
         let folder = path.parent().unwrap_or(path);
         let mut args = fluent_bundle::FluentArgs::new();
         args.set("path", display_folder(folder));
         parts.push(crate::i18n::tr_args("download-card-saved-to", &args));
+    }
+    parts.join(" · ")
+}
+
+fn upload_done_detail(toast: &TransferToast) -> String {
+    let mut parts = Vec::new();
+    if let Some(size) = toast.size {
+        parts.push(format_size(size));
+    }
+    if let Some(count) = toast.item_count {
+        let mut args = fluent_bundle::FluentArgs::new();
+        args.set("count", count as i64);
+        parts.push(crate::i18n::tr_args("transfer-card-items", &args));
+    }
+    if let Some(directory) = &toast.remote_dir {
+        let mut args = fluent_bundle::FluentArgs::new();
+        args.set("path", directory.clone());
+        parts.push(crate::i18n::tr_args("upload-card-uploaded-to", &args));
     }
     parts.join(" · ")
 }
@@ -1188,9 +1334,13 @@ fn display_folder(path: &Path) -> String {
     path.display().to_string()
 }
 
-fn running_detail(progress: &RemoteTransferProgress, canceling: bool) -> String {
+fn running_detail(
+    progress: &RemoteTransferProgress,
+    canceling: bool,
+    kind: RemoteTransferKind,
+) -> String {
     if canceling {
-        return crate::i18n::tr("download-card-canceling");
+        return crate::i18n::tr("transfer-card-canceling");
     }
     if let Some((done, total)) = progress.items() {
         return format!("{done} / {total}");
@@ -1207,11 +1357,14 @@ fn running_detail(progress: &RemoteTransferProgress, canceling: bool) -> String 
     if progress.transferred() > 0 {
         return format!(
             "{} · {}",
-            crate::i18n::tr("update-capsule-downloading"),
+            match kind {
+                RemoteTransferKind::Upload => crate::i18n::tr("upload-card-uploading"),
+                _ => crate::i18n::tr("update-capsule-downloading"),
+            },
             format_size(progress.transferred())
         );
     }
-    crate::i18n::tr("download-card-preparing")
+    crate::i18n::tr("transfer-card-preparing")
 }
 
 /// Binary units, one decimal past bytes, matching Settings' size language
@@ -1247,21 +1400,34 @@ fn card_height(
             pad * 2.0 + title_line + gap * 0.5 + body_line + gap * 0.75 + bar_h
         }
         CardView::Toast(toast) => match toast.outcome {
-            DownloadToastOutcome::Done => {
+            TransferToastOutcome::Done => {
+                let (button_area, button_gap) = match toast.kind {
+                    RemoteTransferKind::Upload => {
+                        if toast.remote_path.is_some() {
+                            (button_h, gap)
+                        } else {
+                            (0.0, 0.0)
+                        }
+                    }
+                    _ => (
+                        if stacked {
+                            button_h * 2.0 + gap
+                        } else {
+                            button_h
+                        },
+                        gap,
+                    ),
+                };
                 pad * 2.0
                     + title_line
                     + gap * 0.5
                     + body_line
                     + gap * 0.5
                     + body_line
-                    + gap
-                    + if stacked {
-                        button_h * 2.0 + gap
-                    } else {
-                        button_h
-                    }
+                    + button_gap
+                    + button_area
             }
-            DownloadToastOutcome::Failed(_) => {
+            TransferToastOutcome::Failed(_) => {
                 pad * 2.0
                     + title_line
                     + gap * 0.5
@@ -1316,7 +1482,7 @@ mod tests {
     #[test]
     fn a_finished_card_fades_in_and_expires_after_its_ttl() {
         let now = Instant::now();
-        let toast = DownloadToast::done(
+        let toast = TransferToast::download_done(
             1,
             "a.txt".to_string(),
             PathBuf::from("/tmp/a.txt"),
@@ -1334,7 +1500,7 @@ mod tests {
     #[test]
     fn a_failure_card_waits_for_retry_or_close() {
         let now = Instant::now();
-        let toast = DownloadToast::failed(
+        let toast = TransferToast::download_failed(
             2,
             "b.txt".to_string(),
             None,
@@ -1345,7 +1511,7 @@ mod tests {
         );
         assert_eq!(
             toast.outcome,
-            DownloadToastOutcome::Failed("connection lost".to_string())
+            TransferToastOutcome::Failed("connection lost".to_string())
         );
         assert_eq!(toast.size, None);
         assert_eq!(toast.item_count, None);
@@ -1356,7 +1522,7 @@ mod tests {
     #[test]
     fn a_finished_detail_names_the_folder_not_the_file_twice() {
         let now = Instant::now();
-        let toast = DownloadToast::done(
+        let toast = TransferToast::download_done(
             3,
             "report.pdf".to_string(),
             PathBuf::from("/nonesuch/Downloads/report.pdf"),
@@ -1365,7 +1531,7 @@ mod tests {
             None,
             now,
         );
-        let detail = done_detail(&toast);
+        let detail = download_done_detail(&toast);
         assert!(detail.starts_with("2.0 MB"));
         assert!(detail.contains("/nonesuch/Downloads"));
         assert!(!detail.contains("report.pdf"));
@@ -1374,7 +1540,7 @@ mod tests {
     #[test]
     fn a_folder_detail_counts_items_without_a_byte_total() {
         let now = Instant::now();
-        let toast = DownloadToast::done(
+        let toast = TransferToast::download_done(
             5,
             "tree".to_string(),
             PathBuf::from("/nonesuch/Downloads/tree"),
@@ -1383,8 +1549,27 @@ mod tests {
             Some(12),
             now,
         );
-        let detail = done_detail(&toast);
+        let detail = download_done_detail(&toast);
         assert!(detail.contains("12"));
         assert!(detail.contains("/nonesuch/Downloads"));
+    }
+
+    #[test]
+    fn an_upload_detail_names_its_remote_folder() {
+        let now = Instant::now();
+        let toast = TransferToast::upload_done(
+            6,
+            "up.txt".to_string(),
+            Some("/srv/project/up.txt".to_string()),
+            Some("/srv/project".to_string()),
+            false,
+            Some(1234),
+            None,
+            now,
+        );
+        let detail = upload_done_detail(&toast);
+        assert!(detail.starts_with("1.2 KB"));
+        assert!(detail.contains("/srv/project"));
+        assert_eq!(toast.kind, RemoteTransferKind::Upload);
     }
 }
