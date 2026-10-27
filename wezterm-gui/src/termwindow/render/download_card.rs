@@ -385,6 +385,11 @@ impl crate::TermWindow {
             )
             .context("download card surface")?;
 
+            // The whole surface swallows clicks, not just the buttons. The
+            // buttons are pushed after this and win the reverse-order hit
+            // test, so only empty parts of the card reach this item.
+            card_items.push(ui_item(rect, UIItemType::DownloadCardBackground));
+
             match view {
                 CardView::Running {
                     id,

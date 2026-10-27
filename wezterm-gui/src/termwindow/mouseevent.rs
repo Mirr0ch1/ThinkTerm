@@ -1752,6 +1752,7 @@ impl super::TermWindow {
             | UIItemType::DownloadCardRetry(_)
             | UIItemType::DownloadCardOpen(_)
             | UIItemType::DownloadCardOpenDownloads(_)
+            | UIItemType::DownloadCardBackground
             | UIItemType::ContextMenuBackdrop
             | UIItemType::ContextMenuItem(_)
             | UIItemType::CommandPalette
@@ -1935,6 +1936,7 @@ impl super::TermWindow {
             | UIItemType::DownloadCardRetry(_)
             | UIItemType::DownloadCardOpen(_)
             | UIItemType::DownloadCardOpenDownloads(_)
+            | UIItemType::DownloadCardBackground
             | UIItemType::ContextMenuBackdrop
             | UIItemType::ContextMenuItem(_)
             | UIItemType::CommandPalette
@@ -4232,7 +4234,8 @@ impl super::TermWindow {
             | UIItemType::DownloadCardDismiss(_)
             | UIItemType::DownloadCardRetry(_)
             | UIItemType::DownloadCardOpen(_)
-            | UIItemType::DownloadCardOpenDownloads(_) => {
+            | UIItemType::DownloadCardOpenDownloads(_)
+            | UIItemType::DownloadCardBackground => {
                 self.mouse_event_download_card(item.clone(), event, context);
             }
             UIItemType::UpdateCapsule => self.mouse_event_update_capsule(false, event, context),
@@ -4699,7 +4702,8 @@ impl super::TermWindow {
             | UIItemType::DownloadCardDismiss(_)
             | UIItemType::DownloadCardRetry(_)
             | UIItemType::DownloadCardOpen(_)
-            | UIItemType::DownloadCardOpenDownloads(_) => {
+            | UIItemType::DownloadCardOpenDownloads(_)
+            | UIItemType::DownloadCardBackground => {
                 self.mouse_event_download_card(item.clone(), event, context);
             }
             UIItemType::UpdateCapsule => self.mouse_event_update_capsule(false, event, context),
@@ -5766,6 +5770,12 @@ impl super::TermWindow {
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
+        if item.item_type == UIItemType::DownloadCardBackground {
+            // The card's empty surface is still part of the card: keep the
+            // click here instead of letting it select a file underneath.
+            context.set_cursor(Some(MouseCursor::Arrow));
+            return;
+        }
         context.set_cursor(Some(MouseCursor::Hand));
         if event.kind != WMEK::Press(MousePress::Left) {
             return;

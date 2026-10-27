@@ -886,6 +886,9 @@ pub enum UIItemType {
     DownloadCardRetry(u64),
     DownloadCardOpen(u64),
     DownloadCardOpenDownloads(u64),
+    /// The card's own surface: swallows clicks that miss a button so they do
+    /// not fall through to the file tree or terminal underneath.
+    DownloadCardBackground,
     /// The area a plugin's panel draws in: the pointer and the wheel over it
     /// go to the panel's player.
     RightSidebarPluginPanel,
