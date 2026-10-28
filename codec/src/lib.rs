@@ -305,14 +305,19 @@ fn check_payload_length(data_len: usize, len: u64, serial: u64, ident: u64) -> a
 async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
     r: &mut R,
     max_serial: Option<u64>,
+    payload_limit: Option<usize>,
 ) -> anyhow::Result<Decoded> {
-    decode_raw_async_limited(r, max_serial, None).await
+    decode_raw_async_limited(r, max_serial, None, payload_limit).await
 }
 
+/// `payload_limit` is for a peer trusted with little: a payload past it is
+/// refused before it is read, and a compressed one is inflated here, to no
+/// more than it either.
 async fn decode_raw_async_limited<R: Unpin + AsyncRead + std::fmt::Debug>(
     r: &mut R,
     max_serial: Option<u64>,
     push_budget: Option<usize>,
+    payload_limit: Option<usize>,
 ) -> anyhow::Result<Decoded> {
     let len = read_u64_async(r)
         .await
@@ -355,6 +360,15 @@ async fn decode_raw_async_limited<R: Unpin + AsyncRead + std::fmt::Debug>(
         };
 
     check_payload_length(data_len, len, serial, ident)?;
+    if let Some(limit) = payload_limit {
+        if data_len > limit {
+            return Err(CorruptResponse(format!(
+                "a payload of {data_len} bytes is more than this connection takes \
+                 ({limit} bytes)"
+            ))
+            .into());
+        }
+    }
     if serial == 0 && ident != 1 {
         if let Some(budget) = push_budget {
             anyhow::ensure!(data_len <= budget, "registration push exceeds byte budget");
@@ -378,6 +392,10 @@ async fn decode_raw_async_limited<R: Unpin + AsyncRead + std::fmt::Debug>(
         })?;
         data.push(piece);
     }
+    let (data, is_compressed) = match payload_limit {
+        Some(limit) if is_compressed => (inflate_within(&data, limit)?, false),
+        _ => (data, is_compressed),
+    };
     Ok(Decoded {
         ident,
         serial,
@@ -450,6 +468,32 @@ pub struct DecodedPdu {
 /// If the serialized size is larger than this, then we'll consider compressing it
 #[cfg(not(target_family = "wasm"))]
 const COMPRESS_THRESH: usize = 32;
+
+/// A compressed payload from a peer held to `limit`, inflated: no more
+/// than `limit` bytes of it, or none, so what it inflates to is held to the
+/// limit as an uncompressed one is.
+fn inflate_within(data: &Payload, limit: usize) -> anyhow::Result<Payload> {
+    #[cfg(not(target_family = "wasm"))]
+    let decompress = zstd::Decoder::new(data.reader())?;
+    #[cfg(target_family = "wasm")]
+    let decompress = ruzstd::decoding::StreamingDecoder::new(data.reader())
+        .map_err(|e| anyhow::anyhow!("ruzstd: {e}"))?;
+    use std::io::Read as _;
+    let mut inflated = Vec::new();
+    decompress
+        .take(limit as u64 + 1)
+        .read_to_end(&mut inflated)
+        .context("inflating a payload")?;
+    if inflated.len() > limit {
+        return Err(CorruptResponse(format!(
+            "a payload inflating past {limit} bytes is more than this connection takes"
+        ))
+        .into());
+    }
+    let mut payload = Payload::default();
+    payload.push(inflated);
+    Ok(payload)
+}
 
 /// Where a PDU is going, which decides whether it is compressed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -717,9 +761,29 @@ macro_rules! pdu {
                       R: AsyncRead,
                       R: std::fmt::Debug
             {
+                Self::decode_async_within(r, max_serial, None).await
+            }
+
+            /// `decode_async` for a peer trusted with little, such as a
+            /// viewer on the share socket: a payload past `payload_limit` is
+            /// refused before it is read, and one that inflates past it is
+            /// refused as it inflates.
+            pub async fn decode_async_bounded<R>(r: &mut R, max_serial: Option<u64>, payload_limit: usize) -> Result<DecodedPdu, Error>
+                where R: std::marker::Unpin,
+                      R: AsyncRead,
+                      R: std::fmt::Debug
+            {
+                Self::decode_async_within(r, max_serial, Some(payload_limit)).await
+            }
+
+            async fn decode_async_within<R>(r: &mut R, max_serial: Option<u64>, payload_limit: Option<usize>) -> Result<DecodedPdu, Error>
+                where R: std::marker::Unpin,
+                      R: AsyncRead,
+                      R: std::fmt::Debug
+            {
                 #[cfg(not(target_family = "wasm"))]
                 let started = std::time::Instant::now();
-                let decoded = decode_raw_async(r, max_serial).await.context("decoding a PDU")?;
+                let decoded = decode_raw_async(r, max_serial, payload_limit).await.context("decoding a PDU")?;
                 // Only a debug line above 64 KiB reads these; wasm has no
                 // Instant, and the line is not worth a clock abstraction.
                 #[cfg(not(target_family = "wasm"))]
@@ -828,7 +892,8 @@ macro_rules! pdu {
 ///     threads behind workspaces (GetWorkspaceNames), and
 ///     ClientJoined/ClientLeft.
 /// 82: SwapPanes swaps two panes of a tab, each into the other's place.
-pub const CODEC_VERSION: usize = 82;
+/// 83: Sharing a pane with other accounts on the machine (Share* PDUs).
+pub const CODEC_VERSION: usize = 83;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -949,6 +1014,25 @@ pdu! {
     ClientJoined: 120,
     ClientLeft: 121,
     SwapPanes: 122,
+    ShareStart: 123,
+    ShareList: 124,
+    ShareListResponse: 125,
+    ShareStop: 126,
+    ShareKick: 127,
+    ShareGrant: 128,
+    ShareRevoke: 129,
+    ShareIncoming: 130,
+    ShareIncomingResponse: 131,
+    ShareJoin: 132,
+    ShareJoinResponse: 133,
+    ShareRequestControl: 134,
+    ShareReleaseControl: 135,
+    ShareStateChanged: 136,
+    ShareDiscover: 137,
+    ShareDiscoverResponse: 138,
+    ShareDeny: 139,
+    ShareCandidates: 140,
+    ShareCandidatesResponse: 141,
 }
 
 impl Pdu {
@@ -1984,6 +2068,243 @@ pub struct ClientLeft {
     pub client_id: ClientId,
 }
 
+/// The directory an account's server listens in for viewers of the panes it
+/// shares. It belongs to that account and nobody else may write to it, so a
+/// socket found in it is that account's; a viewer checks both before it
+/// believes one.
+pub fn share_socket_dir(uid: u32) -> PathBuf {
+    PathBuf::from(format!("/tmp/{SHARE_SOCKET_DIR_PREFIX}{uid}"))
+}
+
+pub const SHARE_SOCKET_DIR_PREFIX: &str = "thinkterm-share-";
+pub const SHARE_SOCKET_NAME: &str = "share.sock";
+
+/// Who a shared pane is for: an account on the server's machine, or every
+/// account in one of its groups, by name.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub enum ShareAudience {
+    User(String),
+    Group(String),
+}
+
+/// As it is typed: `name`, or `group:name`.
+impl std::fmt::Display for ShareAudience {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::User(name) => write!(f, "{name}"),
+            Self::Group(name) => write!(f, "group:{name}"),
+        }
+    }
+}
+
+/// Share a pane with other accounts on the server's machine: they may
+/// watch it, and one at a time may type into it once its owner agrees.
+/// Responds with `ShareListResponse` holding just the new share.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareStart {
+    pub pane_id: PaneId,
+    pub audience: Vec<ShareAudience>,
+    /// Asks for viewers to read the pane's history too. Not granted: a
+    /// share shows only what is on the pane's screen.
+    pub history: bool,
+    /// Seconds until the share ends by itself: at most half an hour, which
+    /// is also what `None` gets.
+    pub expires_in_secs: Option<u64>,
+    /// Asked by a person, from the desktop's share button. A share starts
+    /// no other way: a program in a pane -- an agent -- is refused.
+    pub from_desktop: bool,
+}
+
+/// The shares this server holds. Responds with `ShareListResponse`.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareList {}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareListResponse {
+    pub shares: Vec<ShareInfo>,
+}
+
+/// A share as its owner sees it. Times are seconds since the Unix epoch.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareInfo {
+    pub share_id: u64,
+    pub pane_id: PaneId,
+    pub audience: Vec<ShareAudience>,
+    pub history: bool,
+    pub started: u64,
+    pub expires: Option<u64>,
+    pub viewers: Vec<ShareViewer>,
+    /// The viewer who may type, and until when; `None` when only the owner
+    /// types.
+    pub controller: Option<ShareController>,
+    /// Viewers waiting to be allowed to type, oldest first.
+    pub requests: Vec<ShareViewer>,
+}
+
+/// One viewer's connection. The id names it to `ShareKick` and `ShareGrant`.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareViewer {
+    pub viewer_id: u64,
+    pub name: String,
+    pub since: u64,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareController {
+    pub viewer_id: u64,
+    pub name: String,
+    pub until: Option<u64>,
+}
+
+/// End a share and drop everyone watching it. Responds with UnitResponse.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareStop {
+    pub share_id: u64,
+}
+
+/// Drop one viewer from a share. Responds with UnitResponse.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareKick {
+    pub share_id: u64,
+    pub viewer_id: u64,
+}
+
+/// Let one viewer type, in place of whoever could before. Responds with
+/// UnitResponse.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareGrant {
+    pub share_id: u64,
+    pub viewer_id: u64,
+    /// Seconds until the right lapses; `None` keeps it until taken back.
+    pub for_secs: Option<u64>,
+    /// Asked by a person, from the desktop's share panel, as a share's
+    /// start is.
+    pub from_desktop: bool,
+}
+
+/// Turn down a viewer's request to type; it goes on watching. Responds
+/// with UnitResponse.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareDeny {
+    pub share_id: u64,
+    pub viewer_id: u64,
+}
+
+/// Take typing back from the viewer who has it. Responds with UnitResponse.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareRevoke {
+    pub share_id: u64,
+}
+
+/// From a viewer: the shares this server has made for it. Responds with
+/// `ShareIncomingResponse`.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareIncoming {}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareIncomingResponse {
+    /// The account the server runs as.
+    pub owner: String,
+    pub shares: Vec<IncomingShare>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct IncomingShare {
+    pub share_id: u64,
+    pub pane_id: PaneId,
+    pub title: String,
+    pub history: bool,
+    pub started: u64,
+    /// The name of whoever may type now, besides the owner.
+    pub controller: Option<String>,
+}
+
+/// To a client's own server: the panes other accounts on its machine share
+/// with the account it runs as. The server asks each of them, as that
+/// account. Responds with `ShareDiscoverResponse`.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareDiscover {}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareDiscoverResponse {
+    /// One entry per account with something shared, each with its shares.
+    pub owners: Vec<ShareIncomingResponse>,
+    /// The accounts whose ThinkTerm is another version than the server's:
+    /// what they share cannot be read from it.
+    pub other_version: Vec<String>,
+    /// The `thinkterm` program beside the server, which watches a share
+    /// with `cli share watch OWNER/SHARE`.
+    pub watch_program: Option<PathBuf>,
+}
+
+/// From a viewer: start watching a share. A connection watches one share.
+/// Responds with `ShareJoinResponse`; the pane's rows are then read as any
+/// client reads them.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareJoin {
+    pub share_id: u64,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareJoinResponse {
+    pub share_id: u64,
+    pub pane_id: PaneId,
+    pub viewer_id: u64,
+    /// Whether the viewer may read the pane's history. Without it only the
+    /// rows on the screen when they are asked for come back.
+    pub history: bool,
+}
+
+/// From a viewer: ask the owner to let it type. Responds with UnitResponse.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareRequestControl {
+    pub share_id: u64,
+}
+
+/// From a viewer: give typing back, or withdraw a request. Responds with
+/// UnitResponse.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareReleaseControl {
+    pub share_id: u64,
+}
+
+/// The accounts and groups of the server's machine a pane can be shared
+/// with, for a person to pick from. Responds with
+/// `ShareCandidatesResponse`.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareCandidates {}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareCandidatesResponse {
+    /// The account the server runs as.
+    pub me: String,
+    /// People's accounts, not the system's own; `me` among them.
+    pub accounts: Vec<String>,
+    pub groups: Vec<String>,
+}
+
+/// Why a viewer's watch ended, in `ShareStateChanged::ended`.
+pub mod share_end {
+    /// The owner stopped sharing, or the owner's ThinkTerm stopped.
+    pub const STOPPED: &str = "stopped";
+    /// The owner removed this viewer.
+    pub const REMOVED: &str = "removed";
+    pub const EXPIRED: &str = "expired";
+    /// The shared pane closed.
+    pub const CLOSED: &str = "closed";
+}
+
+/// Unilateral, to a viewer: whether it may type now, and who does; or,
+/// with `ended`, why the share is over for it (a `share_end` code).
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareStateChanged {
+    pub share_id: u64,
+    pub controlling: bool,
+    pub requested: bool,
+    pub controller: Option<String>,
+    pub ended: Option<String>,
+}
+
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct SetPaneZoomed {
     pub containing_tab_id: TabId,
@@ -2925,9 +3246,43 @@ mod test {
             futures_lite::future::block_on(decode_raw_async(
                 &mut futures_lite::io::Cursor::new(encoded),
                 None,
+                None,
             ))
             .unwrap(),
         );
+    }
+
+    #[test]
+    fn a_bounded_peer_may_compress_but_not_past_the_limit() {
+        let decode = |bytes: Vec<u8>| {
+            futures_lite::future::block_on(Pdu::decode_async_bounded(
+                &mut futures_lite::io::Cursor::new(bytes),
+                None,
+                4096,
+            ))
+        };
+        // A paste the client compressed, as it compresses anything that
+        // shrinks: taken, and read as it was sent.
+        let paste = Pdu::SendPaste(SendPaste {
+            pane_id: 1,
+            data: "echo hello; ".repeat(50),
+        });
+        let mut bytes = vec![];
+        paste.encode(&mut bytes, 7).unwrap();
+        assert!(bytes.len() < 600, "it went compressed");
+        assert_eq!(decode(bytes).unwrap().pdu, paste);
+
+        // One that inflates past the limit is refused, however small it
+        // was on the wire.
+        let bomb = Pdu::SendPaste(SendPaste {
+            pane_id: 1,
+            data: "a".repeat(64 * 1024),
+        });
+        let mut bytes = vec![];
+        bomb.encode(&mut bytes, 8).unwrap();
+        assert!(bytes.len() < 4096);
+        let err = decode(bytes).expect_err("refused");
+        assert!(format!("{err:#}").contains("inflating past"), "{:#}", err);
     }
 
     /// The wasm client's receive path: a native server compresses with the
@@ -3198,7 +3553,7 @@ mod test {
         // tripwire: whoever bumps the codec must come here, confirm the
         // round-trips still cover the new version, and advance it
         // deliberately.
-        assert_eq!(CODEC_VERSION, 82);
+        assert_eq!(CODEC_VERSION, 83);
         use thinkterm_proto::{
             AgentEvidence, AgentState, AgentStatus, ProgramBlockedKind, ProgramReport,
             ProgramReportChild, ProgramReportState,
@@ -3268,7 +3623,7 @@ mod test {
     #[test]
     fn foreground_program_protocol_round_trip_at_version_74() {
         // Same tripwire as the agent-status test above.
-        assert_eq!(CODEC_VERSION, 82);
+        assert_eq!(CODEC_VERSION, 83);
         use thinkterm_proto::ForegroundProgram;
 
         fn round_trip(pdu: &Pdu) -> Pdu {
@@ -3369,7 +3724,7 @@ mod test {
     #[test]
     fn run_state_protocol_round_trip_at_version_80() {
         // Same tripwire as the agent-status test above.
-        assert_eq!(CODEC_VERSION, 82);
+        assert_eq!(CODEC_VERSION, 83);
         use thinkterm_proto::{PaneExit, PaneRunState, ProgramState, ShellCommands};
 
         let exit = PaneExit {
@@ -3468,7 +3823,7 @@ mod test {
     fn frame_control_extension_round_trips_without_changing_legacy_version() {
         // The extension is asked for, so it needed no bump of its own; 74
         // is the foreground program's, which a server sends unasked.
-        assert_eq!(CODEC_VERSION, 82);
+        assert_eq!(CODEC_VERSION, 83);
         for pdu in [
             Pdu::GetKittyImage(GetKittyImage { pane_id: 3, image_id: 7, data_hash: [9; 32], have_frames: 2, image_epoch: Some(4) }),
             Pdu::GetKittyFrameSelections(GetKittyFrameSelections { pane_id: 3, subscribe: true }),
