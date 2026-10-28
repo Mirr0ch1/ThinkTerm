@@ -748,6 +748,7 @@ fn install_shutdown_signal_handler() -> anyhow::Result<()> {
                     log::error!("flushing ThinkTerm layouts before shutdown: {err:#}");
                 }
                 wezterm_mux_server_impl::thinkterm_layout::keep_pane_output();
+                wezterm_mux_server_impl::share::shut_down();
                 std::process::exit(0);
             })
             .detach();
@@ -1107,6 +1108,7 @@ mod windows_daemon {
                 log::error!("flushing ThinkTerm layouts before shutdown: {err:#}");
             }
             wezterm_mux_server_impl::thinkterm_layout::keep_pane_output();
+            wezterm_mux_server_impl::share::shut_down();
             std::process::exit(0);
         })
         .detach();

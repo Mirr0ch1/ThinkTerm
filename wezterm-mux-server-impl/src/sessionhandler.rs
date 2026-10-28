@@ -124,6 +124,9 @@ pub(crate) struct PerPane {
     /// The connection subscribed to events: a push carries the pane's
     /// alerts and nothing of what it shows.
     events_only: bool,
+    /// The connection is a viewer of a shared pane: a push reads its rows
+    /// with the screen they are on (see `Pane::get_screen_lines`).
+    viewer: bool,
 }
 
 /// What may wait for one pane from one connection before further input is
@@ -131,6 +134,10 @@ pub(crate) struct PerPane {
 /// reading it. The client's own write queue stops at four megabytes;
 /// pastes and `cli send-text` do not pass through it.
 const INPUT_QUEUE_LIMIT: usize = 8 * 1024 * 1024;
+
+/// A viewer's coalesced wheel event is replayed on the main thread, so
+/// its small wire representation must not ask for unbounded work.
+const SHARE_WHEEL_NOTCH_LIMIT: usize = 256;
 
 /// One piece of terminal input a client sent for a pane.
 enum PaneInput {
@@ -188,6 +195,8 @@ struct InputSource {
     client_id: Option<Arc<ClientId>>,
     registration: Option<ClientRegistrationId>,
     palette_session_id: Option<PaletteSessionId>,
+    /// A viewer on the share socket: its share and its place in it.
+    share: Option<ShareWatch>,
 }
 
 impl PerPane {
@@ -370,12 +379,15 @@ fn select_dirty_lines(
 
 /// Read `pane` against what was `last` sent: None when nothing changed and
 /// nothing forces a push. Takes the pane's terminal lock, several times;
-/// no `PerPane` lock may be held by the caller.
+/// no `PerPane` lock may be held by the caller. A `viewer`'s rows are read
+/// with the screen they are on: the bounds read here before them may be
+/// of the other screen by then.
 fn read_pane_changes(
     pane: &Arc<dyn Pane>,
     last: &LastSent,
     force_with_input_serial: Option<InputSerial>,
     scene_seqno: u64,
+    viewer: bool,
 ) -> Option<PaneReading> {
     let mut changed = false;
     let mouse_grabbed = pane.is_mouse_grabbed();
@@ -430,17 +442,25 @@ fn read_pane_changes(
         // Acknowledge its terminal sequence without copying unchanged rows.
         Vec::new()
     } else {
+        let read = |lines| {
+            if viewer {
+                pane.get_screen_lines(lines)
+            } else {
+                pane.get_lines(lines)
+            }
+        };
         let viewport_range =
             dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex;
-        let (first_line, lines) = pane.get_lines(viewport_range);
+        let (first_line, lines) = read(viewport_range);
         let mut bonus_lines = select_dirty_lines(first_line, lines, &mut all_dirty_lines);
 
         // Always send the cursor's row with ordinary changes, as that tends
-        // to be the busiest row.
-        let (cursor_line_idx, mut lines) = pane.get_lines(cursor_position.y..cursor_position.y + 1);
-        let mut cursor_line = lines.remove(0);
-        cursor_line.compress_for_scrollback();
-        bonus_lines.push((cursor_line_idx, cursor_line));
+        // to be the busiest row. A viewer's may have left the screen.
+        let (cursor_line_idx, lines) = read(cursor_position.y..cursor_position.y + 1);
+        if let Some(mut cursor_line) = lines.into_iter().next() {
+            cursor_line.compress_for_scrollback();
+            bonus_lines.push((cursor_line_idx, cursor_line));
+        }
         bonus_lines
     };
 
@@ -708,13 +728,25 @@ fn apply_pane_input(
         pane.erase_scrollback(erase_mode);
         return Ok(Pdu::UnitResponse(UnitResponse {}));
     }
-    claim_viewport_for_pane(
-        &mux,
-        source.client_id.as_ref(),
-        source.registration,
-        pane.pane_id(),
-    )?;
-    activate_client_palette(&mux, pane, source.palette_session_id)?;
+    match source.share {
+        // A viewer types only while the owner lets it -- asked again now,
+        // since the wait for the pane may have outlasted the grant -- and
+        // is none of the owner's frontends: it claims no layout, sizes
+        // nothing, and brings no palette.
+        Some(watch) => anyhow::ensure!(
+            crate::share::may_type(watch.viewer_id, watch.share_id, pane.pane_id()),
+            "the owner has taken typing back"
+        ),
+        None => {
+            claim_viewport_for_pane(
+                &mux,
+                source.client_id.as_ref(),
+                source.registration,
+                pane.pane_id(),
+            )?;
+            activate_client_palette(&mux, pane, source.palette_session_id)?;
+        }
+    }
     let input_serial = match input {
         PaneInput::Key {
             event,
@@ -730,29 +762,9 @@ fn apply_pane_input(
             None
         }
         PaneInput::Mouse(event) => {
-            // The client coalesces rapid wheel motion into a single
-            // event with an accumulated amount, but the terminal
-            // emits one report per event regardless of the amount;
-            // replay it per notch so mouse-mode apps scroll the
-            // full distance.
-            use wezterm_term::MouseButton as MB;
-            let notches = match event.button {
-                MB::WheelUp(n) if n > 1 => Some((MB::WheelUp(1), n)),
-                MB::WheelDown(n) if n > 1 => Some((MB::WheelDown(1), n)),
-                MB::WheelLeft(n) if n > 1 => Some((MB::WheelLeft(1), n)),
-                MB::WheelRight(n) if n > 1 => Some((MB::WheelRight(1), n)),
-                _ => None,
-            };
-            match notches {
-                Some((notch, n)) => {
-                    let mut single = event;
-                    single.button = notch;
-                    for _ in 0..n {
-                        pane.mouse_event(single.clone())?;
-                    }
-                }
-                None => pane.mouse_event(event)?,
-            }
+            apply_mouse_input(pane.pane_id(), source.share, event, |event| {
+                pane.mouse_event(event)
+            })?;
             None
         }
         PaneInput::Write(data) => {
@@ -773,6 +785,59 @@ fn apply_pane_input(
     };
     maybe_push_pane_changes(pane, sender.clone(), Arc::clone(per_pane), input_serial)?;
     Ok(Pdu::UnitResponse(UnitResponse {}))
+}
+
+fn validate_share_mouse_input(event: &wezterm_term::input::MouseEvent) -> anyhow::Result<()> {
+    use wezterm_term::MouseButton as MB;
+    if let MB::WheelUp(n) | MB::WheelDown(n) | MB::WheelLeft(n) | MB::WheelRight(n) = event.button {
+        anyhow::ensure!(
+            n <= SHARE_WHEEL_NOTCH_LIMIT,
+            "a shared pane accepts at most {SHARE_WHEEL_NOTCH_LIMIT} wheel notches per event"
+        );
+    }
+    Ok(())
+}
+
+fn apply_mouse_input(
+    pane_id: PaneId,
+    share: Option<ShareWatch>,
+    event: wezterm_term::input::MouseEvent,
+    mut send: impl FnMut(wezterm_term::input::MouseEvent) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if share.is_some() {
+        validate_share_mouse_input(&event)?;
+    }
+    let mut send = |event| {
+        if let Some(watch) = share {
+            anyhow::ensure!(
+                crate::share::may_type(watch.viewer_id, watch.share_id, pane_id),
+                "the owner has taken typing back"
+            );
+        }
+        send(event)
+    };
+    // The client coalesces rapid wheel motion into a single event, but
+    // the terminal emits one report per event regardless of the amount.
+    // Replay each notch, checking the viewer's grant throughout.
+    use wezterm_term::MouseButton as MB;
+    let notches = match event.button {
+        MB::WheelUp(n) if n > 1 => Some((MB::WheelUp(1), n)),
+        MB::WheelDown(n) if n > 1 => Some((MB::WheelDown(1), n)),
+        MB::WheelLeft(n) if n > 1 => Some((MB::WheelLeft(1), n)),
+        MB::WheelRight(n) if n > 1 => Some((MB::WheelRight(1), n)),
+        _ => None,
+    };
+    match notches {
+        Some((notch, n)) => {
+            let mut single = event;
+            single.button = notch;
+            for _ in 0..n {
+                send(single)?;
+            }
+            Ok(())
+        }
+        None => send(event),
+    }
 }
 
 fn relative_scene_seqno(selections: &[wezterm_term::KittyFrameSelection]) -> u64 {
@@ -803,7 +868,7 @@ fn maybe_push_pane_changes(
     // palette from taking over client rendering. Send it before line changes
     // so a real application override is installed before those lines paint.
     let application_palette = pane.palette_override();
-    let (needs_palette, last, frame_control, frame_revision, mut scene_seqno) = {
+    let (needs_palette, last, frame_control, frame_revision, mut scene_seqno, viewer) = {
         let per_pane = per_pane.lock().unwrap();
         (
             per_pane.needs_application_palette(&application_palette),
@@ -811,6 +876,7 @@ fn maybe_push_pane_changes(
             per_pane.frame_control,
             per_pane.frame_revision,
             per_pane.scene_seqno,
+            per_pane.viewer,
         )
     };
     if needs_palette {
@@ -841,7 +907,7 @@ fn maybe_push_pane_changes(
             per_pane.scene_seqno = scene_seqno;
         }
     }
-    let reading = read_pane_changes(pane, &last, force_with_input_serial, scene_seqno);
+    let reading = read_pane_changes(pane, &last, force_with_input_serial, scene_seqno, viewer);
     let mut per_pane = per_pane.lock().unwrap();
     if let Some(reading) = reading {
         let resp = per_pane.commit_changes(pane.pane_id(), reading);
@@ -1088,6 +1154,9 @@ pub enum ConnectionPeer {
     /// is not a thing to be able to arrange from off it.
     Tls,
     Web(WebPeer),
+    /// The share socket: another account on this machine, as the kernel
+    /// named it, watching a pane shared with it. See `crate::share`.
+    Share(crate::share::SharePeer),
 }
 
 fn peer_may_import_sessions(peer: &ConnectionPeer) -> bool {
@@ -1173,6 +1242,40 @@ fn web_peer_may_send(pdu: &Pdu) -> bool {
     )
 }
 
+/// What a viewer on the share socket may ask for: to see what is shared
+/// with it, to join one share, to read that pane's rows, and to type into
+/// it while its owner lets it. Which pane, and whether typing is allowed
+/// now, is checked again per request (`SessionHandler::share_gate`). The
+/// list names what is allowed, so a request added later is refused here
+/// until someone decides it belongs.
+fn share_peer_may_send(pdu: &Pdu) -> bool {
+    matches!(
+        pdu,
+        Pdu::Ping(_)
+            | Pdu::Pong(_)
+            | Pdu::GetCodecVersion(_)
+            | Pdu::SetClientId(_)
+            | Pdu::ShareIncoming(_)
+            | Pdu::ShareJoin(_)
+            | Pdu::ShareRequestControl(_)
+            | Pdu::ShareReleaseControl(_)
+            | Pdu::GetPaneRenderChanges(_)
+            | Pdu::GetPaneRenderableDimensions(_)
+            | Pdu::GetLines(_)
+            | Pdu::WriteToPane(_)
+            | Pdu::SendKeyDown(_)
+            | Pdu::SendMouseEvent(_)
+            | Pdu::SendPaste(_)
+    )
+}
+
+/// The share a viewer's connection has joined.
+#[derive(Debug, Clone, Copy)]
+struct ShareWatch {
+    share_id: u64,
+    viewer_id: u64,
+}
+
 pub struct SessionHandler {
     to_write_tx: PduSender,
     peer: ConnectionPeer,
@@ -1188,10 +1291,30 @@ pub struct SessionHandler {
     /// The client sent `SubscribeEvents`: it hears of panes appearing,
     /// and its pane pushes carry alerts only.
     pub(crate) events_subscribed: bool,
+    /// On the share socket, once the viewer has joined a share.
+    share_watch: Option<ShareWatch>,
+    /// The pane a viewer watches, `NO_PANE` until it joins: read by the
+    /// connection's notification filter, which runs on whatever thread
+    /// notifies, without a lock.
+    share_pane: Arc<std::sync::atomic::AtomicUsize>,
+    /// A viewer's ask after what is shared with it is being answered.
+    share_asking: Arc<std::sync::atomic::AtomicBool>,
+    /// The person's desktop, once it shared a pane here: what it shared
+    /// ends when this connection does.
+    sharer: Option<crate::share::Sharer>,
 }
+
+/// `SessionHandler::share_pane` before the viewer joins a share.
+pub(crate) const NO_PANE: usize = usize::MAX;
 
 impl Drop for SessionHandler {
     fn drop(&mut self) {
+        if let Some(watch) = self.share_watch.take() {
+            crate::share::leave(watch.viewer_id, watch.share_id);
+        }
+        if let Some(sharer) = self.sharer.take() {
+            sharer.left();
+        }
         for pane in self.per_pane.values() {
             pane.lock().unwrap().set_frame_control(false);
         }
@@ -1222,7 +1345,68 @@ impl SessionHandler {
             proxy_client_id: None,
             plugin_pipe: None,
             events_subscribed: false,
+            share_watch: None,
+            share_pane: Arc::new(std::sync::atomic::AtomicUsize::new(NO_PANE)),
+            share_asking: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sharer: None,
         }
+    }
+
+    /// The pane this connection's viewer watches, for the notification
+    /// filter set up before any request is read.
+    pub(crate) fn share_pane(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.share_pane)
+    }
+
+    /// Whether this connection is a viewer on the share socket.
+    pub(crate) fn is_share_viewer(&self) -> bool {
+        matches!(self.peer, ConnectionPeer::Share(_))
+    }
+
+    /// Whether this viewer may hear about `pane_id`: the pane of the share
+    /// it joined. A viewer removed from it is dropped with its connection.
+    pub(crate) fn share_may_read(&self, pane_id: PaneId) -> bool {
+        self.share_pane.load(std::sync::atomic::Ordering::Relaxed) == pane_id
+    }
+
+    /// For a viewer: refuse what it may not read or type.
+    fn share_gate(&self, pdu: &Pdu) -> anyhow::Result<()> {
+        let (pane_id, typing) = match pdu {
+            Pdu::GetPaneRenderChanges(req) => (req.pane_id, false),
+            Pdu::GetPaneRenderableDimensions(req) => (req.pane_id, false),
+            Pdu::GetLines(req) => (req.pane_id, false),
+            Pdu::WriteToPane(req) => (req.pane_id, true),
+            Pdu::SendKeyDown(req) => (req.pane_id, true),
+            Pdu::SendMouseEvent(req) => {
+                validate_share_mouse_input(&req.event)?;
+                (req.pane_id, true)
+            }
+            Pdu::SendPaste(req) => (req.pane_id, true),
+            _ => return Ok(()),
+        };
+        let watch = self
+            .share_watch
+            .ok_or_else(|| anyhow!("join a share before reading its pane"))?;
+        if typing {
+            anyhow::ensure!(
+                crate::share::may_type(watch.viewer_id, watch.share_id, pane_id),
+                "you can only watch this pane; ask its owner to let you type"
+            );
+            return Ok(());
+        }
+        crate::share::may_read(watch.viewer_id, watch.share_id, pane_id)
+            .ok_or_else(|| anyhow!("pane {pane_id} is not shared with you"))?;
+        Ok(())
+    }
+
+    /// Whether the rows this connection reads of `pane_id` are cut to its
+    /// screen: a viewer of a share made without its history.
+    /// Whether a viewer reads only the screen of `pane_id`: unless its share
+    /// gives it the history, which one it has just left no longer does.
+    fn screen_only(&self, pane_id: PaneId) -> bool {
+        self.share_watch.is_some_and(|watch| {
+            crate::share::may_read(watch.viewer_id, watch.share_id, pane_id) != Some(true)
+        })
     }
 
     /// The pid of the client registered on this connection, when it
@@ -1297,9 +1481,11 @@ impl SessionHandler {
 
     pub(crate) fn per_pane(&mut self, pane_id: PaneId) -> Arc<Mutex<PerPane>> {
         let events_only = self.events_subscribed;
+        let viewer = self.is_share_viewer();
         Arc::clone(self.per_pane.entry(pane_id).or_insert_with(|| {
             Arc::new(Mutex::new(PerPane {
                 events_only,
+                viewer,
                 ..PerPane::default()
             }))
         }))
@@ -1344,6 +1530,7 @@ impl SessionHandler {
                 client_id: self.client_id.clone(),
                 registration: self.client_registration,
                 palette_session_id: self.palette_session_id,
+                share: self.share_watch,
             };
             spawn_into_main_thread(drain_pane_inputs(
                 pane_id,
@@ -1405,6 +1592,20 @@ impl SessionHandler {
             return;
         }
 
+        if self.is_share_viewer() {
+            if !share_peer_may_send(&decoded.pdu) {
+                send_response(Err(anyhow!(
+                    "{} is not available to a viewer of a shared pane",
+                    decoded.pdu.pdu_name()
+                )));
+                return;
+            }
+            if let Err(err) = self.share_gate(&decoded.pdu) {
+                send_response(Err(err));
+                return;
+            }
+        }
+
         if requires_existing_frontend_access(&decoded.pdu) {
             if let Err(err) = require_registered_frontend_access(
                 &Mux::get(),
@@ -1444,6 +1645,12 @@ impl SessionHandler {
                     )
                 })
                 .detach();
+            }
+            // A viewer is not one of the owner's frontends: it is not
+            // registered, so it holds no lease and sizes nothing, and it
+            // is not told the owner's frontend state or palette.
+            Pdu::SetClientId(_) if self.is_share_viewer() => {
+                send_response(Ok(Pdu::UnitResponse(UnitResponse {})));
             }
             Pdu::SetClientId(SetClientId {
                 mut client_id,
@@ -2500,6 +2707,14 @@ impl SessionHandler {
             Pdu::GetLines(GetLines { pane_id, lines }) => {
                 let per_pane = self.per_pane(pane_id);
                 let sender = self.to_write_tx.clone();
+                let screen_only = self.screen_only(pane_id);
+                // A viewer's ask is held to what a viewer needs: each row
+                // once, and not without end (see `share::viewer_rows`).
+                let lines = if self.is_share_viewer() {
+                    crate::share::viewer_rows(lines)
+                } else {
+                    lines
+                };
                 spawn_into_main_thread(async move {
                     // Read once the pane can be read without waiting, like
                     // a push: the client asks again for rows it does not
@@ -2533,7 +2748,17 @@ impl SessionHandler {
                                 if range.start > range.end {
                                     continue;
                                 }
-                                let (first_row, lines) = pane.get_lines(range);
+                                // A viewer without the history gets what is
+                                // on the screen as the rows are read: rows
+                                // are numbered afresh on the alternate
+                                // screen and move when the pane is
+                                // reflowed, so no row number marks where
+                                // the share began.
+                                let (first_row, lines) = if screen_only {
+                                    pane.get_screen_lines(range)
+                                } else {
+                                    pane.get_lines(range)
+                                };
                                 for (idx, mut line) in lines.into_iter().enumerate() {
                                     let stable_row = first_row + idx as StableRowIndex;
                                     line.compress_for_scrollback();
@@ -2680,6 +2905,17 @@ impl SessionHandler {
                 .detach();
             }
 
+            // Where the owner's executable and config live is nothing a
+            // viewer needs.
+            Pdu::GetCodecVersion(_) if self.is_share_viewer() => {
+                send_response(Ok(Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                    codec_vers: CODEC_VERSION,
+                    version_string: config::wezterm_version().to_owned(),
+                    server_id: Mux::get().runtime_server_id().to_string(),
+                    executable_path: std::path::PathBuf::new(),
+                    config_file_path: None,
+                })))
+            }
             Pdu::GetCodecVersion(_) => {
                 match std::env::current_exe().context("resolving current_exe") {
                     Err(err) => send_response(Err(err)),
@@ -2960,6 +3196,188 @@ impl SessionHandler {
                 .detach();
             }
 
+            // The owner's side. Not on the web or viewer allowlists, so
+            // only this machine's own clients and mTLS reach these.
+            // The accounts and groups it names are looked up, maybe in a
+            // directory slow to answer: on a thread of its own, not the main
+            // one every pane goes through.
+            Pdu::ShareStart(request) => {
+                let sender = self.to_write_tx.clone();
+                let sharer = self.sharer.get_or_insert_with(Default::default).clone();
+                let spawned = std::thread::Builder::new()
+                    .name("share-start".into())
+                    .spawn(move || {
+                        let pdu = match crate::share::start(request, sharer) {
+                            Ok(info) => Pdu::ShareListResponse(ShareListResponse {
+                                shares: vec![info],
+                            }),
+                            Err(err) => Pdu::ErrorResponse(ErrorResponse {
+                                reason: format!("Error: {err:#}"),
+                            }),
+                        };
+                        let _ = sender.send(DecodedPdu { serial, pdu });
+                    });
+                if let Err(err) = spawned {
+                    send_response(Err(anyhow!("cannot start sharing: {err:#}")));
+                }
+            }
+            Pdu::ShareList(_) => send_response(Ok(Pdu::ShareListResponse(ShareListResponse {
+                shares: crate::share::list(),
+            }))),
+            Pdu::ShareStop(ShareStop { share_id }) => send_response(
+                crate::share::stop(share_id).map(|()| Pdu::UnitResponse(UnitResponse {})),
+            ),
+            Pdu::ShareKick(ShareKick {
+                share_id,
+                viewer_id,
+            }) => send_response(
+                crate::share::kick(share_id, viewer_id)
+                    .map(|()| Pdu::UnitResponse(UnitResponse {})),
+            ),
+            Pdu::ShareGrant(ShareGrant {
+                share_id,
+                viewer_id,
+                for_secs,
+                from_desktop,
+            }) => send_response(
+                crate::share::grant(share_id, viewer_id, for_secs, from_desktop)
+                    .map(|()| Pdu::UnitResponse(UnitResponse {})),
+            ),
+            Pdu::ShareRevoke(ShareRevoke { share_id }) => send_response(
+                crate::share::revoke(share_id).map(|()| Pdu::UnitResponse(UnitResponse {})),
+            ),
+            // Looked up off the main thread: the directory service may be
+            // slow to answer.
+            Pdu::ShareCandidates(_) => {
+                let sender = self.to_write_tx.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("share-candidates".into())
+                    .spawn(move || {
+                        let _ = sender.send(DecodedPdu {
+                            serial,
+                            pdu: Pdu::ShareCandidatesResponse(
+                                crate::share::candidates_to_share_with(),
+                            ),
+                        });
+                    });
+                if let Err(err) = spawned {
+                    send_response(Err(anyhow!("cannot list the accounts here: {err:#}")));
+                }
+            }
+            Pdu::ShareDeny(ShareDeny {
+                share_id,
+                viewer_id,
+            }) => send_response(
+                crate::share::deny(share_id, viewer_id)
+                    .map(|()| Pdu::UnitResponse(UnitResponse {})),
+            ),
+
+            // What other accounts here share with ours. Each of their
+            // servers is asked in turn, which may take a few seconds when
+            // one does not answer: done on a thread of its own.
+            Pdu::ShareDiscover(_) => {
+                let sender = self.to_write_tx.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("share-discover".into())
+                    .spawn(move || {
+                        let incoming = smol::block_on(wezterm_client::share::incoming());
+                        let owners = incoming
+                            .found
+                            .into_iter()
+                            .map(|(_, response)| response)
+                            .collect();
+                        let watch_program = std::env::current_exe()
+                            .ok()
+                            .and_then(|exe| exe.parent().map(|dir| dir.join("thinkterm")))
+                            .filter(|program| program.exists());
+                        let _ = sender.send(DecodedPdu {
+                            serial,
+                            pdu: Pdu::ShareDiscoverResponse(ShareDiscoverResponse {
+                                owners,
+                                other_version: incoming.other_version,
+                                watch_program,
+                            }),
+                        });
+                    });
+                if let Err(err) = spawned {
+                    send_response(Err(anyhow!("cannot look for shared panes: {err:#}")));
+                }
+            }
+
+            // The viewer's side, on the share socket only: who the viewer
+            // is comes from there.
+            // A group is looked up to answer, maybe in a directory slow to
+            // answer: on a thread of its own, one at a time, so that no
+            // viewer holds up the threads every connection shares.
+            Pdu::ShareIncoming(_) => {
+                let ConnectionPeer::Share(peer) = &self.peer else {
+                    send_response(Err(anyhow!("ask for shared panes on the share socket")));
+                    return;
+                };
+                if self.share_asking.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    send_response(Err(anyhow!("still answering the last ask")));
+                    return;
+                }
+                let peer = peer.clone();
+                let asking = Arc::clone(&self.share_asking);
+                let sender = self.to_write_tx.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("share-incoming".into())
+                    .spawn(move || {
+                        let response = crate::share::incoming(&peer);
+                        asking.store(false, std::sync::atomic::Ordering::SeqCst);
+                        let _ = sender.send(DecodedPdu {
+                            serial,
+                            pdu: Pdu::ShareIncomingResponse(response),
+                        });
+                    });
+                if let Err(err) = spawned {
+                    self.share_asking
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    send_response(Err(anyhow!("cannot look for shared panes: {err:#}")));
+                }
+            }
+            Pdu::ShareJoin(ShareJoin { share_id }) => {
+                let ConnectionPeer::Share(peer) = &self.peer else {
+                    send_response(Err(anyhow!("join a share on the share socket")));
+                    return;
+                };
+                if self.share_watch.is_some() {
+                    send_response(Err(anyhow!("this connection already watches a share")));
+                    return;
+                }
+                match crate::share::join(peer, share_id, self.to_write_tx.clone()) {
+                    Ok(joined) => {
+                        self.share_watch = Some(ShareWatch {
+                            share_id,
+                            viewer_id: joined.viewer_id,
+                        });
+                        self.share_pane
+                            .store(joined.pane_id, std::sync::atomic::Ordering::Relaxed);
+                        send_response(Ok(Pdu::ShareJoinResponse(joined)));
+                    }
+                    Err(err) => send_response(Err(err)),
+                }
+            }
+            Pdu::ShareRequestControl(ShareRequestControl { share_id }) => {
+                let result = match self.share_watch {
+                    Some(watch) if watch.share_id == share_id => {
+                        crate::share::request_control(watch.viewer_id, share_id)
+                    }
+                    _ => Err(anyhow!("you are not watching share {share_id}")),
+                };
+                send_response(result.map(|()| Pdu::UnitResponse(UnitResponse {})));
+            }
+            Pdu::ShareReleaseControl(ShareReleaseControl { share_id }) => {
+                let result = match self.share_watch {
+                    Some(watch) if watch.share_id == share_id => {
+                        crate::share::release_control(watch.viewer_id, share_id)
+                    }
+                    _ => Err(anyhow!("you are not watching share {share_id}")),
+                };
+                send_response(result.map(|()| Pdu::UnitResponse(UnitResponse {})));
+            }
+
             Pdu::Invalid { .. } => send_response(Err(anyhow!("invalid PDU {:?}", decoded.pdu))),
             // The answer to this connection's liveness probe. Arriving at
             // all is the answer; there is nothing to reply, and replying
@@ -3014,6 +3432,12 @@ impl SessionHandler {
             | Pdu::EnsureThinkTermThreadResponse { .. }
             | Pdu::ClientViewportState { .. }
             | Pdu::FrontendAccessState { .. }
+            | Pdu::ShareListResponse { .. }
+            | Pdu::ShareIncomingResponse { .. }
+            | Pdu::ShareJoinResponse { .. }
+            | Pdu::ShareStateChanged { .. }
+            | Pdu::ShareDiscoverResponse { .. }
+            | Pdu::ShareCandidatesResponse { .. }
             | Pdu::ErrorResponse { .. } => {
                 send_response(Err(anyhow!("expected a request, got {:?}", decoded.pdu)))
             }
@@ -3400,6 +3824,222 @@ mod tests {
     use std::sync::Arc;
     use wezterm_term::color::ColorPalette;
     use wezterm_term::TerminalSize;
+
+    fn mouse_input(
+        kind: wezterm_term::MouseEventKind,
+        button: wezterm_term::MouseButton,
+    ) -> wezterm_term::MouseEvent {
+        wezterm_term::MouseEvent {
+            kind,
+            x: 3,
+            y: 4,
+            x_pixel_offset: 1,
+            y_pixel_offset: 2,
+            button,
+            modifiers: termwiz::input::Modifiers::SHIFT,
+        }
+    }
+
+    fn typing_viewer(sender: super::PduSender) -> super::SessionHandler {
+        let peer = crate::share::SharePeer::new(u32::MAX - 1, "viewer".into(), u32::MAX - 1);
+        let (share_id, viewer_id) = crate::share::share_for_test(7, false, &peer);
+        let mut handler =
+            super::SessionHandler::for_peer(sender, super::ConnectionPeer::Share(peer));
+        handler.share_watch = Some(super::ShareWatch {
+            share_id,
+            viewer_id,
+        });
+        handler
+            .share_pane
+            .store(7, std::sync::atomic::Ordering::Relaxed);
+        crate::share::grant_for_test(share_id, viewer_id);
+        handler
+    }
+
+    #[test]
+    fn a_viewers_wheel_count_is_bounded_before_queueing_and_replay() {
+        use super::{apply_mouse_input, PduSender, SHARE_WHEEL_NOTCH_LIMIT};
+        use std::sync::Mutex;
+        use wezterm_term::{MouseButton as MB, MouseEventKind as MK};
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&sent);
+        let mut handler = typing_viewer(PduSender::new(move |pdu| {
+            sink.lock().unwrap().push(pdu);
+            Ok(())
+        }));
+        for kind in [MK::Press, MK::Release, MK::Move] {
+            for wheel in [
+                MB::WheelUp as fn(usize) -> MB,
+                MB::WheelDown,
+                MB::WheelLeft,
+                MB::WheelRight,
+            ] {
+                for count in [
+                    0,
+                    1,
+                    2,
+                    SHARE_WHEEL_NOTCH_LIMIT,
+                    SHARE_WHEEL_NOTCH_LIMIT + 1,
+                    usize::MAX,
+                ] {
+                    let event = mouse_input(kind, wheel(count));
+                    let request = Pdu::SendMouseEvent(codec::SendMouseEvent { pane_id: 7, event });
+                    let mut wire = Vec::new();
+                    request.encode(&mut wire, 19).unwrap();
+                    let decoded = Pdu::decode(&wire[..]).unwrap();
+                    assert_eq!(decoded.pdu, request);
+                    let mut applied = Vec::new();
+                    let replay = apply_mouse_input(7, handler.share_watch, event, |event| {
+                        anyhow::ensure!(
+                            applied.len() <= SHARE_WHEEL_NOTCH_LIMIT,
+                            "stop a regressed replay before the test exhausts memory"
+                        );
+                        applied.push(event);
+                        Ok(())
+                    });
+                    if count > SHARE_WHEEL_NOTCH_LIMIT {
+                        assert!(replay.is_err());
+                        assert!(applied.is_empty(), "no partial replay of an invalid count");
+                        handler.process_one(decoded);
+                        let response = sent.lock().unwrap().pop().unwrap();
+                        assert_eq!(response.serial, 19);
+                        assert!(matches!(response.pdu, Pdu::ErrorResponse(ref err)
+                            if err.reason.contains("at most 256 wheel notches")));
+                        assert!(
+                            handler.per_pane.is_empty(),
+                            "refused before creating a queue"
+                        );
+                    } else {
+                        handler.share_gate(&decoded.pdu).unwrap();
+                        replay.unwrap();
+                        let expected = mouse_input(kind, wheel(if count > 1 { 1 } else { count }));
+                        assert_eq!(applied, vec![expected; count.max(1)]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_replay_preserves_nonwheel_events_and_nonviewer_counts() {
+        use super::{apply_mouse_input, PduSender, SHARE_WHEEL_NOTCH_LIMIT};
+        use wezterm_term::{MouseButton as MB, MouseEventKind as MK};
+
+        let handler = typing_viewer(PduSender::new(|_| Ok(())));
+        for kind in [MK::Press, MK::Release, MK::Move] {
+            for button in [MB::Left, MB::Middle, MB::Right, MB::None] {
+                let event = mouse_input(kind, button);
+                for share in [None, handler.share_watch] {
+                    let mut applied = Vec::new();
+                    apply_mouse_input(7, share, event, |event| {
+                        applied.push(event);
+                        Ok(())
+                    })
+                    .unwrap();
+                    assert_eq!(applied, vec![event]);
+                }
+            }
+        }
+        let count = SHARE_WHEEL_NOTCH_LIMIT + 1;
+        let mut applied = Vec::new();
+        apply_mouse_input(
+            7,
+            None,
+            mouse_input(MK::Press, MB::WheelUp(count)),
+            |event| {
+                applied.push(event);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(applied, vec![mouse_input(MK::Press, MB::WheelUp(1)); count]);
+    }
+
+    #[test]
+    fn a_viewers_wheel_replay_stops_when_typing_is_revoked() {
+        use super::{apply_mouse_input, PduSender};
+        use wezterm_term::{MouseButton as MB, MouseEventKind as MK};
+
+        let handler = typing_viewer(PduSender::new(|_| Ok(())));
+        let watch = handler.share_watch.unwrap();
+        let event = mouse_input(MK::Press, MB::WheelDown(4));
+        let request = Pdu::SendMouseEvent(codec::SendMouseEvent { pane_id: 7, event });
+        handler.share_gate(&request).unwrap();
+        let mut applied = 0;
+        let err = apply_mouse_input(7, Some(watch), event, |_| {
+            applied += 1;
+            if applied == 2 {
+                crate::share::revoke(watch.share_id)?;
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("taken typing back"));
+        assert_eq!(applied, 2);
+        assert!(handler.share_gate(&request).is_err());
+        assert!(apply_mouse_input(7, Some(watch), event, |_| {
+            panic!("input revoked while queued must not be applied")
+        })
+        .is_err());
+    }
+
+    // A single range is what a viewer asks for here.
+    #[allow(clippy::single_range_in_vec_init)]
+    #[test]
+    fn a_viewer_reads_only_its_pane_and_types_only_when_let() {
+        use codec::{GetLines, GetPaneRenderChanges, SendPaste};
+        let peer = crate::share::SharePeer::new(u32::MAX - 1, "viewer".into(), u32::MAX - 1);
+        let (share_id, viewer_id) = crate::share::share_for_test(7, false, &peer);
+        let mut handler = super::SessionHandler::for_peer(
+            super::PduSender::new(|_| Ok(())),
+            super::ConnectionPeer::Share(peer),
+        );
+
+        // Before joining, nothing of any pane.
+        let lines = Pdu::GetLines(GetLines {
+            pane_id: 7,
+            lines: vec![0..200],
+        });
+        assert!(handler.share_gate(&lines).is_err());
+        assert!(!handler.share_may_read(7));
+
+        handler.share_watch = Some(super::ShareWatch {
+            share_id,
+            viewer_id,
+        });
+        handler
+            .share_pane
+            .store(7, std::sync::atomic::Ordering::Relaxed);
+        // Its pane, cut to the screen when the rows are read.
+        handler.share_gate(&lines).unwrap();
+        assert!(handler.screen_only(7));
+        // Another pane is not shared with it.
+        let other = Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id: 8 });
+        assert!(handler.share_gate(&other).is_err());
+        assert!(handler.share_may_read(7));
+        assert!(!handler.share_may_read(8));
+
+        // Typing waits for the owner.
+        let paste = Pdu::SendPaste(SendPaste {
+            pane_id: 7,
+            data: "rm -rf ~\n".into(),
+        });
+        assert!(handler.share_gate(&paste).is_err());
+        crate::share::grant_for_test(share_id, viewer_id);
+        handler.share_gate(&paste).unwrap();
+
+        // Nothing off the list gets as far as the gate.
+        assert!(!super::share_peer_may_send(&Pdu::KillPane(codec::KillPane { pane_id: 7 })));
+        assert!(!super::share_peer_may_send(&Pdu::ListPanes(codec::ListPanes {})));
+        assert!(!super::share_peer_may_send(&Pdu::GetTlsCreds(codec::GetTlsCreds {})));
+        assert!(!super::share_peer_may_send(&Pdu::ShareList(codec::ShareList {})));
+        assert!(super::share_peer_may_send(&Pdu::ShareJoin(codec::ShareJoin { share_id })));
+
+        // Leaving takes the viewer out of the share.
+        drop(handler);
+        assert_eq!(crate::share::may_read(viewer_id, share_id, 7), None);
+    }
 
     #[test]
     fn only_a_client_registered_on_the_socket_itself_is_direct() {

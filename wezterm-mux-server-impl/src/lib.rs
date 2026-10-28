@@ -18,6 +18,7 @@ mod plugin_relay;
 mod private_file;
 mod sent_images;
 pub mod sessionhandler;
+pub mod share;
 pub mod thinkterm_access;
 pub mod thinkterm_layout;
 pub mod thinkterm_session;

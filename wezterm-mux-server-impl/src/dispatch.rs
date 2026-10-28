@@ -194,7 +194,7 @@ where
 {
     let local = match peer {
         ConnectionPeer::Local => LocalSocket::of(&stream),
-        ConnectionPeer::Tls | ConnectionPeer::Web(_) => None,
+        ConnectionPeer::Tls | ConnectionPeer::Web(_) | ConnectionPeer::Share(_) => None,
     };
     let stream = smol::Async::new(stream)?;
     process_stream_on(stream, peer, local).await
@@ -322,8 +322,17 @@ async fn process_async_with_peer<S: ConnectionStream>(
     log::trace!("process_async called");
     let revoked = match &peer {
         ConnectionPeer::Web(web) => Some(web.revoked.clone()),
+        ConnectionPeer::Share(share) => Some(share.dropped.clone()),
         ConnectionPeer::Local | ConnectionPeer::Tls => None,
     };
+    let withdrawn = match &peer {
+        ConnectionPeer::Share(_) => "the viewer's share ended, or the viewer was removed",
+        _ => "the client's web token was revoked",
+    };
+    // A viewer hears of nothing but the pane it watches: the rest of the
+    // owner's mux -- other panes, windows, the tree, the clipboard -- is
+    // not turned into anything for it at all.
+    let share_viewer = matches!(peer, ConnectionPeer::Share(_));
     let mut client_link = codec::Link::Network;
 
     let (item_tx, item_rx) = smol::channel::unbounded::<Item>();
@@ -358,9 +367,17 @@ async fn process_async_with_peer<S: ConnectionStream>(
         // it waits on a busy pane's terminal.
         let mux = Mux::get();
         let tx = item_tx.clone();
+        let watched = handler.share_pane();
         mux.subscribe(move |n| {
             if tx.is_closed() {
                 return false;
+            }
+            // A viewer's notifications are sorted here, on whatever thread
+            // notified, so that none for another pane costs a hop to the
+            // main thread: until it joins a share, it hears of nothing.
+            if share_viewer && !viewer_hears(&n, watched.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return true;
             }
             log::trace!("notification queued for the connection: {n:?}");
             let tx = tx.clone();
@@ -395,7 +412,10 @@ async fn process_async_with_peer<S: ConnectionStream>(
         // order and a busy pane keeps the queue arm ready on every turn, so
         // a revocation that only lived in the race could wait forever.
         if admission_is_withdrawn(&revoked) {
-            log::warn!("the client's web token was revoked; dropping the connection");
+            log::warn!("{withdrawn}; dropping the connection");
+            if share_viewer {
+                say_why(&mut stream, &item_rx, client_link).await;
+            }
             return Ok(());
         }
         let rx_msg = item_rx.recv();
@@ -471,7 +491,16 @@ async fn process_async_with_peer<S: ConnectionStream>(
                                 stream: &mut stream,
                                 bytes: &moved,
                             };
-                            Read::Decoded(Pdu::decode_async(&mut counted, None).await)
+                            Read::Decoded(if share_viewer {
+                                Pdu::decode_async_bounded(
+                                    &mut counted,
+                                    None,
+                                    VIEWER_PAYLOAD_LIMIT,
+                                )
+                                .await
+                            } else {
+                                Pdu::decode_async(&mut counted, None).await
+                            })
                         },
                         async {
                             stalled(&moved, READ_STALL_LIMIT, true).await;
@@ -530,7 +559,10 @@ async fn process_async_with_peer<S: ConnectionStream>(
             }
             Ok(Item::LivenessTick) => unreachable!("handled above"),
             Ok(Item::Shutdown) => {
-                log::warn!("the client's web token was revoked; dropping the connection");
+                log::warn!("{withdrawn}; dropping the connection");
+                if share_viewer {
+                    say_why(&mut stream, &item_rx, client_link).await;
+                }
                 return Ok(());
             }
             Ok(Item::WritePdu(decoded)) => {
@@ -584,7 +616,10 @@ async fn process_async_with_peer<S: ConnectionStream>(
                         return Ok(());
                     }
                     Err(WriteFailure::Revoked) => {
-                        log::warn!("the client's web token was revoked; dropping the connection");
+                        log::warn!("{withdrawn}; dropping the connection");
+                        if share_viewer {
+                            say_why(&mut stream, &item_rx, client_link).await;
+                        }
                         return Ok(());
                     }
                     Err(WriteFailure::Encode(err)) => {
@@ -608,6 +643,16 @@ async fn process_async_with_peer<S: ConnectionStream>(
             // A connection subscribed to events reads no pane contents:
             // output costs it nothing, and an alert goes straight out
             // rather than waiting for the pane's parser.
+            // A viewer hears only of the pane it may read, and of none of
+            // what a program there says to its own user's desktop.
+            Ok(Item::Notif(
+                MuxNotification::PaneOutput(pane_id)
+                | MuxNotification::Alert { pane_id, .. }
+                | MuxNotification::PaneRemoved(pane_id)
+                | MuxNotification::PaneExited { pane_id, .. },
+            )) if handler.is_share_viewer() && !handler.share_may_read(pane_id) => {}
+            Ok(Item::Notif(MuxNotification::Alert { alert, .. }))
+                if handler.is_share_viewer() && !viewer_sees_alert(&alert) => {}
             Ok(Item::Notif(MuxNotification::PaneOutput(_))) if handler.events_subscribed => {}
             Ok(Item::Notif(MuxNotification::Alert { pane_id, alert }))
                 if handler.events_subscribed =>
@@ -791,6 +836,71 @@ async fn admission_withdrawn(revoked: &Option<smol::channel::Receiver<()>>) {
             let _ = rx.recv().await;
         }
         None => std::future::pending().await,
+    }
+}
+
+/// Whether a notification concerns a viewer on the share socket watching
+/// `pane`: that pane's output, alerts and end.
+fn viewer_hears(n: &MuxNotification, pane: usize) -> bool {
+    match n {
+        MuxNotification::PaneOutput(pane_id)
+        | MuxNotification::Alert { pane_id, .. }
+        | MuxNotification::PaneRemoved(pane_id)
+        | MuxNotification::PaneExited { pane_id, .. } => *pane_id == pane,
+        _ => false,
+    }
+}
+
+/// The most a viewer on the share socket sends in one request: a paste,
+/// at its largest. Nothing it may send needs compression.
+const VIEWER_PAYLOAD_LIMIT: usize = 1024 * 1024;
+
+/// What of a shared pane's alerts reaches a viewer: what changes how the
+/// pane looks. A desktop notification, a user variable or a bell is meant
+/// for the owner.
+fn viewer_sees_alert(alert: &wezterm_term::Alert) -> bool {
+    use wezterm_term::Alert;
+    matches!(
+        alert,
+        Alert::WindowTitleChanged(_)
+            | Alert::TabTitleChanged(_)
+            | Alert::IconTitleChanged(_)
+            | Alert::PaletteChanged
+            | Alert::CurrentWorkingDirectoryChanged
+    )
+}
+
+/// A viewer dropped because its share ended or it was removed: the share
+/// queued the reason just before the drop, and it is written out first,
+/// within a second, so the viewer can say why rather than just stop.
+async fn say_why<S: ConnectionStream>(
+    stream: &mut S,
+    items: &smol::channel::Receiver<Item>,
+    link: codec::Link,
+) {
+    while let Ok(item) = items.try_recv() {
+        let Item::WritePdu(decoded) = item else {
+            continue;
+        };
+        if !matches!(decoded.pdu, Pdu::ShareStateChanged(_)) {
+            continue;
+        }
+        let _ = smol::future::or(
+            async {
+                if decoded
+                    .pdu
+                    .encode_async_over(&mut *stream, decoded.serial, link)
+                    .await
+                    .is_ok()
+                {
+                    let _ = stream.flush().await;
+                }
+            },
+            async {
+                smol::Timer::after(Duration::from_secs(1)).await;
+            },
+        )
+        .await;
     }
 }
 
