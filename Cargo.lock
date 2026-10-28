@@ -12363,6 +12363,7 @@ name = "wezterm-uds"
 version = "0.1.0"
 dependencies = [
  "async-io",
+ "socket2 0.5.10",
  "uds_windows",
 ]
 

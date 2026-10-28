@@ -102,6 +102,26 @@ impl UnixStream {
         Ok(Self(StreamImpl::connect(path)?))
     }
 
+    /// `connect`, except that a listener with no room for one more
+    /// connection is an error at once. On Linux `connect` waits for room
+    /// for as long as that takes: for ever, on a server that has stopped
+    /// accepting. Elsewhere it does not wait, and nor does this.
+    pub fn connect_without_waiting<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use socket2::{Domain, SockAddr, Socket, Type};
+            let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+            socket.set_nonblocking(true)?;
+            socket.connect(&SockAddr::unix(path)?)?;
+            socket.set_nonblocking(false)?;
+            Ok(Self(StreamImpl::from(std::os::fd::OwnedFd::from(socket))))
+        }
+        #[cfg(windows)]
+        {
+            Self::connect(path)
+        }
+    }
+
     /// A second handle on the same socket, wrapped like the first, so one
     /// thread can read while another writes.
     pub fn try_clone(&self) -> std::io::Result<Self> {
@@ -208,5 +228,46 @@ mod tests {
             "a stale file must not read as a listener"
         );
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use socket2::{Domain, SockAddr, Socket, Type};
+
+    /// A listener that takes nobody fills up, and the connection after
+    /// that is refused there and then rather than left waiting for room
+    /// that never comes.
+    #[test]
+    fn a_full_listener_refuses_rather_than_waits() {
+        let dir = std::env::temp_dir().join(format!("wezterm-uds-full-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("s");
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        listener.bind(&SockAddr::unix(&path).unwrap()).unwrap();
+        listener.listen(1).unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let connecting = path.clone();
+        std::thread::spawn(move || {
+            let mut queued = vec![];
+            let refused = (0..64).any(|_| {
+                match super::UnixStream::connect_without_waiting(&connecting) {
+                    Ok(stream) => {
+                        queued.push(stream);
+                        false
+                    }
+                    Err(_) => true,
+                }
+            });
+            let _ = done_tx.send(refused);
+        });
+        let refused = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a connection waited on the full listener");
+        assert!(refused, "the listener never filled up");
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
