@@ -862,7 +862,10 @@ impl super::TermWindow {
         // behind it. Placed after the modifier/LED bookkeeping so status-line
         // state stays current; not marking the event handled lets the cooked
         // KeyEvent still arrive, where the palette's dispatch consumes it.
-        if self.command_palette.is_some() || self.recording_overlay.owns_keyboard() {
+        if self.command_palette.is_some()
+            || self.recording_overlay.owns_keyboard()
+            || self.share_panel_open()
+        {
             return;
         }
         // The chord that opens the palette is left to the cooked event that
@@ -1132,6 +1135,19 @@ impl super::TermWindow {
                     }
                     Key::None => {}
                 }
+            }
+            return;
+        }
+        // A pane's share panel takes the keyboard as the palette does.
+        if self.share_panel_open() {
+            if window_key.key_is_down {
+                let mods = window_key.modifiers.remove_positional_mods();
+                match self.win_key_code_to_termwiz_key_code(&window_key.key) {
+                    Key::Code(key) => self.share_panel_key(key, mods),
+                    Key::Composed(text) => self.share_panel_text(&text),
+                    Key::None => {}
+                }
+                context.invalidate();
             }
             return;
         }

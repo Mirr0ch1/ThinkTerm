@@ -909,6 +909,9 @@ enum SettingsSection {
     Workspaces,
     Agents,
     Web,
+    /// Sharing a terminal with other accounts on its machine, and later
+    /// syncing with one's other devices.
+    ShareSync,
     /// Not a page: what a search for it finds, which leads to the Tailscale
     /// group in Remote Hosts, where the tailnet is set up beside its
     /// machines.
@@ -934,6 +937,7 @@ const BASE_SECTIONS: &[SettingsSection] = &[
     SettingsSection::Workspaces,
     SettingsSection::Agents,
     SettingsSection::Web,
+    SettingsSection::ShareSync,
     SettingsSection::Archived,
     SettingsSection::Keymap,
     SettingsSection::CommandPalette,
@@ -1010,6 +1014,7 @@ fn initial_section() -> SettingsSection {
         "workspaces" => SettingsSection::Workspaces,
         "agents" => SettingsSection::Agents,
         "web" => SettingsSection::Web,
+        "share" | "sharing" | "sharesync" | "share-sync" => SettingsSection::ShareSync,
         // The plugins are on the Sidebar page, the only place they show.
         "plugins" => SettingsSection::Sidebar,
         "archived" => SettingsSection::Archived,
@@ -1045,6 +1050,7 @@ impl SettingsSection {
             Self::Workspaces => crate::i18n::tr("settings-section-workspaces"),
             Self::Agents => crate::i18n::tr("settings-section-agents"),
             Self::Web => crate::i18n::tr("settings-section-web"),
+            Self::ShareSync => crate::i18n::tr("settings-section-share-sync"),
             Self::Tailscale => crate::i18n::tr("settings-section-tailscale"),
             Self::Archived => crate::i18n::tr("settings-section-archived"),
             Self::Keymap => crate::i18n::tr("settings-section-keymap"),
@@ -1069,6 +1075,7 @@ impl SettingsSection {
             Self::Workspaces => SettingsIcon::Workspaces,
             Self::Agents => SettingsIcon::Agents,
             Self::Web => SettingsIcon::Web,
+            Self::ShareSync => SettingsIcon::Share,
             Self::Tailscale => SettingsIcon::Tailscale,
             Self::Archived => SettingsIcon::Archived,
             Self::Keymap => SettingsIcon::Keymap,
@@ -1095,6 +1102,7 @@ impl SettingsSection {
             Self::Workspaces => TileColor::Yellow,
             Self::Agents => TileColor::Orange,
             Self::Web => TileColor::Teal,
+            Self::ShareSync => TileColor::Green,
             Self::Tailscale => TileColor::Blue,
             Self::Archived => TileColor::Indigo,
             Self::Keymap => TileColor::Gray,
@@ -1140,6 +1148,14 @@ impl SettingsSection {
                 "HTTP",
                 "Port",
                 "Listener",
+            ],
+            Self::ShareSync => &[
+                "Share",
+                "Sharing",
+                "Share Terminal",
+                "Shared with Me",
+                "Watch",
+                "Sync",
             ],
             Self::Tailscale => &[
                 "Tailscale",
@@ -1391,6 +1407,10 @@ impl SettingsSection {
                 ]
                 .iter()
                 .any(|key| crate::i18n::tr(key).to_lowercase().contains(query)))
+            || (self == Self::ShareSync
+                && crate::i18n::tr("settings-sharing")
+                    .to_lowercase()
+                    .contains(query))
             || (self == Self::Sidebar
                 && crate::i18n::tr("settings-remember-right-sidebar")
                     .to_lowercase()
@@ -2004,6 +2024,7 @@ enum SettingsAction {
     ClearImportFields,
     ToggleImportField(ImportFieldId),
     ToggleMainWindowFrameRestore,
+    ToggleSharing,
     ToggleNotificationSounds,
     ToggleSystemNotifications,
     ToggleAgentStatusPart(AgentStatusPart),
@@ -6275,6 +6296,25 @@ impl SettingsWindow {
                 self.ui.open_dropdown = None;
                 self.toggle_import_field(field_id);
             }
+            SettingsAction::ToggleSharing => {
+                self.ui.open_dropdown = None;
+                self.native_settings.sharing.enabled = !self.native_settings.sharing.enabled;
+                match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => {
+                        self.status = if self.native_settings.sharing.enabled {
+                            crate::i18n::tr("settings-status-sharing-on")
+                        } else {
+                            crate::i18n::tr("settings-status-sharing-off")
+                        };
+                    }
+                    Err(err) => {
+                        self.status = settings_tr(
+                            "settings-status-sharing-error",
+                            &[("error", format!("{err:#}"))],
+                        );
+                    }
+                }
+            }
             SettingsAction::ToggleMainWindowFrameRestore => {
                 self.ui.open_dropdown = None;
                 self.native_settings.window.restore_main_window_frame =
@@ -8477,6 +8517,7 @@ impl SettingsWindow {
             SettingsSection::Workspaces => self.paint_workspaces(layers, x, max_width)?,
             SettingsSection::Agents => self.paint_agents(layers, x, max_width)?,
             SettingsSection::Web => self.paint_web(layers, x, max_width)?,
+            SettingsSection::ShareSync => self.paint_share_sync(layers, x, max_width)?,
             // Never selected: picking it opens Remote Hosts instead.
             SettingsSection::Tailscale => {}
             SettingsSection::Archived => self.paint_archived(layers, x, max_width)?,
@@ -15417,6 +15458,102 @@ impl SettingsWindow {
             palette.text,
             (x + width - value_x).max(80.0),
         )?;
+        Ok(())
+    }
+
+    /// Share & Sync: whether this ThinkTerm shares terminals at all.
+    fn paint_share_sync(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let body_font = Rc::clone(&self.body_font);
+        let scroll = self.ui.content_scroll.offset;
+        let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
+        self.draw_text(
+            layers,
+            &body_font,
+            x,
+            section_y,
+            &crate::i18n::tr("settings-share-sync-description"),
+            palette.secondary_text,
+            max_width,
+        )?;
+        let card_padding = self.ui_px(36.0);
+        let row_x = x + card_padding;
+        let row_width = max_width - card_padding * 2.0;
+        let (card_y, _) = self.settings_card_geometry(section_y, 1);
+        // What turning it off does, and where it works on Windows, are in
+        // the explanation's last lines: it is given room for them.
+        let layout = CardLayout {
+            description_lines: 4,
+            ..self.card_layout()
+        };
+        let bottom = self.paint_card_as(layers, x, card_y, max_width, layout, |this, layers, top| {
+            let mut rows = RowCursor::new(top, this);
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::Share,
+                TileColor::Green,
+            )?;
+            // The share socket and the accounts it admits are unix's: on
+            // Windows this turns on sharing the panes of the Linux and Mac
+            // servers a window is connected to.
+            let description = if cfg!(windows) {
+                "settings-sharing-description-windows"
+            } else {
+                "settings-sharing-description"
+            };
+            let title = crate::i18n::tr("settings-sharing");
+            let title_y = rows.y;
+            let extra = this.paint_toggle_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &title,
+                &crate::i18n::tr(description),
+                this.native_settings.sharing.enabled,
+                SettingsAction::ToggleSharing,
+                rows.rule(),
+            )?;
+            let control_x = tx + tw - this.settings_control_width(tw);
+            let text_width = (control_x - tx - this.ui_px(24.0)).max(tw * 0.45);
+            // That it is still being tried, on a line of its own: after
+            // the description it would be cut off with it.
+            let note_y =
+                this.settings_row_description_y(title_y) + this.description_line_step() + extra;
+            let last_note_y = note_y
+                + this.draw_row_note(
+                    layers,
+                    tx,
+                    note_y,
+                    &crate::i18n::tr("settings-sharing-experimental"),
+                    text_width,
+                )?;
+            let cell_height = this.metrics.cell_size.height as f32;
+            let bottom = last_note_y + cell_height + this.ui_px(6.0);
+            rows.add((bottom - (title_y + this.settings_row_visual_height())).max(0.0));
+            // New, and said so after its title, as window opacity is.
+            let ui_font = Rc::clone(&this.ui_font);
+            let title_width = this.measure_text_width(&ui_font, &title).min(text_width);
+            this.paint_beta_badge(
+                layers,
+                tx + title_width + this.ui_px(14.0),
+                title_y,
+                tx + text_width,
+            )?;
+            Ok(rows.bottom)
+        })?;
+        self.ui.content_scroll.set_extents(
+            self.content_viewport_extent(),
+            self.settings_content_extent(bottom + scroll),
+        );
         Ok(())
     }
 

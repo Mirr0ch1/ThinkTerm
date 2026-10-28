@@ -417,6 +417,7 @@ impl crate::TermWindow {
     /// at 0.5), inflating max_scroll past the painted content.
     fn workspace_sidebar_list_height(
         view: &workspace_threads::WorkspaceThreadsView,
+        shared_rows: usize,
         row_height: usize,
         row_gap: usize,
         section_gap: usize,
@@ -469,19 +470,34 @@ impl crate::TermWindow {
                 }
             }
         }
+        // "Shared with me": its label row, then a row per pane, after a
+        // section gap when anything came before.
+        if shared_rows > 0 {
+            if height > 0 {
+                height = height.saturating_add(section_gap);
+            }
+            height = height.saturating_add((shared_rows + 1).saturating_mul(row_height + row_gap));
+        }
         height.saturating_sub(row_gap)
     }
 
     fn workspace_sidebar_scroll_height(
         view: &workspace_threads::WorkspaceThreadsView,
+        shared_rows: usize,
         row_height: usize,
         row_gap: usize,
         section_gap: usize,
         group_gap: usize,
         viewport_height: usize,
     ) -> usize {
-        let height =
-            Self::workspace_sidebar_list_height(view, row_height, row_gap, section_gap, group_gap);
+        let height = Self::workspace_sidebar_list_height(
+            view,
+            shared_rows,
+            row_height,
+            row_gap,
+            section_gap,
+            group_gap,
+        );
         if height > viewport_height {
             height.saturating_add(SIDEBAR_LIST_BOTTOM_PADDING)
         } else {
@@ -1237,6 +1253,7 @@ impl crate::TermWindow {
         let row_gap = self.ui_px(SIDEBAR_ROW_GAP);
         let total_height = Self::workspace_sidebar_scroll_height(
             &view,
+            self.shared_with_us_rows(),
             layout.row_height,
             row_gap,
             self.ui_px(WORKSPACE_SECTION_LABEL_GAP),
@@ -1298,6 +1315,7 @@ impl crate::TermWindow {
         let row_gap = self.ui_px(SIDEBAR_ROW_GAP);
         let total_height = Self::workspace_sidebar_scroll_height(
             &view,
+            self.shared_with_us_rows(),
             layout.row_height,
             row_gap,
             self.ui_px(WORKSPACE_SECTION_LABEL_GAP),
@@ -1540,9 +1558,12 @@ impl crate::TermWindow {
                 &workspaces,
                 self.workspace_sidebar_show_archived,
             ));
-        // A ref row is showing its workspace: the Space's own rows must not
-        // paint a second active highlight from their stale pointer.
-        let suppress_own_active = view.ref_workspace_on_screen();
+        // A ref row is showing its workspace, or a row of "Shared with me"
+        // is: the Space's own rows must not paint a second active highlight
+        // from their stale pointer.
+        let suppress_own_active = view.ref_workspace_on_screen()
+            || workspace_threads::is_share_view_workspace(&active_workspace)
+            || self.any_share_view_opening();
 
         let header_icon_size = icon_size.min(self.ui_px(32));
         let button_size = (header_icon_size + self.ui_px(8)).clamp(self.ui_px(32), self.ui_px(40));
@@ -1976,6 +1997,7 @@ impl crate::TermWindow {
             let viewport_height = content_bottom.saturating_sub(list_top);
             let total_height = Self::workspace_sidebar_scroll_height(
                 &view,
+                self.shared_with_us_rows(),
                 session_row_height,
                 row_gap,
                 self.ui_px(WORKSPACE_SECTION_LABEL_GAP),
@@ -3008,6 +3030,189 @@ impl crate::TermWindow {
 
                     virtual_y += session_row_height + row_gap;
                 }
+            }
+        }
+
+        // The panes other accounts on this machine share with ours, after
+        // everything of the Space's own; `workspace_sidebar_list_height`
+        // counts them the same way. A row opens the pane in a new tab.
+        // Under them, a line for each account whose ThinkTerm is another
+        // version: what it shares cannot be watched, but it may share.
+        let shared = self.shared_with_us().to_vec();
+        let other_version = self.shared_with_us_other_version();
+        if !shared.is_empty() || !other_version.is_empty() {
+            if virtual_y > 0 {
+                virtual_y += self.ui_px(WORKSPACE_SECTION_LABEL_GAP);
+            }
+            let label_icon_size = header_icon_size.min(ui_cell_height).max(16);
+            let label_top = list_top_f + virtual_y as f32 - scroll_offset;
+            let label_bottom = label_top + session_row_height as f32;
+            if label_bottom > list_top_f && label_top < content_bottom_f {
+                let label_y = label_top.floor().max(0.0) as usize;
+                let label_icon_x = item_x + self.ui_px(SIDEBAR_INSET);
+                let label_icon_y =
+                    label_y + ((session_row_height.saturating_sub(label_icon_size)) / 2);
+                let label_text_x = label_icon_x + label_icon_size + self.ui_px(SIDEBAR_ICON_GAP);
+                self.paint_sidebar_icon(
+                    layers,
+                    SvgIcon::Share,
+                    label_icon_x,
+                    label_icon_y,
+                    label_icon_size,
+                    muted_fg,
+                )?;
+                self.paint_sidebar_text(
+                    layers,
+                    &ui_font,
+                    ui_metrics,
+                    &crate::i18n::tr("sidebar-shared-with-me"),
+                    label_text_x,
+                    label_y + ((session_row_height.saturating_sub(ui_cell_height)) / 2),
+                    item_x
+                        .saturating_add(item_width)
+                        .saturating_sub(label_text_x + self.ui_px(SIDEBAR_INSET)),
+                    muted_fg,
+                )?;
+            }
+            virtual_y += session_row_height + row_gap;
+
+            let row_x = item_x + self.ui_px(SIDEBAR_INSET);
+            let row_width = item_width.saturating_sub(self.ui_px(SIDEBAR_INSET) * 2);
+            for (index, row) in shared.iter().enumerate() {
+                let row_top = list_top_f + virtual_y as f32 - scroll_offset;
+                let row_bottom = row_top + session_row_height as f32;
+                if row_bottom > list_top_f && row_top < content_bottom_f {
+                    let y = row_top.floor().max(0.0) as usize;
+                    let hit_y = row_top.max(list_top_f).floor().max(0.0) as usize;
+                    let hit_bottom =
+                        row_bottom.min(content_bottom_f).ceil().max(hit_y as f32) as usize;
+                    self.ui_items.push(UIItem {
+                        x: row_x,
+                        y: hit_y,
+                        width: row_width,
+                        height: hit_bottom.saturating_sub(hit_y).max(1),
+                        item_type: UIItemType::SharedWithMe(index),
+                    });
+                    let hovered = !suppress_hover
+                        && self.is_pointer_over_ui_rect(row_x, y, row_width, session_row_height);
+                    // The one this window is watching is selected, as a
+                    // thread on screen is, and from the click that opens it.
+                    let opening = self.share_view_opening(&row.workspace);
+                    let shown = opening || active_workspace == row.workspace;
+                    let row_rect = euclid::rect(
+                        row_x as f32,
+                        y as f32,
+                        row_width as f32,
+                        session_row_height as f32,
+                    );
+                    if shown {
+                        self.paint_active_surface_shadow(
+                            layers,
+                            0,
+                            row_rect,
+                            self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
+                        )
+                        .context("sidebar watched shared pane shadow")?;
+                        self.fill_rounded_rectangle_with_border(
+                            layers,
+                            0,
+                            row_rect,
+                            selected_bg,
+                            selected_border,
+                            self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
+                            CAPSULE_BORDER_WIDTH,
+                        )
+                        .context("sidebar watched shared pane")?;
+                    } else if hovered {
+                        self.fill_rounded_rectangle(
+                            layers,
+                            0,
+                            row_rect,
+                            chrome.sidebar_row_hover_bg,
+                            self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
+                        )
+                        .context("sidebar hovered shared pane")?;
+                    }
+                    let icon_x = row_x + self.ui_px(SIDEBAR_INSET);
+                    let icon_y = y + ((session_row_height.saturating_sub(label_icon_size)) / 2);
+                    self.paint_sidebar_icon(
+                        layers,
+                        if opening {
+                            SvgIcon::LoaderCircle
+                        } else {
+                            SvgIcon::Eye
+                        },
+                        icon_x,
+                        icon_y,
+                        label_icon_size,
+                        if hovered || shown { foreground } else { muted_fg },
+                    )?;
+                    let text_x = icon_x + label_icon_size + self.ui_px(SIDEBAR_ICON_GAP);
+                    let text = if row.title.is_empty() {
+                        row.owner.clone()
+                    } else {
+                        format!("{} · {}", row.owner, row.title)
+                    };
+                    self.paint_sidebar_text(
+                        layers,
+                        &ui_font,
+                        ui_metrics,
+                        &text,
+                        text_x,
+                        y + ((session_row_height.saturating_sub(ui_cell_height)) / 2),
+                        row_x
+                            .saturating_add(row_width)
+                            .saturating_sub(text_x + self.ui_px(SIDEBAR_INSET)),
+                        foreground,
+                    )?;
+                }
+                virtual_y += session_row_height + row_gap;
+            }
+            // Two lines each, counted as two rows: whose, then what to do,
+            // which the sidebar's width would cut off after the name.
+            let hint = crate::i18n::tr("sidebar-shared-other-version-hint");
+            for line in &other_version {
+                let row_top = list_top_f + virtual_y as f32 - scroll_offset;
+                let row_bottom = row_top + (session_row_height * 2 + row_gap) as f32;
+                if row_bottom > list_top_f && row_top < content_bottom_f {
+                    let y = row_top.floor().max(0.0) as usize;
+                    let icon_x = row_x + self.ui_px(SIDEBAR_INSET);
+                    let icon_y = y + ((session_row_height.saturating_sub(label_icon_size)) / 2);
+                    self.paint_sidebar_icon(
+                        layers,
+                        SvgIcon::CircleAlert,
+                        icon_x,
+                        icon_y,
+                        label_icon_size,
+                        muted_fg,
+                    )?;
+                    let text_x = icon_x + label_icon_size + self.ui_px(SIDEBAR_ICON_GAP);
+                    let text_y = y + ((session_row_height.saturating_sub(ui_cell_height)) / 2);
+                    let text_width = row_x
+                        .saturating_add(row_width)
+                        .saturating_sub(text_x + self.ui_px(SIDEBAR_INSET));
+                    self.paint_sidebar_text(
+                        layers,
+                        &ui_font,
+                        ui_metrics,
+                        line,
+                        text_x,
+                        text_y,
+                        text_width,
+                        muted_fg,
+                    )?;
+                    self.paint_sidebar_text(
+                        layers,
+                        &ui_font,
+                        ui_metrics,
+                        &hint,
+                        text_x,
+                        text_y + ui_cell_height + self.ui_px(2),
+                        text_width,
+                        muted_fg,
+                    )?;
+                }
+                virtual_y += (session_row_height + row_gap) * 2;
             }
         }
 

@@ -1666,6 +1666,7 @@ impl super::TermWindow {
             | UIItemType::ProjectNew
             | UIItemType::SpaceMenu
             | UIItemType::SpaceReconnect
+            | UIItemType::SharedWithMe(_)
             | UIItemType::ProjectToggleThreads(_)
             | UIItemType::ThreadRefGroupToggle { .. }
             | UIItemType::ThreadRefGroupNewThread(_)
@@ -1748,6 +1749,7 @@ impl super::TermWindow {
             | UIItemType::RightSidebarRemoteFileCopyText
             | UIItemType::RightSidebarRemoteTransfer(_)
             | UIItemType::ContextMenuBackdrop
+            | UIItemType::SharePanel
             | UIItemType::ContextMenuItem(_)
             | UIItemType::CommandPalette
             | UIItemType::AboveScrollThumb(_)
@@ -1842,6 +1844,7 @@ impl super::TermWindow {
             | UIItemType::ProjectNew
             | UIItemType::SpaceMenu
             | UIItemType::SpaceReconnect
+            | UIItemType::SharedWithMe(_)
             | UIItemType::ProjectToggleThreads(_)
             | UIItemType::ThreadRefGroupToggle { .. }
             | UIItemType::ThreadRefGroupNewThread(_)
@@ -1926,6 +1929,7 @@ impl super::TermWindow {
             | UIItemType::RightSidebarRemoteFileCopyText
             | UIItemType::RightSidebarRemoteTransfer(_)
             | UIItemType::ContextMenuBackdrop
+            | UIItemType::SharePanel
             | UIItemType::ContextMenuItem(_)
             | UIItemType::CommandPalette
             | UIItemType::AboveScrollThumb(_)
@@ -2172,9 +2176,10 @@ impl super::TermWindow {
         }
 
         self.current_mouse_event.replace(event.clone());
-        // Not while the command palette's scrim covers the window: the
-        // hover-reveal machinery would slide the sidebar out underneath it.
-        if self.command_palette.is_none() {
+        // Not while the command palette's scrim covers the window, or a share
+        // panel is open: the hover-reveal machinery would slide the sidebar
+        // out underneath it.
+        if self.command_palette.is_none() && !self.share_panel_open() {
             self.update_workspace_sidebar_hover(context);
             self.update_right_sidebar_hover(context);
             self.update_window_tab_reveal(context);
@@ -2189,6 +2194,11 @@ impl super::TermWindow {
         // before the pane-dependent context-menu branch so it also works when
         // there is no active pane (content view foreground).
         if self.mouse_event_command_palette(&event, context) {
+            self.release_pointer_ownership(&event);
+            return;
+        }
+        // A pane's share panel likewise, while it is open.
+        if self.mouse_event_share_panel(&event, context) {
             self.release_pointer_ownership(&event);
             return;
         }
@@ -3118,6 +3128,7 @@ impl super::TermWindow {
                 self.drag_workspace_sidebar_scroll_thumb(item, start_event, event, context);
             }
             UIItemType::ContextMenuBackdrop
+            | UIItemType::SharePanel
             | UIItemType::ContextMenuItem(_)
             | UIItemType::CommandPalette => {}
             UIItemType::PaneNav { .. } => {
@@ -4015,6 +4026,12 @@ impl super::TermWindow {
                 }
                 context.set_cursor(Some(MouseCursor::Arrow));
             }
+            UIItemType::SharedWithMe(index) => {
+                if let WMEK::Press(MousePress::Left) = event.kind {
+                    self.watch_shared_pane(index);
+                }
+                context.set_cursor(Some(MouseCursor::Hand));
+            }
             UIItemType::ProjectToggleThreads(project_id) => {
                 self.mouse_event_project_toggle_threads(project_id, event, context);
             }
@@ -4255,7 +4272,9 @@ impl super::TermWindow {
             UIItemType::WorkspaceSidebarNotifications => {
                 self.mouse_event_workspace_sidebar_notifications(item.clone(), event, context);
             }
-            UIItemType::ContextMenuBackdrop | UIItemType::CommandPalette => {
+            UIItemType::ContextMenuBackdrop
+            | UIItemType::SharePanel
+            | UIItemType::CommandPalette => {
                 context.set_cursor(Some(MouseCursor::Arrow));
             }
             UIItemType::ContextMenuItem(_) => {
@@ -4605,6 +4624,12 @@ impl super::TermWindow {
                 }
                 context.set_cursor(Some(MouseCursor::Arrow));
             }
+            UIItemType::SharedWithMe(index) => {
+                if let WMEK::Press(MousePress::Left) = event.kind {
+                    self.watch_shared_pane(index);
+                }
+                context.set_cursor(Some(MouseCursor::Hand));
+            }
             UIItemType::ProjectToggleThreads(project_id) => {
                 self.mouse_event_project_toggle_threads(project_id, event, context);
             }
@@ -4845,7 +4870,9 @@ impl super::TermWindow {
                     self.request_close_content_view_by_id(id);
                 }
             }
-            UIItemType::ContextMenuBackdrop | UIItemType::CommandPalette => {
+            UIItemType::ContextMenuBackdrop
+            | UIItemType::SharePanel
+            | UIItemType::CommandPalette => {
                 context.set_cursor(Some(MouseCursor::Arrow));
             }
             UIItemType::ContextMenuItem(_) => {
@@ -8327,6 +8354,8 @@ impl super::TermWindow {
         let mux = Mux::get();
 
         match action {
+            PaneNavAction::Share => self.toggle_share_panel(pane_id),
+            PaneNavAction::SharePill => self.press_share_pill(pane_id),
             PaneNavAction::Background => {
                 if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {
                     if tab

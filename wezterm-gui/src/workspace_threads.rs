@@ -6697,6 +6697,11 @@ impl WorkspaceThreadStore {
 
     fn sync_current_project(&mut self, space_id: &str, active_workspace: &str) -> bool {
         let mut changed = self.normalize_after_load();
+        // A window watching a shared pane shows a workspace of its own:
+        // binding the active thread to it would lose the thread's.
+        if is_share_view_workspace(active_workspace) {
+            return changed;
+        }
         // A refs-only Space (a migrated collection) owns no projects: the
         // workspace on display belongs to a reference's origin Space, and
         // falling through to ensure_current_project would seed it with a
@@ -10305,6 +10310,15 @@ fn workspace_name_for_thread(project_id: &str, thread_id: &str) -> String {
     format!("thinkterm:{project_id}:{thread_id}")
 }
 
+/// The workspaces a window watches a pane another account shares in, one
+/// per share (see `termwindow::share`). No thread owns one, and none may
+/// be bound to one.
+pub const SHARE_VIEW_WORKSPACE_PREFIX: &str = "thinkterm-share-view:";
+
+pub fn is_share_view_workspace(workspace: &str) -> bool {
+    workspace.starts_with(SHARE_VIEW_WORKSPACE_PREFIX)
+}
+
 /// Whether `workspace` is the mux workspace this thread runs in: its
 /// materialized name once the server has reported one, else the name the
 /// thread is planned under. Both the writer and the reader of remote font
@@ -12885,6 +12899,36 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn a_shared_pane_on_screen_leaves_the_active_thread_alone() {
+        let mut store = test_store();
+        let space = default_space_id();
+        let mut thread = WorkspaceThread::new(
+            "project-default".to_string(),
+            "main".to_string(),
+            Some("workspace-default".to_string()),
+        );
+        let thread_id = thread.id.clone();
+        thread.materialized_workspace_name = Some("workspace-default".to_string());
+        let mut project = test_project_in_space(
+            &space,
+            "project-default",
+            "Default",
+            PathBuf::from("/tmp/default"),
+            vec![thread],
+        );
+        project.active_thread_id = Some(thread_id);
+        store.projects.push(project);
+        store.set_active_project_for_space(&space, "project-default".to_string());
+
+        let watching = format!("{SHARE_VIEW_WORKSPACE_PREFIX}local/owl/3");
+        store.sync_current_project(&space, &watching);
+        assert!(store.projects.iter().all(|project| project.threads.iter().all(|thread| {
+            thread.materialized_workspace_name.as_deref() != Some(watching.as_str())
+        })));
+        assert_eq!(store.projects.len(), 1, "no project is made up for it");
     }
 
     #[test]

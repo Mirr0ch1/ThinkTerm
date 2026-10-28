@@ -89,7 +89,10 @@ pub enum SvgIcon {
     Shield,
     SlidersHorizontal,
     SlidersVertical,
+    Share,
     Shrink,
+    User,
+    Users,
     CircleAlert,
     CircleCheck,
     CircleX,
@@ -354,6 +357,9 @@ impl SvgIcon {
             Self::SlidersVertical => {
                 include_bytes!("../../../../third_party/lucide/icons/sliders-vertical.svg")
             }
+            Self::Share => include_bytes!("../../../../third_party/lucide/icons/share-2.svg"),
+            Self::User => include_bytes!("../../../../third_party/lucide/icons/user.svg"),
+            Self::Users => include_bytes!("../../../../third_party/lucide/icons/users.svg"),
             Self::Shrink => include_bytes!("../../../../third_party/lucide/icons/shrink.svg"),
             Self::CircleAlert => {
                 include_bytes!("../../../../third_party/lucide/icons/circle-alert.svg")
@@ -890,6 +896,9 @@ mod tests {
             SvgIcon::Server,
             SvgIcon::ServerOff,
             SvgIcon::LaptopOff,
+            SvgIcon::Share,
+            SvgIcon::User,
+            SvgIcon::Users,
             SvgIcon::MuxServer,
             SvgIcon::ExternalLink,
             SvgIcon::ChevronDown,

@@ -1261,7 +1261,7 @@ fn paint_menu_rows(
 ///
 /// Takes the window's palette rather than an appearance so the caller pays for
 /// resolving it once per configuration instead of once per menu paint.
-fn context_menu_palette(palette: UiPalette) -> UiPalette {
+pub(crate) fn context_menu_palette(palette: UiPalette) -> UiPalette {
     let mut card = palette.as_menu_card();
     // Solid whatever the palette: one derived from the terminal's scheme
     // keeps its see-through control fill, and what the menu covered showed

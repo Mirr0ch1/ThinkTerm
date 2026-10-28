@@ -45,6 +45,11 @@ use wezterm_term::{Line, StableRowIndex};
 use window::color::LinearRgba;
 use window::MouseEventKind as WMEK;
 
+/// Inside a viewer pane's pill, either side of its icon and words.
+const SHARE_PILL_PAD: usize = 12;
+/// The dot on a share button while someone asks to type.
+const SHARE_ASKING_DOT: usize = 12;
+
 fn clamp_pane_horizontal_span(
     pane_left: f32,
     candidate_right: f32,
@@ -198,10 +203,130 @@ impl crate::TermWindow {
 
     /// The trailing action buttons alone.
     fn pane_nav_actions_width(&self, pos: &PositionedPane, button_size: usize) -> usize {
-        let action_count = 4 + usize::from(self.can_collapse_pane_stack(pos));
+        let action_count = 4
+            + usize::from(self.can_collapse_pane_stack(pos))
+            + usize::from(
+                self.pane_can_share(&pos.pane)
+                    || self.pane_is_watching_share(pos.pane.pane_id()),
+            );
+        // A viewer's pill stands where the share button would.
+        let pill = self
+            .pane_share_pill_width(pos, button_size)
+            .map_or(0, |width| width.saturating_sub(button_size));
         action_count
             .saturating_mul(button_size + self.ui_px(PANE_NAV_BUTTON_GAP))
             .saturating_add(self.ui_px(PANE_NAV_INSET))
+            .saturating_add(pill)
+    }
+
+    /// How wide the pill of a pane watching another account's share is:
+    /// its icon and its words.
+    fn pane_share_pill_width(&self, pos: &PositionedPane, button_size: usize) -> Option<usize> {
+        let pill = self.share_pill(pos.pane.pane_id())?;
+        let font = self
+            .fonts
+            .title_font_with_size(crate::native_settings::pane_header_font_size(
+                &crate::native_settings::load_shared(),
+            ))
+            .ok()?;
+        let text = self.sidebar_text_width(&font, &pill.label).ok()?.ceil() as usize;
+        let icon = self.ui_px(PANE_NAV_ACTION_ICON_SIZE).min(button_size);
+        Some(
+            self.ui_px(SHARE_PILL_PAD) * 2
+                + icon
+                + self.ui_px(PANE_NAV_ICON_GAP)
+                + text,
+        )
+    }
+
+    /// The pill of a pane watching another account's share: where the
+    /// watch stands, pressed to ask to type or to give it back.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_pane_share_pill(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        pill: &crate::termwindow::share::SharePill,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        icon_size: usize,
+        pos: &PositionedPane,
+        foreground: LinearRgba,
+    ) -> anyhow::Result<()> {
+        if pill.live {
+            self.ui_items.push(UIItem {
+                x,
+                y,
+                width,
+                height,
+                item_type: UIItemType::PaneNav {
+                    pane_id: pos.pane.pane_id(),
+                    pane_index: pos.index,
+                    action: PaneNavAction::SharePill,
+                },
+            });
+        }
+        let hovered = pill.live && self.is_pointer_over_ui_rect(x, y, width, height);
+        let pressed = hovered && self.is_pointer_pressing_ui_rect(x, y, width, height);
+        let chrome = self.chrome();
+        let (fill, border, ink) = if pill.lit {
+            let fill = if hovered {
+                chrome.accent_hover
+            } else {
+                chrome.accent
+            };
+            (fill, fill, chrome.on_accent)
+        } else {
+            let fill = if pressed {
+                chrome.control_pressed_bg
+            } else if hovered {
+                chrome.control_hover_bg
+            } else {
+                chrome.control_bg
+            };
+            (fill, chrome.control_border, foreground)
+        };
+        self.fill_rounded_rectangle_with_border(
+            layers,
+            1,
+            euclid::rect(x as f32, y as f32, width as f32, height as f32),
+            fill,
+            border,
+            PANE_NAV_ACTION_BUTTON_RADIUS,
+            ICON_BUTTON_BORDER_WIDTH,
+        )
+        .context("pane share pill")?;
+        let pad = self.ui_px(SHARE_PILL_PAD);
+        self.paint_pane_nav_icon(
+            layers,
+            pill.icon,
+            x + pad,
+            y + height.saturating_sub(icon_size) / 2,
+            icon_size,
+            ink,
+        )?;
+        let font = self
+            .fonts
+            .title_font_with_size(crate::native_settings::pane_header_font_size(
+                &crate::native_settings::load_shared(),
+            ))
+            .context("pane share pill font")?;
+        let metrics = RenderMetrics::with_font_metrics(&font.metrics());
+        let text_x = x + pad + icon_size + self.ui_px(PANE_NAV_ICON_GAP);
+        let text_y = y + height.saturating_sub(metrics.cell_size.height as usize) / 2;
+        // Its width measured the words: rounding is all that may cut them.
+        let text_width = (x + width).saturating_sub(text_x + pad) + 2;
+        self.paint_pane_nav_text(
+            layers,
+            &font,
+            metrics,
+            &pill.label,
+            text_x,
+            text_y,
+            text_width,
+            ink,
+        )
     }
 
     /// `pos`'s bar, `width` wide, has room for the window's `parts` beside
@@ -1202,7 +1327,45 @@ impl crate::TermWindow {
             },
             PaneNavAction::ToggleZoom,
         ));
+        // A shared pane's button wears the accent while the share lasts,
+        // and a dot while someone asks to type; a pane watching another
+        // account's share has its pill in the button's place.
+        let share_state = self.pane_share_state(&pos.pane);
+        let watch_pill = self.share_pill(pos.pane.pane_id());
+        if self.pane_can_share(&pos.pane) || watch_pill.is_some() {
+            actions.push((SvgIcon::Share, PaneNavAction::Share));
+        }
+        let accent = self.chrome().accent;
         for (icon, action) in actions {
+            if action == PaneNavAction::Share {
+                if let Some(pill) = &watch_pill {
+                    let width = self
+                        .pane_share_pill_width(pos, button_size)
+                        .unwrap_or(button_size);
+                    button_x = button_x.saturating_sub(width + self.ui_px(PANE_NAV_BUTTON_GAP));
+                    if (button_x as f32) < pane_x {
+                        break;
+                    }
+                    self.paint_pane_share_pill(
+                        layers,
+                        pill,
+                        button_x,
+                        button_y,
+                        width,
+                        button_size,
+                        action_icon_size,
+                        pos,
+                        foreground,
+                    )?;
+                    continue;
+                }
+            }
+            let (color, hover_color) =
+                if share_state.is_some() && action == PaneNavAction::Share {
+                    (accent, accent)
+                } else {
+                    (muted_fg, foreground)
+                };
             button_x = button_x.saturating_sub(button_size + self.ui_px(PANE_NAV_BUTTON_GAP));
             // Stop once a button would spill past the pane's left edge (happens
             // when the pane is too narrow to hold all the action buttons).
@@ -1216,11 +1379,27 @@ impl crate::TermWindow {
                 button_y,
                 button_size,
                 action_icon_size,
-                muted_fg,
-                foreground,
+                color,
+                hover_color,
                 pos,
                 action,
             )?;
+            if share_state == Some(true) && action == PaneNavAction::Share {
+                let dot = self.ui_px(SHARE_ASKING_DOT);
+                self.fill_rounded_rectangle(
+                    layers,
+                    2,
+                    euclid::rect(
+                        (button_x + button_size).saturating_sub(dot + self.ui_px(4)) as f32,
+                        (button_y + self.ui_px(4)) as f32,
+                        dot as f32,
+                        dot as f32,
+                    ),
+                    AGENT_BLOCKED_COLOR,
+                    dot as f32 / 2.0,
+                )
+                .context("pane share asking dot")?;
+            }
         }
 
         let tabs = self.pane_nav_tabs(pos);

@@ -164,6 +164,7 @@ pub mod remote_thread_view;
 pub(crate) mod remote_walk;
 pub mod render;
 pub mod resize;
+pub(crate) mod share;
 mod selection;
 mod sidebar_hover;
 mod space_swipe;
@@ -773,6 +774,9 @@ pub enum UIItemType {
     /// domain is disconnected (retry loop parked, detached, or never
     /// connected this session).
     SpaceReconnect,
+    /// A row of "Shared with me": the pane another account shares, by its
+    /// place in `TermWindow::shared_with_us`.
+    SharedWithMe(usize),
     ProjectToggleThreads(String),
     /// Collapse/expand a folder-style thread-reference group. `key` is the
     /// collapse-state key (`"<space_id>::"` + the group key — the origin
@@ -895,6 +899,9 @@ pub enum UIItemType {
     /// share the room between them.
     RightSidebarPluginExtendedResize,
     ContextMenuBackdrop,
+    /// Over the whole window while a pane's share panel is open: every
+    /// pointer event goes to the panel (see `share.rs`).
+    SharePanel,
     ContextMenuItem(Vec<usize>),
     /// Backdrop of the command palette; the palette routes its own pointer
     /// events, this item only keeps clicks from reading as terminal surface.
@@ -1313,6 +1320,11 @@ pub enum PaneNavAction {
     ToggleCollapse,
     SplitRight,
     SplitDown,
+    /// Share the pane with other accounts, or see who watches it.
+    Share,
+    /// A pane watching another account's share: ask to type, or give it
+    /// back.
+    SharePill,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2147,6 +2159,11 @@ pub fn tooltip_label_for(item_type: &UIItemType) -> Option<String> {
         UIItemType::WorkspaceSidebarSshHosts => "tooltip-sidebar-ssh-hosts",
         UIItemType::WorkspaceSidebarLiveOverview => "tooltip-sidebar-live-overview",
         UIItemType::WorkspaceSidebarNotifications => "tooltip-sidebar-notifications",
+        UIItemType::PaneNav {
+            action: PaneNavAction::Share,
+            ..
+        } => "tooltip-share-pane",
+        UIItemType::SharedWithMe(_) => "tooltip-watch-shared-pane",
         UIItemType::RightSidebarAgent(crate::agent_status::AgentPanelAction::ViewOptions) => {
             "tooltip-sidebar-view-options"
         }
@@ -3137,6 +3154,8 @@ pub struct TermWindow {
     scheme_preview: Option<Option<String>>,
     context_menu_application_actions: HashMap<u64, ContextMenuApplicationAction>,
     next_context_menu_application_action_id: u64,
+    /// Panes shared with other accounts, and what they share with ours.
+    pub(crate) share: share::ShareUi,
     context_menu_suppressed_release: Option<MousePress>,
     dragging: Option<(UIItem, MouseEvent)>,
     // In-flight drag of a Files-panel row toward the terminal; becomes
@@ -5091,6 +5110,7 @@ impl TermWindow {
             scheme_preview_ground: None,
             context_menu_application_actions: HashMap::new(),
             next_context_menu_application_action_id: 1,
+            share: Default::default(),
             context_menu_suppressed_release: None,
             dragging: None,
             right_sidebar_file_drag: None,
@@ -6213,6 +6233,7 @@ impl TermWindow {
                     pane_id,
                 } => {
                     self.refresh_thread_work_for_pane(pane_id);
+                    self.note_share_watch(pane_id, &name, &value);
                     self.emit_user_var_event(pane_id, name, value);
                 }
                 MuxNotification::WindowTitleChanged { .. }
@@ -6488,6 +6509,7 @@ impl TermWindow {
                 self.maybe_release_occluded_memory();
                 self.maybe_release_idle_preview_cache();
                 self.maybe_warm_overview_fonts();
+                self.share_tick();
             }
             TermWindowNotif::OpenProjectPath(path) => {
                 let path = path.to_string_lossy();
@@ -6674,6 +6696,16 @@ impl TermWindow {
         let Some(window) = self.window.clone() else {
             return;
         };
+        // The pane shared with us that this window went to watch closed:
+        // back to the thread it came from, still the Space's active one.
+        if self.share_view_closed() {
+            if let Some(thread_id) =
+                crate::workspace_threads::ensure_active_thread_for_space(&self.active_space_id)
+            {
+                self.activate_workspace_thread(thread_id, &window);
+                return;
+            }
+        }
         let recovery_thread = if self.dies_with_mux_window
             || crate::workspace_threads::client_domain_for_space(&self.active_space_id).is_some()
         {

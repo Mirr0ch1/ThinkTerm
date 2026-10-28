@@ -1635,6 +1635,16 @@ impl Default for NativeWebSettings {
     }
 }
 
+/// Sharing a terminal with other accounts on its machine
+/// (`termwindow::share`): the Share & Sync page. Off until turned on.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct NativeSharingSettings {
+    /// The share button on terminals, "Shared with me" in the sidebar, and
+    /// the window asking its servers after shares: none of it while off.
+    pub(crate) enabled: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct NativeCommandPaletteSettings {
@@ -1957,6 +1967,7 @@ pub(crate) struct ThinkTermNativeSettings {
     pub(crate) keymap: NativeKeymapSettings,
     pub(crate) web: NativeWebSettings,
     pub(crate) tab_icons: NativeTabIconSettings,
+    pub(crate) sharing: NativeSharingSettings,
 }
 
 impl Default for ThinkTermNativeSettings {
@@ -1976,6 +1987,7 @@ impl Default for ThinkTermNativeSettings {
             keymap: NativeKeymapSettings::default(),
             web: NativeWebSettings::default(),
             tab_icons: NativeTabIconSettings::default(),
+            sharing: NativeSharingSettings::default(),
         }
     }
 }
@@ -3235,6 +3247,16 @@ pub(crate) fn main_window_renderer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sharing_is_off_until_turned_on() {
+        let settings: ThinkTermNativeSettings = serde_json::from_str("{}").unwrap();
+        assert!(!settings.sharing.enabled);
+        assert!(!ThinkTermNativeSettings::for_new_install().sharing.enabled);
+        let settings: ThinkTermNativeSettings =
+            serde_json::from_str(r#"{"sharing": {"enabled": true}}"#).unwrap();
+        assert!(settings.sharing.enabled);
+    }
 
     #[test]
     fn the_right_sidebar_starts_as_it_was_left_while_that_is_remembered() {
