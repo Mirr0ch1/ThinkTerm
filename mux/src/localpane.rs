@@ -461,6 +461,10 @@ impl Pane for LocalPane {
         crate::pane::impl_get_lines_via_with_lines(self, lines)
     }
 
+    fn get_screen_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
+        terminal_get_screen_lines(&mut self.terminal.lock(), lines)
+    }
+
     fn get_logical_lines(&self, lines: Range<StableRowIndex>) -> Vec<LogicalLine> {
         crate::pane::impl_get_logical_lines_via_get_lines(self, lines)
     }
@@ -2124,6 +2128,35 @@ mod summary_tests {
         assert_eq!(summary.title, title_before);
         assert_eq!(summary.dimensions.cols, 80);
         drop(guard);
+    }
+
+    /// The alternate screen numbers its rows from nought, so bounds taken
+    /// on it name the primary screen's oldest history once the program
+    /// has left it. Rows held to the screen are read with the screen.
+    #[test]
+    fn rows_held_to_the_screen_are_read_with_it() {
+        let (pane, _sizes, _exit) = pane();
+        let feed = |text: &str| {
+            let mut parser = termwiz::escape::parser::Parser::new();
+            let mut actions = vec![];
+            parser.parse(text.as_bytes(), |action| actions.push(action));
+            pane.perform_actions(actions);
+        };
+        for row in 0..60 {
+            feed(&format!("history {row}\r\n"));
+        }
+        feed("\x1b[?1049hfull screen");
+        let alt = pane.get_dimensions();
+        let asked = alt.physical_top..alt.physical_top + alt.viewport_rows as StableRowIndex;
+        let (_, lines) = pane.get_screen_lines(asked.clone());
+        assert!(lines[0].as_str().starts_with("full screen"));
+
+        // The program leaves its screen between the bounds and the rows.
+        feed("\x1b[?1049l");
+        let (_, unheld) = pane.get_lines(asked.clone());
+        assert!(unheld[0].as_str().starts_with("history 0"));
+        let (_, held) = pane.get_screen_lines(asked);
+        assert!(held.is_empty());
     }
 
     #[cfg(unix)]

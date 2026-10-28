@@ -301,6 +301,21 @@ pub trait Pane: Downcast + Send + Sync {
     /// the first row in the range.
     fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>);
 
+    /// `get_lines`, held to the rows on the screen as they are read. The
+    /// screen's bounds and its rows are read together: the two screens
+    /// number their rows apart, so bounds read before a switch from one
+    /// to the other would name rows of the other one, as like as not its
+    /// oldest history. A pane that cannot read both at once reads them one
+    /// after the other.
+    fn get_screen_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
+        let lines = on_screen(&self.get_dimensions(), lines);
+        // Not asked: a screen can answer an empty range with a row.
+        if lines.is_empty() {
+            return (lines.start, vec![]);
+        }
+        self.get_lines(lines)
+    }
+
     fn with_lines_mut(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines);
 
     fn for_each_logical_line_in_stable_range_mut(
@@ -805,6 +820,16 @@ pub fn impl_get_logical_lines_via_get_lines<P: Pane + ?Sized>(
     lines
 }
 
+/// The rows of `lines` on the screen `dims` describe.
+pub fn on_screen(
+    dims: &RenderableDimensions,
+    lines: Range<StableRowIndex>,
+) -> Range<StableRowIndex> {
+    let top = dims.physical_top;
+    let start = lines.start.max(top);
+    start..lines.end.min(top + dims.viewport_rows as StableRowIndex).max(start)
+}
+
 /// A helper that allows you to implement Pane::get_lines in terms
 /// of your Pane::with_lines_mut method.
 pub fn impl_get_lines_via_with_lines<P: Pane + ?Sized>(
@@ -984,6 +1009,28 @@ mod test {
             .iter()
             .map(|l| (l.first_row, l.logical.as_str()))
             .collect::<Vec<_>>()
+    }
+
+    // A range that ends before it starts is one of those asked about.
+    #[allow(clippy::reversed_empty_ranges)]
+    #[test]
+    fn only_rows_on_the_screen_are_on_it() {
+        let dims = RenderableDimensions {
+            viewport_rows: 24,
+            physical_top: 100,
+            ..RenderableDimensions::default()
+        };
+        assert_eq!(on_screen(&dims, 90..110), 100..110);
+        assert_eq!(on_screen(&dims, 120..200), 120..124);
+        assert!(on_screen(&dims, 0..100).is_empty());
+        assert!(on_screen(&dims, 124..130).is_empty());
+        assert!(on_screen(&dims, 110..105).is_empty());
+        // The alternate screen numbers its rows from nought.
+        let alt = RenderableDimensions {
+            viewport_rows: 24,
+            ..RenderableDimensions::default()
+        };
+        assert_eq!(on_screen(&alt, 0..5000), 0..24);
     }
 
     #[test]
