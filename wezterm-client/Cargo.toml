@@ -42,6 +42,9 @@ wezterm-uds.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 
+[target."cfg(unix)".dependencies]
+nix = { workspace = true, features = ["user"] }
+
 [target."cfg(windows)".dependencies]
 winapi = { workspace=true, features = [
     "winbase",

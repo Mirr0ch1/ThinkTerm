@@ -573,8 +573,26 @@ async fn process_unilateral_inner_async(
 /// Where a client without a domain of its own -- the CLI -- sends what the
 /// server pushes, once it has asked to hear it, and which of the pushes it
 /// wants. See `tap_unilateral_pdus`.
-static UNILATERAL_TAP: std::sync::Mutex<Option<(Sender<Pdu>, fn(&Pdu) -> bool)>> =
-    std::sync::Mutex::new(None);
+static UNILATERAL_TAP: std::sync::Mutex<Option<UnilateralSink>> = std::sync::Mutex::new(None);
+
+enum UnilateralSink {
+    Channel(Sender<Pdu>, fn(&Pdu) -> bool),
+    Share(crate::share_queue::Sender),
+}
+
+impl UnilateralSink {
+    fn send(&self, pdu: Pdu) -> anyhow::Result<()> {
+        match self {
+            Self::Channel(tap, wanted) => {
+                if wanted(&pdu) && tap.try_send(pdu).is_err() {
+                    log::warn!("dropping a server push nobody is reading");
+                }
+                Ok(())
+            }
+            Self::Share(tap) => tap.send(pdu),
+        }
+    }
+}
 
 /// Hand every PDU the server pushes to a client without a local domain
 /// (the CLI's own connection) to the returned receiver, rather than drop
@@ -588,8 +606,45 @@ pub fn tap_unilateral_pdus(capacity: usize) -> Receiver<Pdu> {
 /// however many, cannot crowd them out.
 pub fn tap_unilateral_pdus_where(capacity: usize, wanted: fn(&Pdu) -> bool) -> Receiver<Pdu> {
     let (tx, rx) = smol::channel::bounded(capacity);
-    *UNILATERAL_TAP.lock().unwrap() = Some((tx, wanted));
+    *UNILATERAL_TAP.lock().unwrap() = Some(UnilateralSink::Channel(tx, wanted));
     rx
+}
+
+/// Share viewers may skip intermediate screen updates, but must always learn
+/// the current control state and why their watch ended.
+pub fn tap_share_updates() -> ShareUpdateTap {
+    let (sender, receiver) = crate::share_queue::channel();
+    *UNILATERAL_TAP.lock().unwrap() = Some(UnilateralSink::Share(sender));
+    ShareUpdateTap { receiver }
+}
+
+pub struct ShareUpdateTap {
+    receiver: crate::share_queue::Receiver,
+}
+
+impl ShareUpdateTap {
+    pub async fn recv(&self) -> Result<crate::share_queue::Update, smol::channel::RecvError> {
+        self.receiver.recv().await
+    }
+
+    pub fn try_recv(&self) -> Result<crate::share_queue::Update, smol::channel::TryRecvError> {
+        self.receiver.try_recv()
+    }
+
+    fn release(&self, installed: &mut Option<UnilateralSink>) {
+        self.receiver.close();
+        if installed.as_ref().is_some_and(
+            |tap| matches!(tap, UnilateralSink::Share(tap) if tap.same_channel(&self.receiver)),
+        ) {
+            *installed = None;
+        }
+    }
+}
+
+impl Drop for ShareUpdateTap {
+    fn drop(&mut self) {
+        self.release(&mut UNILATERAL_TAP.lock().unwrap());
+    }
 }
 
 fn process_unilateral(
@@ -603,11 +658,8 @@ fn process_unilateral(
         None => {
             // No panes to update here. A caller that asked for the
             // server's pushes gets them; anyone else ignores them.
-            if let Some((tap, wanted)) = UNILATERAL_TAP.lock().unwrap().as_ref() {
-                if wanted(&decoded.pdu) && tap.try_send(decoded.pdu).is_err() {
-                    log::warn!("dropping a server push nobody is reading");
-                }
-                return Ok(());
+            if let Some(tap) = UNILATERAL_TAP.lock().unwrap().as_ref() {
+                return tap.send(decoded.pdu);
             }
             log::trace!(
                 "client doesn't have a real local domain, \
@@ -1073,6 +1125,7 @@ async fn client_thread_registered(
     };
 
     let mut stream = reconnectable.take_stream().unwrap();
+    let incoming_payload_limit = reconnectable.incoming_payload_limit;
 
     // Application-level keepalive: a transport that died without an RST
     // (VPN egress rotation, sleepy NAT) otherwise hangs silently until the
@@ -1182,16 +1235,31 @@ async fn client_thread_registered(
                 };
                 let read = with_progress(&bytes, IO_STALL_LIMIT, async {
                     if registration.is_complete() {
-                        return Pdu::decode_async(&mut counted, Some(next_serial))
-                            .await
-                            .map(Some);
+                        return match incoming_payload_limit {
+                            Some(limit) => {
+                                Pdu::decode_async_bounded(&mut counted, Some(next_serial), limit)
+                                    .await
+                            }
+                            None => Pdu::decode_async(&mut counted, Some(next_serial)).await,
+                        }
+                        .map(Some);
                     }
-                    let deferred = DeferredPdu::read_async(
-                        &mut counted,
-                        Some(next_serial),
-                        REGISTRATION_BYTES.saturating_sub(deferred_bytes),
-                    )
-                    .await?;
+                    let push_budget = REGISTRATION_BYTES.saturating_sub(deferred_bytes);
+                    let deferred = match incoming_payload_limit {
+                        Some(limit) => {
+                            DeferredPdu::read_async_bounded(
+                                &mut counted,
+                                Some(next_serial),
+                                push_budget,
+                                limit,
+                            )
+                            .await?
+                        }
+                        None => {
+                            DeferredPdu::read_async(&mut counted, Some(next_serial), push_budget)
+                                .await?
+                        }
+                    };
                     if !deferred.is_push() {
                         return deferred.decode().map(Some);
                     }
@@ -1509,6 +1577,7 @@ struct Reconnectable {
     config: ClientDomainConfig,
     stream: Option<Box<dyn AsyncReadAndWrite>>,
     tls_creds: Option<GetTlsCredsResponse>,
+    incoming_payload_limit: Option<usize>,
 }
 
 struct SshStream {
@@ -1573,6 +1642,7 @@ impl Reconnectable {
             config,
             stream,
             tls_creds: None,
+            incoming_payload_limit: None,
         }
     }
 
@@ -2240,7 +2310,18 @@ impl Client {
                     &abort_rx,
                 ) {
                     *reader_abort.lock().unwrap() = None;
-                    log::warn!(
+                    // A client let go of on purpose ends so: nothing to warn
+                    // of, however often a command asks and lets go.
+                    let let_go = matches!(
+                        e.root_cause().downcast_ref::<NotReconnectableError>(),
+                        Some(NotReconnectableError::ClientWasDestroyed)
+                    );
+                    log::log!(
+                        if let_go {
+                            log::Level::Debug
+                        } else {
+                            log::Level::Warn
+                        },
                         "mux connection generation {generation} ended in {:?}: {e:#}",
                         ClientConnectionPhase::from_u8(
                             reader_connection_phase.load(Ordering::Acquire)
@@ -2782,6 +2863,37 @@ impl Client {
         Ok(Self::new(local_domain_id, reconnectable))
     }
 
+    /// A client on a socket the caller has connected to `unix_dom`'s
+    /// server, for one it does not reconnect to: a server it only asks
+    /// things of, or watches until it is gone.
+    pub fn new_unix_stream(unix_dom: &UnixDomain, stream: UnixStream) -> anyhow::Result<Self> {
+        Self::new_unix_stream_with_limit(unix_dom, stream, None)
+    }
+
+    /// A socket owned by another account gets a limit before even the
+    /// version handshake is read; ordinary mux connections keep theirs.
+    pub fn new_unix_stream_bounded(
+        unix_dom: &UnixDomain,
+        stream: UnixStream,
+        payload_limit: usize,
+    ) -> anyhow::Result<Self> {
+        Self::new_unix_stream_with_limit(unix_dom, stream, Some(payload_limit))
+    }
+
+    fn new_unix_stream_with_limit(
+        unix_dom: &UnixDomain,
+        stream: UnixStream,
+        payload_limit: Option<usize>,
+    ) -> anyhow::Result<Self> {
+        stream.set_read_timeout(Some(unix_dom.read_timeout))?;
+        stream.set_write_timeout(Some(unix_dom.write_timeout))?;
+        let stream: Box<dyn AsyncReadAndWrite> = Box::new(Async::new(stream)?);
+        let mut reconnectable =
+            Reconnectable::new(ClientDomainConfig::Unix(unix_dom.clone()), Some(stream));
+        reconnectable.incoming_payload_limit = payload_limit;
+        Ok(Self::new(None, reconnectable))
+    }
+
     pub fn new_tls(
         local_domain_id: DomainId,
         tls_client: &TlsDomainClient,
@@ -2984,6 +3096,23 @@ impl Client {
     rpc!(web_token_mint, WebTokenMint, WebTokenMintResponse);
     rpc!(web_token_list, WebTokenList = (), WebTokenListResponse);
     rpc!(web_token_revoke, WebTokenRevoke, WebTokenRevokeResponse);
+    rpc!(share_start, ShareStart, ShareListResponse);
+    rpc!(share_list, ShareList = (), ShareListResponse);
+    rpc!(share_stop, ShareStop, UnitResponse);
+    rpc!(share_kick, ShareKick, UnitResponse);
+    rpc!(share_grant, ShareGrant, UnitResponse);
+    rpc!(share_revoke, ShareRevoke, UnitResponse);
+    rpc!(share_deny, ShareDeny, UnitResponse);
+    rpc!(
+        share_candidates,
+        ShareCandidates = (),
+        ShareCandidatesResponse
+    );
+    rpc!(share_incoming, ShareIncoming = (), ShareIncomingResponse);
+    rpc!(share_discover, ShareDiscover = (), ShareDiscoverResponse);
+    rpc!(share_join, ShareJoin, ShareJoinResponse);
+    rpc!(share_request_control, ShareRequestControl, UnitResponse);
+    rpc!(share_release_control, ShareReleaseControl, UnitResponse);
     rpc!(
         get_web_server_status,
         GetWebServerStatus = (),
@@ -3042,6 +3171,56 @@ mod tests {
     use super::{is_auth_cancelled, outage_clock_after_session, split_host_port, Reconnectable};
     use crate::domain::ClientDomainConfig;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn releasing_a_share_tap_drops_payloads_without_removing_its_replacement() {
+        use super::{ShareUpdateTap, UnilateralSink};
+        use codec::{Pdu, ShareStateChanged};
+
+        for replaced in [false, true] {
+            let (sender, receiver) = crate::share_queue::channel();
+            sender
+                .send(Pdu::ShareStateChanged(ShareStateChanged {
+                    share_id: 1,
+                    controlling: true,
+                    requested: false,
+                    controller: None,
+                    ended: None,
+                }))
+                .unwrap();
+            let (replacement, next) = crate::share_queue::channel();
+            let mut installed = Some(UnilateralSink::Share(if replaced {
+                replacement
+            } else {
+                sender
+            }));
+            let tap = ShareUpdateTap { receiver };
+            tap.release(&mut installed);
+            assert!(matches!(
+                tap.try_recv(),
+                Err(smol::channel::TryRecvError::Closed)
+            ));
+            if replaced {
+                installed
+                    .as_ref()
+                    .unwrap()
+                    .send(Pdu::ShareStateChanged(ShareStateChanged {
+                        share_id: 1,
+                        controlling: false,
+                        requested: false,
+                        controller: None,
+                        ended: Some("stopped".into()),
+                    }))
+                    .unwrap();
+                assert!(matches!(
+                    next.try_recv(),
+                    Ok(crate::share_queue::Update::Ended(reason)) if reason == "stopped"
+                ));
+            } else {
+                assert!(installed.is_none());
+            }
+        }
+    }
 
     #[test]
     fn a_tls_address_splits_into_host_and_port() {
@@ -3268,6 +3447,112 @@ mod connection_regression_tests {
             panic!("connection test timed out")
         })
         .await
+    }
+
+    #[test]
+    fn a_bounded_connection_limits_replies_and_pushes_before_and_after_registration() {
+        block_on(async {
+            for registered in [false, true] {
+                for push in [false, true] {
+                    for link in [codec::Link::SameMachine, codec::Link::Network] {
+                        let (mut connection, mut peer) = pair();
+                        connection.incoming_payload_limit = Some(1024);
+                        let (sender, mut receiver) = unbounded();
+                        if registered {
+                            sender
+                                .try_send(ReaderMessage::RegistrationComplete {
+                                    connection_generation: 1,
+                                })
+                                .unwrap();
+                        }
+                        let (promise, _reply) = bounded(1);
+                        sender
+                            .try_send(ReaderMessage::SendPdu {
+                                pdu: Pdu::Ping(Ping {}),
+                                promise,
+                                registration_required: false,
+                            })
+                            .unwrap();
+                        let result = within(smol::future::or(
+                            client_thread_async(&mut connection, None, 1, &mut receiver),
+                            async {
+                                let request = Pdu::decode_async(&mut peer, None).await.unwrap();
+                                Pdu::WindowTitleChanged(WindowTitleChanged {
+                                    window_id: 0,
+                                    title: "x".repeat(8192),
+                                })
+                                .encode_async_over(
+                                    &mut peer,
+                                    if push { 0 } else { request.serial },
+                                    link,
+                                )
+                                .await
+                                .unwrap();
+                                std::future::pending().await
+                            },
+                        ))
+                        .await;
+                        assert!(
+                            format!("{:#}", result.unwrap_err())
+                                .contains("more than this connection takes"),
+                            "registered={}, push={}, link={:?}",
+                            registered,
+                            push,
+                            link
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn bounded_clients_keep_small_replies_and_ordinary_clients_keep_larger_ones() {
+        block_on(async {
+            for registered in [false, true] {
+                for (limit, bytes) in [(Some(1024), 200), (None, 8192)] {
+                    for link in [codec::Link::SameMachine, codec::Link::Network] {
+                        let (mut connection, mut peer) = pair();
+                        assert_eq!(connection.incoming_payload_limit, None);
+                        connection.incoming_payload_limit = limit;
+                        let (sender, mut receiver) = unbounded();
+                        if registered {
+                            sender
+                                .try_send(ReaderMessage::RegistrationComplete {
+                                    connection_generation: 1,
+                                })
+                                .unwrap();
+                        }
+                        let (promise, reply) = bounded(1);
+                        sender
+                            .try_send(ReaderMessage::SendPdu {
+                                pdu: Pdu::Ping(Ping {}),
+                                promise,
+                                registration_required: false,
+                            })
+                            .unwrap();
+                        let reader = async {
+                            let result =
+                                client_thread_async(&mut connection, None, 1, &mut receiver).await;
+                            panic!("connection ended: {:?}", result);
+                        };
+                        let server = async {
+                            let request = Pdu::decode_async(&mut peer, None).await.unwrap();
+                            let response = Pdu::WindowTitleChanged(WindowTitleChanged {
+                                window_id: 0,
+                                title: "x".repeat(bytes),
+                            });
+                            response
+                                .encode_async_over(&mut peer, request.serial, link)
+                                .await
+                                .unwrap();
+                            assert_eq!(reply.recv().await.unwrap().unwrap(), response);
+                        };
+                        within(smol::future::or(reader, server)).await;
+                    }
+                }
+            }
+        });
     }
 
     #[test]

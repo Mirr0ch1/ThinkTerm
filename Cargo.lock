@@ -11822,6 +11822,7 @@ dependencies = [
  "log",
  "metrics",
  "mux",
+ "nix 0.29.0",
  "openssl",
  "parking_lot",
  "portable-pty",
