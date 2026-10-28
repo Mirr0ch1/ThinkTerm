@@ -33,6 +33,8 @@ mod tls_creds;
 mod wait;
 mod web_server;
 mod web_token;
+mod share;
+mod share_watch;
 mod zoom_pane;
 
 #[derive(Debug, Parser, Clone, Copy)]
@@ -214,6 +216,11 @@ enum CliSubCommand {
     #[command(name = "web-token", rename_all = "kebab")]
     WebToken(web_token::WebTokenCommand),
 
+    /// Your shared panes, and the panes other accounts on this machine share
+    /// with you. A pane is shared from the share button in ThinkTerm.
+    #[command(name = "share", rename_all = "kebab")]
+    Share(share::ShareCommand),
+
     /// Turn the browser listener on and off, and see where it is accepting
     #[command(name = "web-server", rename_all = "kebab")]
     WebServer(web_server::WebServerCommand),
@@ -353,6 +360,12 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
     if let CliSubCommand::RestoreOutput(cmd) = &cli.sub {
         return cmd.run();
     }
+    // Watching asks the servers of the accounts that share, not our own.
+    if let CliSubCommand::Share(cmd) = &cli.sub {
+        if cmd.is_viewer() {
+            return cmd.run_viewer().await;
+        }
+    }
 
     let mut ui = mux::connui::ConnectionUI::new_headless();
     let initial = true;
@@ -364,7 +377,7 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
     let prefer_mux = cli.prefer_mux
         || matches!(
             cli.sub,
-            CliSubCommand::WebServer(_) | CliSubCommand::WebToken(_)
+            CliSubCommand::WebServer(_) | CliSubCommand::WebToken(_) | CliSubCommand::Share(_)
         );
     // HTML takes its colours from the server's palette, which the server
     // sends unasked as the client registers: listened for before that.
@@ -416,6 +429,7 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::TlsCreds(cmd) => cmd.run(client).await,
         CliSubCommand::WebServer(cmd) => cmd.run(client).await,
         CliSubCommand::WebToken(cmd) => cmd.run(client).await,
+        CliSubCommand::Share(cmd) => cmd.run(client).await,
         CliSubCommand::ActivatePaneDirection(cmd) => cmd.run(client).await,
         CliSubCommand::GetPaneDirection(cmd) => cmd.run(client).await,
         CliSubCommand::KillPane(cmd) => cmd.run(client).await,
