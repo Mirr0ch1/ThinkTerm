@@ -121,6 +121,10 @@ pub enum SvgIcon {
     Timer,
     Type,
     Laptop,
+    /// The laptop crossed out: a machine that cannot be reached now. Not in
+    /// lucide, which has the server's and the monitor's; drawn after them.
+    LaptopOff,
+    ServerOff,
     KeyRound,
     LogOut,
     Monitor,
@@ -411,6 +415,10 @@ impl SvgIcon {
             Self::Timer => include_bytes!("../../../../third_party/lucide/icons/timer.svg"),
             Self::Type => include_bytes!("../../../../third_party/lucide/icons/type.svg"),
             Self::Laptop => include_bytes!("../../../../third_party/lucide/icons/laptop.svg"),
+            Self::LaptopOff => include_bytes!("../../../../assets/ui/laptop-off.svg"),
+            Self::ServerOff => {
+                include_bytes!("../../../../third_party/lucide/icons/server-off.svg")
+            }
             Self::KeyRound => include_bytes!("../../../../third_party/lucide/icons/key-round.svg"),
             Self::LogOut => include_bytes!("../../../../third_party/lucide/icons/log-out.svg"),
             Self::Monitor => include_bytes!("../../../../third_party/lucide/icons/monitor.svg"),
@@ -880,6 +888,8 @@ mod tests {
             SvgIcon::BellRing,
             SvgIcon::Braces,
             SvgIcon::Server,
+            SvgIcon::ServerOff,
+            SvgIcon::LaptopOff,
             SvgIcon::MuxServer,
             SvgIcon::ExternalLink,
             SvgIcon::ChevronDown,

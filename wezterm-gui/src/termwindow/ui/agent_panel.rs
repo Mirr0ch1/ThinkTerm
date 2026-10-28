@@ -22,7 +22,7 @@ use anyhow::Context;
 use mux::pane::PaneId;
 use mux::Mux;
 use std::borrow::Borrow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use wezterm_client::domain::FrontendRecoverySlot;
@@ -276,6 +276,11 @@ impl TermWindow {
         };
         // Its colours are blended once a frame, not once a glyph: steps this
         // fine are closer than the eye tells apart across a band this narrow.
+        // How each server the agents run on is reached, asked once a frame.
+        let mut reach: HashMap<
+            mux::domain::DomainId,
+            crate::termwindow::ui::sidebar::SpaceConnectionState,
+        > = HashMap::new();
         let shimmer_ramp: [LinearRgba; SHIMMER_RAMP_STEPS] = std::array::from_fn(|step| {
             crate::ui::color::mix(
                 muted_fg,
@@ -383,6 +388,9 @@ impl TermWindow {
                 muted_fg,
             )?;
         }
+        // Grouped by state, the heading over a row already names its state.
+        let under_state_heading =
+            view.group_by() == crate::native_settings::AgentsGroupBy::State;
         // The walk starts at the first entry that reaches into view and
         // stops below it, so the rows above and below cost nothing.
         let first = list.ends.partition_point(|&end| end as f32 <= scroll);
@@ -593,7 +601,8 @@ impl TermWindow {
             // Under the title: what it is doing, then where. The state icon
             // already says the state, so the words only stand in for it
             // when there is no icon, or nothing else to put on the line --
-            // and for Idle, whose check differs from Done's only in colour.
+            // and for Idle, whose check differs from Done's only in colour,
+            // unless the heading over it says Idle already.
             let mut line_y = title_y + cell_height + line_gap;
             if let Some(report) = agent.report.as_ref().filter(|_| layout.message) {
                 if visible(line_y, cell_height) {
@@ -649,7 +658,7 @@ impl TermWindow {
             // The thread's human name, resolved once per snapshot -- never the
             // internal workspace id, and never a per-frame store walk.
             let place_line = if has_state_icon
-                && shown != agent_status::ShownState::Idle
+                && (shown != agent_status::ShownState::Idle || under_state_heading)
                 && !agent.place.is_empty()
             {
                 agent.place.clone()
@@ -662,14 +671,77 @@ impl TermWindow {
                 }
             };
             if visible(line_y, cell_height) {
+                // Where it runs, before the words: this device or a server,
+                // with a light on it while that machine is reached -- green,
+                // or amber while it is being reached again -- and crossed
+                // out when it is not.
+                use crate::termwindow::ui::sidebar::SpaceConnectionState as Reach;
+                let local = agent.machine.is_empty();
+                let reached = Mux::get().get_pane(agent.pane_id).map(|pane| {
+                    let domain_id = pane.domain_id();
+                    *reach
+                        .entry(domain_id)
+                        .or_insert_with(|| self.machine_reach(domain_id))
+                });
+                let machine_icon = match (local, reached == Some(Reach::Disconnected)) {
+                    (true, false) => SvgIcon::Laptop,
+                    (true, true) => SvgIcon::LaptopOff,
+                    (false, false) => SvgIcon::Server,
+                    (false, true) => SvgIcon::ServerOff,
+                };
+                let machine_size = (cell_height * 4 / 5).max(1);
+                let machine_y = line_y + (cell_height - machine_size) / 2;
+                self.paint_sidebar_icon(
+                    layers,
+                    machine_icon,
+                    text_x,
+                    machine_y,
+                    machine_size,
+                    muted_fg,
+                )?;
+                let light = match reached {
+                    Some(Reach::Connected) => Some(crate::thread_marks::FINISHED_COLOR),
+                    Some(Reach::Connecting | Reach::Reconnecting) => {
+                        Some(crate::thread_marks::WAITING_COLOR)
+                    }
+                    Some(Reach::Disconnected) | None => None,
+                };
+                if let Some(color) = light {
+                    // On the drawing's own corner -- the laptop's screen, the
+                    // server's top box -- as a light sits on a device; in
+                    // 24ths of the icon, as lucide draws them.
+                    let (corner_x, corner_y) = if local {
+                        (19.5, 5.5)
+                    } else {
+                        (21.0, 3.0)
+                    };
+                    let dot = (machine_size * 2 / 5).max(3) as f32;
+                    let center_x = text_x as f32 + machine_size as f32 * corner_x / 24.0;
+                    let center_y = machine_y as f32 + machine_size as f32 * corner_y / 24.0;
+                    self.fill_rounded_rectangle(
+                        layers,
+                        2,
+                        euclid::rect(
+                            (center_x - dot / 2.0).round(),
+                            (center_y - dot / 2.0).round(),
+                            dot,
+                            dot,
+                        ),
+                        color,
+                        dot / 2.0,
+                    )
+                    .context("agent machine dot")?;
+                }
+                // A full gap: the dot stands out past the icon's edge.
+                let label_x = text_x + machine_size + metrics.icon_gap;
                 self.paint_agent_text(
                     layers,
                     ui_font,
                     ui_metrics,
                     &place_line,
-                    text_x,
+                    label_x,
                     line_y,
-                    text_width,
+                    text_right.saturating_sub(label_x),
                     muted_fg,
                 )?;
             }
@@ -928,6 +1000,27 @@ impl TermWindow {
         }
 
         Ok(())
+    }
+
+    /// How the server a pane lives on is reached: a pane of this process
+    /// always is. Read as the panel paints, which asks for no frame of its
+    /// own: a light that changes shows at the next.
+    fn machine_reach(
+        &self,
+        domain_id: mux::domain::DomainId,
+    ) -> crate::termwindow::ui::sidebar::SpaceConnectionState {
+        use crate::termwindow::ui::sidebar::SpaceConnectionState;
+        let Some(domain) = Mux::get().get_domain(domain_id) else {
+            return SpaceConnectionState::Disconnected;
+        };
+        if domain
+            .downcast_ref::<wezterm_client::domain::ClientDomain>()
+            .is_none()
+        {
+            return SpaceConnectionState::Connected;
+        }
+        let remote = !crate::local_sessions::is_host_domain_id(domain_id);
+        self.domain_reach(domain.domain_name(), remote)
     }
 
     /// An open sub-task list lasts as long as its sub-tasks, so the next

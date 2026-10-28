@@ -629,19 +629,35 @@ impl crate::TermWindow {
     /// host is checked by the status heartbeat instead (see
     /// `watch_space_connection_state`), so idle local windows stay idle.
     pub(crate) fn space_connection_state(&self, space_id: &str) -> SpaceConnectionState {
-        const SUSTAINED_LAG_MS: u64 = 5000;
         let remote = workspace_threads::client_domain_for_space(space_id);
         let is_remote = remote.is_some();
         let Some(domain_name) = remote.or_else(crate::local_sessions::host_domain_name) else {
             return SpaceConnectionState::Connected;
         };
+        self.domain_connection_state(&domain_name, is_remote)
+    }
+
+    /// How the link to the server `domain_name` stands; `is_remote` for one
+    /// on another machine, whose silence counts against it, and which the
+    /// indicator showing it looks at again each second.
+    pub(crate) fn domain_connection_state(
+        &self,
+        domain_name: &str,
+        is_remote: bool,
+    ) -> SpaceConnectionState {
         if is_remote {
             self.update_next_frame_time(Some(
                 std::time::Instant::now() + std::time::Duration::from_secs(1),
             ));
         }
+        self.domain_reach(domain_name, is_remote)
+    }
+
+    /// `domain_connection_state`, asking for no frame.
+    pub(crate) fn domain_reach(&self, domain_name: &str, is_remote: bool) -> SpaceConnectionState {
+        const SUSTAINED_LAG_MS: u64 = 5000;
         let mux = Mux::get();
-        let Some(domain) = mux.get_domain_by_name(&domain_name) else {
+        let Some(domain) = mux.get_domain_by_name(domain_name) else {
             // Not even registered: never connected in this session.
             return SpaceConnectionState::Disconnected;
         };
