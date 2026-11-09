@@ -36,6 +36,7 @@ use termwiz::image::TextureCoordinate;
 #[cfg(test)]
 use termwiz::image::ImageData;
 pub use thinkterm_proto::image::{image_reply, GetImageCellResponse, GetKittyImage};
+pub use thinkterm_proto::file::{ReadRemoteFile, ReadRemoteFileResponse};
 use termwiz::input::KeyboardEncoding;
 use termwiz::surface::{Line, SequenceNo};
 use thiserror::Error;
@@ -1041,6 +1042,8 @@ pdu! {
     ShareCandidatesResponse: 141,
     GetConnectEndpoint: 142,
     GetConnectEndpointResponse: 143,
+    ReadRemoteFile: 144,
+    ReadRemoteFileResponse: 145,
 }
 
 /// Discovery only. This address conveys no authority to approve or export.
