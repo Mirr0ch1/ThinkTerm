@@ -1,0 +1,78 @@
+# Evidence: scrollback image history and remote file links
+
+This branch only carries evidence for two ThinkTerm bugs. Nothing here is
+part of the fix; the fixes live in:
+
+- `fix/scrollback-image-history` (term/cell)
+- `fix/remote-file-link` (codec/mux/client/GUI)
+
+## 1. Kitty images are erased from the scrollback
+
+### What happens
+
+A coding agent running in the pane (oh-my-pi / `omp`) keeps at most 8 inline
+images live. Past that it sends the kitty delete command for the oldest one:
+
+```
+ESC _ G a=d,d=I,i=<image-id>,q=2 ESC \
+```
+
+On 0.4.9 that delete reaches into the scrollback and detaches the picture from
+every row that carries it. The GUI's per-row line cache does not all refetch at
+once, so a picture that scrolled off comes back as horizontal bands: rows that
+were still cached keep pixels, rows refetched after the delete are blank.
+
+`kitty-store.log` is the server log from a real agent session: only 8 images
+are retained after 600 and 1500 transmits.
+
+### Screenshots
+
+`scrollback-old-server.png`: 0.4.9 server. The test prints one 20-row picture,
+pushes it into the scrollback with 30 filler lines, sends `d=I`, then prints
+1000 more lines. Scrolling back to the top shows `BEFORE-IMAGE` and
+`AFTER-IMAGE` with the 20 rows between them blank.
+
+`scrollback-no-delete.png`: same test without `d=I`, after 3000 lines and
+scrolling back. The picture is intact, so the refetch path itself is fine.
+
+`scrollback-fixed.png`: same test as the first, with the patched server. The
+picture is intact after the same `d=I`.
+
+### Reproduce
+
+```console
+# one 20-row picture, 30 filler lines, then optional d=I and 1000 lines
+python3 scroll_test.py delete 1000    # reproduce the loss
+python3 scroll_test.py keep   3000    # control: no deletion
+
+# the multi-image omp-shaped sequence (12 images, 20 rows each)
+python3 emit_kitty.py plain 12
+```
+
+`stripes.png` is the test pattern; each row is labelled `row 0` .. `row 19`,
+so a partial or shifted picture is obvious.
+
+## 2. "Open in Another App" does nothing for a remote file link
+
+The GUI runs on the client, but a terminal link such as
+`/tmp/icon/preview.jpg` names a file on the host that runs the program. The
+menu called `wezterm_open_url::open_url()` in the GUI process, so the opener
+looked for a path that does not exist there and failed silently.
+
+`link-menu.png` shows the patched menu: for a path on another host it says
+"Download and Open on This Machine". Choosing it fetched the file and wrote a
+local copy before opening it; `link-open.log` is the resulting copy and
+`file(1)` output.
+
+## Fix validation
+
+```
+cargo test -p wezterm-cell -p wezterm-term --lib   # 18 + 203 passed
+cargo test -p codec --lib                          # 88 passed
+cargo test -p wezterm-gui --bin thinkterm-gui link_open  # 6 passed
+```
+
+The new regression tests are
+`deleting_an_image_leaves_its_scrollback_history_painted`,
+`deleting_a_visible_image_still_takes_it_off_the_screen`, and
+`file_links_are_paths_but_urls_are_not`.

@@ -1,0 +1,12 @@
+$ rm -rf /tmp/thinkterm-links
+$ # click "Download and Open on This Machine" in the menu shown in link-menu.png
+$ ls -l /tmp/thinkterm-links/
+total 12
+-rw------- 1 mirro mirro 8729 Nov 10 03:09 9dac69dd8355cf3d-img1.png
+
+$ file /tmp/thinkterm-links/9dac69dd8355cf3d-img1.png
+/tmp/thinkterm-links/9dac69dd8355cf3d-img1.png: PNG image data, 800 x 520, 16-bit/color RGBA, non-interlaced
+
+# and the local opener was called with that copy:
+$ xdg-open /tmp/thinkterm-links/9dac69dd8355cf3d-img1.png
+Opening in existing browser session.

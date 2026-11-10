@@ -1,0 +1,3 @@
+23:53:37.939  INFO   wezterm_term::terminalstate::kitty > kitty store: images=8 bytes=47749760 placements=3 (after 600 transmits)
+02:06:48.178  INFO   wezterm_term::terminalstate::kitty > kitty store: images=8 bytes=35424256 placements=6 (after 1500 transmits)
+23:11:45.794  INFO   wezterm_term::terminalstate::kitty > kitty store: images=8 bytes=35374080 placements=5 (after 700 transmits)
