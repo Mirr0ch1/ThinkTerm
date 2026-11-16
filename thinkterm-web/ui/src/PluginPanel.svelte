@@ -20,8 +20,13 @@
   import { focusTerminal } from './mobile.svelte';
   import type { PanelOp, PanelView, Painting } from './model';
   import { onMac } from './palette.svelte';
+  import { breakLines } from './wrap';
 
-  let { extended = false }: { extended?: boolean } = $props();
+  let { extended = false, page = undefined }: { extended?: boolean; page?: number } = $props();
+  /** Which of the plugin views this is, as the wasm names them: the right
+      panel's, its extended view, or the plugin's page in the place of pane
+      `page`. */
+  const place = $derived(page !== undefined ? `page:${page}` : extended ? 'extended' : 'panel');
 
   // An extended view's close button: ThinkTerm's, at its top left, where
   // the desktop has the file preview's, whatever the plugin draws. The
@@ -183,6 +188,48 @@
     return result;
   }
 
+  // A text asked to wrap, as the lines its box holds -- `rows` of them at
+  // most -- and how wide each is, remembered as a cut is: where text is
+  // left over, the last ends in an ellipsis in the interface font.
+  const wraps = new Map<string, Cut[]>();
+
+  function wrap(ctx: CanvasRenderingContext2D, text: string, room: number, rows: number, ellipsize: boolean): Cut[] {
+    const key = `${ctx.font}\u0000${room}\u0000${rows}\u0000${text}`;
+    const known = wraps.get(key);
+    if (known !== undefined) return known;
+    const { lines, leftOver } = breakLines(text, room, rows, (part) => ctx.measureText(part).width);
+    const laid = lines.map((shown) => ({ shown, wide: ctx.measureText(shown).width }));
+    const last = laid.length - 1;
+    if (leftOver && ellipsize && last >= 0) laid[last] = cut(ctx, laid[last].shown + ELLIPSIS, room, true);
+    if (wraps.size >= CUTS) wraps.clear();
+    wraps.set(key, laid);
+    return laid;
+  }
+
+  /** One line of a text op, its middle at `middle`: placed across the
+      op's box as it says, and cut at its edge if it is wider still. */
+  function textLine(ctx: CanvasRenderingContext2D, op: Extract<PanelOp, { op: 'text' }>, { shown, wide }: Cut, middle: number) {
+    if (shown === '') return;
+    const left = Math.max(
+      op.x,
+      op.align === 'center' ? op.x + (op.w - wide) / 2 : op.align === 'right' ? op.x + op.w - wide : op.x,
+    );
+    // The monospaced font is cut at its box's edge, not ellipsized: a
+    // plugin lines its columns up itself. So is a line of either that is
+    // wider than its box all the same -- one character in a box narrower
+    // than it.
+    if (wide > op.w) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(op.x, op.y, op.w, op.h);
+      ctx.clip();
+      ctx.fillText(shown, left, middle);
+      ctx.restore();
+    } else {
+      ctx.fillText(shown, left, middle);
+    }
+  }
+
   function paint(painting: Painting | null) {
     const ctx = canvas?.getContext('2d');
     if (!ctx) return;
@@ -233,24 +280,17 @@
         ctx.font = font(op, family);
         ctx.fillStyle = css(rgba(op.color));
         ctx.textBaseline = 'middle';
-        const { shown, wide } = cut(ctx, op.text, op.w, op.font === 'ui');
-        const left = Math.max(
-          op.x,
-          op.align === 'center' ? op.x + (op.w - wide) / 2 : op.align === 'right' ? op.x + op.w - wide : op.x,
-        );
-        const middle = op.y + op.h / 2;
-        // The monospaced font is cut at its box's edge, not ellipsized: a
-        // plugin lines its columns up itself.
-        if (op.font === 'mono' && wide > op.w) {
-          ctx.save();
-          ctx.beginPath();
-          ctx.rect(op.x, op.y, op.w, op.h);
-          ctx.clip();
-          ctx.fillText(shown, left, middle);
-          ctx.restore();
-        } else {
-          ctx.fillText(shown, left, middle);
+        if (op.wrap) {
+          // From the box's top, a line of the font each, as many as the
+          // box holds: one made a whole number of lines tall holds them all.
+          const line = op.font === 'mono' ? MONO.line : TEXT[op.size].line;
+          const rows = Math.max(1, Math.floor((op.h + 0.5) / line));
+          wrap(ctx, op.text, op.w, rows, op.font === 'ui').forEach((laid, row) =>
+            textLine(ctx, op, laid, op.y + row * line + line / 2),
+          );
+          return;
         }
+        textLine(ctx, op, cut(ctx, op.text, op.w, op.font === 'ui'), op.y + op.h / 2);
         return;
       }
       case 'line': {
@@ -383,7 +423,7 @@
     // What the panel's field takes of what the page's holds: less, it
     // holds that instead.
     const tell = () => {
-      const held = handle.client?.plugin_panel_field_text(extended, current.id, node.value);
+      const held = handle.client?.plugin_panel_field_text(place, current.id, node.value);
       if (typeof held === 'string' && held !== node.value) node.value = held;
       showClear();
     };
@@ -419,7 +459,7 @@
         !op.focused &&
         document.activeElement === node &&
         // To another of its fields, which takes it as it follows.
-        !handle.client?.plugin_panel_has_keyboard(extended)
+        !handle.client?.plugin_panel_has_keyboard(place)
       ) {
         hold();
       }
@@ -431,7 +471,7 @@
     follow(op);
     // The canvas outlines the box with the keyboard.
     const onFocus = () => {
-      handle.client?.plugin_panel_field_focus(extended, current.id);
+      handle.client?.plugin_panel_field_focus(place, current.id);
       queueMicrotask(() => refresh());
     };
     const onBlur = (ev: FocusEvent) => {
@@ -440,7 +480,7 @@
       const to = ev.relatedTarget;
       if (to instanceof HTMLElement && to.classList.contains('pfield') && host.contains(to)) return;
       if (!document.hasFocus()) return;
-      handle.client?.plugin_panel_blur(extended);
+      handle.client?.plugin_panel_blur(place);
       queueMicrotask(() => refresh());
     };
     // What a field holds is told once composed: never the half of a word
@@ -479,16 +519,16 @@
       const command = onMac() ? ev.metaKey && !ev.ctrlKey : ev.ctrlKey && !ev.metaKey;
       if (ev.key === 'Enter' && !ev.altKey && (current.kind === 'lines' ? command : !ev.ctrlKey && !ev.metaKey)) {
         ev.preventDefault();
-        handle.client?.plugin_panel_field_submit(extended, current.id);
+        handle.client?.plugin_panel_field_submit(place, current.id);
         return;
       }
       if (!leaves(current.kind, ev)) return;
-      const taken = handle.client?.plugin_panel_key(extended, ev.key, ev.shiftKey, ev.ctrlKey, ev.altKey, ev.metaKey);
+      const taken = handle.client?.plugin_panel_key(place, ev.key, ev.shiftKey, ev.ctrlKey, ev.altKey, ev.metaKey);
       if (!taken) return;
       ev.preventDefault();
       // The keyboard may have moved to another field, or gone back.
       refresh();
-      if (!handle.client?.plugin_panel_has_keyboard(extended) && document.activeElement === node) {
+      if (!handle.client?.plugin_panel_has_keyboard(place) && document.activeElement === node) {
         node.blur();
         focusTerminal();
       }
@@ -522,10 +562,10 @@
       since it was last painted, or `anew`, when the canvas was cleared or
       what it is painted with changed. */
   function refresh(anew = false) {
-    const revision = handle.client?.plugin_panel_revision(extended) ?? -1;
+    const revision = handle.client?.plugin_panel_revision(place) ?? -1;
     if (!anew && revision === painted) return;
     painted = revision;
-    const json = handle.client?.plugin_panel(extended);
+    const json = handle.client?.plugin_panel(place);
     const next = json ? (JSON.parse(json) as PanelView | null) : null;
     view = next;
     paint(next?.painting ?? null);
@@ -548,10 +588,12 @@
       body: TEXT.body,
       title: TEXT.title,
       mono: { ...MONO, advance },
-      can_extend: !extended && canExtend(),
+      can_extend: !extended && page === undefined && canExtend(),
       close: extended ? CLOSE : undefined,
+      // A finger never hovers, and wants more room to press.
+      pointer: matchMedia('(pointer: coarse)').matches ? 'touch' : undefined,
     };
-    const refused = handle.client?.plugin_panel_env(extended, JSON.stringify(env));
+    const refused = handle.client?.plugin_panel_env(place, JSON.stringify(env));
     if (refused) console.warn('plugin panel size: ' + refused);
   }
 
@@ -585,6 +627,7 @@
       document.fonts.add(face);
       face.load().then(() => {
         cuts.clear();
+        wraps.clear();
         sendEnv();
         refresh(true);
       }, () => {});
@@ -599,14 +642,14 @@
       // A mouse's wheel turns one way: with Shift, it goes across.
       if (ev.shiftKey && dx === 0) [dx, dy] = [dy, 0];
       const { x, y } = local(ev);
-      if (handle.client?.plugin_panel_wheel(extended, x, y, dx, dy)) refresh();
+      if (handle.client?.plugin_panel_wheel(place, x, y, dx, dy)) refresh();
     };
     canvas.addEventListener('wheel', onWheel, { passive: false });
     // The room beside the panel changes with the terminal's width: with
     // the window's, and with either panel's.
     const room = new ResizeObserver(() => sendEnv());
     const term = document.getElementById('term');
-    if (!extended && term) room.observe(term);
+    if (!extended && page === undefined && term) room.observe(term);
     fit();
     return () => {
       stopFling();
@@ -619,7 +662,7 @@
 
   // What the plugin drew anew.
   $effect(() => {
-    void (extended ? views.extendedRevision : views.panelRevision);
+    void (page !== undefined ? views.pagesRevision : extended ? views.extendedRevision : views.panelRevision);
     refresh();
   });
 
@@ -649,7 +692,7 @@
   /** Scrolls what is under `at` (client pixels) by `dx`, `dy` of its units. */
   function scrollAt(at: { x: number; y: number }, dx: number, dy: number) {
     const box = canvas.getBoundingClientRect();
-    if (handle.client?.plugin_panel_wheel(extended, at.x - box.left, at.y - box.top, dx, dy)) refresh();
+    if (handle.client?.plugin_panel_wheel(place, at.x - box.left, at.y - box.top, dx, dy)) refresh();
   }
 
   function onPointerDown(ev: PointerEvent) {
@@ -678,7 +721,7 @@
       return;
     }
     const { x, y } = local(ev);
-    if (handle.client?.plugin_panel_pointer(extended, x, y)) refresh();
+    if (handle.client?.plugin_panel_pointer(place, x, y)) refresh();
   }
 
   function onPointerUp(ev: PointerEvent) {
@@ -704,7 +747,7 @@
 
   function onPointerLeave(ev: PointerEvent) {
     if (ev.pointerType === 'touch') return;
-    if (handle.client?.plugin_panel_leave(extended)) refresh();
+    if (handle.client?.plugin_panel_leave(place)) refresh();
   }
 
   /** The close button: the view goes at once, and its plugin hears so. */
@@ -722,13 +765,13 @@
     ev.preventDefault();
     if (document.activeElement === canvas) focusTerminal();
     const heard = handle.client?.plugin_panel_click(
-      extended, x, y, ev.button, Math.max(1, ev.detail), ev.shiftKey, ev.ctrlKey, ev.altKey, ev.metaKey,
+      place, x, y, ev.button, Math.max(1, ev.detail), ev.shiftKey, ev.ctrlKey, ev.altKey, ev.metaKey,
     );
     if (heard) refresh();
   }
 </script>
 
-<div class="plugin" class:extended bind:this={host}>
+<div class="plugin" class:extended class:page={page !== undefined} bind:this={host}>
   <!-- Focused only to hold the keyboard from the terminal (`hold`). -->
   <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
   <canvas

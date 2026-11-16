@@ -645,6 +645,8 @@ pub enum KeyAssignment {
     /// `OpenSshHosts`, which toggles the page: this one only ever opens.
     AddRemoteHost,
     ToggleLiveOverview,
+    /// The ThinkTerm Library in place of the left sidebar, or back.
+    ToggleLibrary,
     /// The sidebar's search button: the command palette, opened already
     /// inside its thread group.
     OpenThreadSearch,
@@ -662,6 +664,9 @@ pub enum KeyAssignment {
     /// keyboard -- in its first field, if it has one. Pressed again while
     /// the panel has it, the keyboard goes back to the terminal.
     FocusPluginPanel(String),
+    /// Do one of a plugin's actions, named by the plugin's id, a "." and
+    /// the action's, as its manifest lists them: `board.new-card`.
+    PluginAction(String),
     ActivateCommandPalette,
     /// Switch this window's color scheme. `None` reverts to the configured
     /// default. Applied through the window's config_overrides, the same
@@ -674,6 +679,9 @@ pub enum KeyAssignment {
         space_id: String,
         thread_id: String,
     },
+    /// Open the thread on the sidebar's row of this number, from 0, counting
+    /// only the rows with a thread on them.
+    ActivateWorkspaceThreadByIndex(usize),
     ActivateWindow(usize),
     ActivateWindowRelative(isize),
     ActivateWindowRelativeNoWrap(isize),

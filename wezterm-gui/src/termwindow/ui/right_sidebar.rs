@@ -21,6 +21,7 @@ use crate::termwindow::remote_files::{
 use crate::termwindow::remote_walk::{
     plan_remote_walk, RemoteWalkEntry, RemoteWalkMode, RemoteWalkPlan,
 };
+use crate::termwindow::render::transfer_card::TransferToast;
 use crate::termwindow::transfer_walk::{
     apply_conflict_choice, destination_escapes_source, destination_stays_within, is_same_file,
     plan_transfer, ConflictChoice, DestinationRoot, OverwritePolicy, TransferEntryKind,
@@ -75,7 +76,7 @@ use wezterm_font::{LoadedFont, LoadedFontId};
 use window::color::LinearRgba;
 use window::{
     Clipboard, ContextMenuIcon, ContextMenuItem, DeadKeyStatus, FolderPickerOptions,
-    IntegratedTitleButtonStyle, Point, Rect, RectF, WindowOps,
+    IntegratedTitleButtonStyle, PathPickerOptions, Point, Rect, RectF, WindowOps,
 };
 
 const RIGHT_SIDEBAR_SECTION_GAP: usize = 12;
@@ -151,10 +152,11 @@ const PREVIEW_OPEN_BUTTON_MIN: usize = 80;
 /// Narrower than this and the "Open With" button drops its dropdown arrow.
 const PREVIEW_OPEN_SPLIT_MIN_WIDTH: usize = 112;
 const PREVIEW_OPEN_ARROW_WIDTH: usize = 36;
-/// Empty-state geometry for the remote Files panel, in design pixels.
-const REMOTE_EMPTY_ICON_SIZE: usize = 40;
-const REMOTE_EMPTY_ICON_GAP: usize = 18;
-const REMOTE_EMPTY_DETAIL_GAP: usize = 6;
+/// Empty-state geometry for the remote Files panel, in design pixels. The
+/// Status panel's empty state uses it too.
+pub(crate) const REMOTE_EMPTY_ICON_SIZE: usize = 40;
+pub(crate) const REMOTE_EMPTY_ICON_GAP: usize = 18;
+pub(crate) const REMOTE_EMPTY_DETAIL_GAP: usize = 6;
 const REMOTE_EMPTY_BUTTON_GAP: usize = 22;
 const REMOTE_EMPTY_BUTTON_HEIGHT: usize = 44;
 /// Toolbar control height.
@@ -320,6 +322,19 @@ const FILE_PREVIEW_HEADER_HEIGHT: usize = 64;
 /// oldest finished ones. The strip eats into the tree, so it stays small;
 /// running transfers are never dropped, however many there are.
 const REMOTE_TRANSFER_STRIP_MAX: usize = 3;
+
+#[derive(Clone, PartialEq)]
+struct RightSidebarPasteTarget {
+    mode: RightSidebarMode,
+    keys_held: bool,
+    /// The Markdown preview in the way, by its instance.
+    preview: Option<u64>,
+    /// Otherwise the Note's document, by its session.
+    note_session: Option<usize>,
+    file_focus: Option<RightSidebarFileField>,
+    snippet_view: RightSidebarSnippetView,
+    snippet_focus: Option<RightSidebarSnippetField>,
+}
 
 #[derive(Clone)]
 pub(crate) struct TerminalPasteTarget {
@@ -2090,7 +2105,7 @@ impl RightSidebarMode {
             Self::Chat => SvgIcon::FolderTree,
             Self::Tasks => SvgIcon::NotebookTabs,
             Self::Snippets => SvgIcon::CodeXml,
-            Self::Agents => SvgIcon::Bot,
+            Self::Agents => SvgIcon::Eye,
             Self::Plugin(_) => self
                 .plugin_panel()
                 .map_or(SvgIcon::Puzzle, |panel| SvgIcon::for_panel(&panel.icon)),
@@ -2185,7 +2200,7 @@ impl crate::TermWindow {
     /// preview pane and the Note pane; both keep a terminal reserve.
     fn right_sidebar_pane_total_max_width(&self) -> usize {
         let available_width = self.right_sidebar_available_width();
-        let content_width = available_width.saturating_sub(self.workspace_sidebar_width());
+        let content_width = available_width.saturating_sub(self.workspace_sidebar_sizing_width());
         let min_preview_total =
             self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH) + self.ui_px(FILE_PREVIEW_PANE_MIN_WIDTH);
         let terminal_reserve = content_width / 5;
@@ -2306,7 +2321,7 @@ impl crate::TermWindow {
     /// terminal reclaims the space through the same zero-width path collapse
     /// already uses, so nothing downstream needs its own special case.
     pub(crate) fn right_sidebar_has_panels(&self) -> bool {
-        RightSidebarMode::any_panel_enabled()
+        self.dedicated_thread.is_none() && RightSidebarMode::any_panel_enabled()
     }
 
     /// The width the TERMINAL is laid out against. Zero whenever the sidebar
@@ -2321,7 +2336,7 @@ impl crate::TermWindow {
     }
 
     /// The width the panel has when it is on screen, docked or not.
-    fn right_sidebar_docked_width(&self) -> usize {
+    pub(crate) fn right_sidebar_docked_width(&self) -> usize {
         if !self.right_sidebar_has_panels() {
             return 0;
         }
@@ -2343,7 +2358,7 @@ impl crate::TermWindow {
     }
 
     /// The width the panel is DRAWN and HIT-TESTED at: the docked width while
-    /// it is docked or hover-revealed, zero otherwise.
+    /// it is docked, hover-revealed or sliding away, zero otherwise.
     pub(crate) fn right_sidebar_presented_width(&self) -> usize {
         if self.right_sidebar_presented() {
             self.right_sidebar_docked_width()
@@ -2352,10 +2367,24 @@ impl crate::TermWindow {
         }
     }
 
-    /// Whether the panel is on screen at all, docked or by a hover reveal.
-    /// What the panel shows follows this; the terminal's layout does not.
+    /// Whether the panel is on screen at all: docked, by a hover reveal, or
+    /// on its way back into the edge. What the panel shows follows this; the
+    /// terminal's layout does not.
     pub(crate) fn right_sidebar_presented(&self) -> bool {
-        !self.right_sidebar_collapsed || self.right_sidebar_hover.is_presented()
+        !self.right_sidebar_collapsed
+            || self.right_sidebar_hover.is_presented()
+            || self
+                .sidebar_slides
+                .closing(crate::termwindow::sidebar_slide::Side::Right)
+    }
+
+    /// Whether the panel, when it is on screen, is a hover reveal. One on its
+    /// way back from being docked is not: it keeps its shape until it is gone.
+    pub(crate) fn right_sidebar_floats(&self) -> bool {
+        self.right_sidebar_collapsed
+            && !self
+                .sidebar_slides
+                .closing(crate::termwindow::sidebar_slide::Side::Right)
     }
 
     pub fn right_sidebar_max_width(&self) -> usize {
@@ -2465,6 +2494,9 @@ impl crate::TermWindow {
     }
 
     pub fn toggle_right_sidebar(&mut self) {
+        // Docking a hover reveal moves nothing but what of the panel is not
+        // out yet.
+        let revealed = self.right_sidebar_hover.progress(Instant::now());
         // Collapsing must not instantly re-reveal under a pointer still on the
         // button, and docking makes a reveal moot.
         self.right_sidebar_hover.suppress_until_pointer_leaves();
@@ -2472,16 +2504,31 @@ impl crate::TermWindow {
         self.right_sidebar_collapsed = !self.right_sidebar_collapsed;
         crate::native_settings::save_right_sidebar_shown(!self.right_sidebar_collapsed);
         if self.right_sidebar_collapsed {
-            self.right_sidebar_contents_scratch.clear();
             if self.right_sidebar_mode == RightSidebarMode::Tasks {
                 self.clear_right_sidebar_text_focus();
             }
-            self.drop_hidden_right_sidebar_markdown_preview_focus();
-            self.close_plugin_panel();
-            self.schedule_right_sidebar_file_memory_release();
-            self.release_right_sidebar_remote_files_if_hidden();
-            self.schedule_right_sidebar_note_memory_release();
+            if self.slide_sidebar(crate::termwindow::sidebar_slide::Side::Right, false) {
+                // Painted from what it shows until it is gone, but no longer
+                // typed into meanwhile.
+                self.unfocus_right_sidebar_markdown_preview();
+                if self.plugin_panel_has_keyboard() {
+                    self.release_plugin_panel_keyboard();
+                }
+            } else {
+                self.let_go_of_right_sidebar();
+            }
         } else {
+            match revealed {
+                Some(revealed) => {
+                    self.dock_revealed_sidebar(
+                        crate::termwindow::sidebar_slide::Side::Right,
+                        revealed,
+                    );
+                }
+                None => {
+                    self.slide_sidebar(crate::termwindow::sidebar_slide::Side::Right, true);
+                }
+            }
             self.kick_right_sidebar_file_rescan_cycle();
             self.request_right_sidebar_remote_files_connect(false);
             if self.right_sidebar_mode == RightSidebarMode::Tasks {
@@ -2491,11 +2538,27 @@ impl crate::TermWindow {
         }
     }
 
+    /// Let go of what the collapsed panel showed: as it collapses, or once it
+    /// has slid out of sight.
+    pub(crate) fn let_go_of_right_sidebar(&mut self) {
+        self.right_sidebar_contents_scratch.clear();
+        self.drop_hidden_right_sidebar_markdown_preview_focus();
+        self.close_plugin_panel();
+        self.schedule_right_sidebar_file_memory_release();
+        self.release_right_sidebar_remote_files_if_hidden();
+        self.schedule_right_sidebar_note_memory_release();
+    }
+
     pub fn expand_right_sidebar(&mut self) {
+        // Out of nothing it slides out; docked or revealed, it is out already.
+        let hidden = self.right_sidebar_collapsed && !self.right_sidebar_hover.is_presented();
         self.right_sidebar_hover.suppress_until_pointer_leaves();
         self.right_sidebar_hover_was_presented = false;
         self.right_sidebar_collapsed = false;
         crate::native_settings::save_right_sidebar_shown(true);
+        if hidden {
+            self.slide_sidebar(crate::termwindow::sidebar_slide::Side::Right, true);
+        }
         self.kick_right_sidebar_file_rescan_cycle();
         self.request_right_sidebar_remote_files_connect(false);
         if self.right_sidebar_mode == RightSidebarMode::Tasks {
@@ -2507,10 +2570,12 @@ impl crate::TermWindow {
     /// The right-edge strip that arms a hover reveal, as (x, y, w, h) in
     /// window pixels. Computed against the docked rect so it exists while the
     /// panel does not; like the left one it leaves out the tab bar row, where
-    /// the pointer is on its way to the tabs or the sidebar button.
+    /// the pointer is on its way to the tabs or the sidebar button -- as much
+    /// of the row as is out, when it hides, or the pane bar holding its
+    /// buttons.
     pub(crate) fn right_sidebar_hover_hot_zone(&self) -> Option<(usize, usize, usize, usize)> {
         let rect = self.right_sidebar_rect_for_width(self.right_sidebar_docked_width())?;
-        let top_tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize;
+        let top_tab_bar_height = self.window_top_right_chrome_height().ceil() as usize;
         let width = self.ui_px(crate::termwindow::ui::tokens::SIDEBAR_HOVER_HOT_ZONE_WIDTH);
         let right_edge = rect.x.saturating_add(rect.width);
         crate::termwindow::sidebar_hover::hot_zone(
@@ -2533,7 +2598,8 @@ impl crate::TermWindow {
             || self.context_menu.is_some()
             || self.native_context_menu_open
             || self.inline_tab_rename.is_some();
-        let eligible = self.right_sidebar_collapsed
+        let eligible = self.dedicated_thread.is_none()
+            && self.right_sidebar_collapsed
             && self.right_sidebar_has_panels()
             && !self.content_view_foreground()
             && !self.content_view_transition_running()
@@ -6381,17 +6447,54 @@ impl crate::TermWindow {
             ClipboardPasteSource::Clipboard => Clipboard::Clipboard,
             ClipboardPasteSource::PrimarySelection => Clipboard::PrimarySelection,
         };
+        let target = self.right_sidebar_paste_target();
         let future = window.get_clipboard(clipboard);
         promise::spawn::spawn(async move {
             if let Ok(text) = future.await {
                 window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    if term_window.push_right_sidebar_text(&text) {
+                    // Only the surface this paste was started in: a clipboard
+                    // can answer after the panel has moved on, and the Note
+                    // saves what lands in it.
+                    if term_window.right_sidebar_paste_target() == target
+                        && term_window.push_right_sidebar_text(&text)
+                    {
                         term_window.invalidate_window();
                     }
                 })));
             }
         })
         .detach();
+    }
+
+    /// What decides where `push_right_sidebar_text` puts its text. A paste
+    /// can start with the preview installed as the note surface and land
+    /// with it put away again, so the preview is named by its instance rather
+    /// than by which surface is installed.
+    fn right_sidebar_paste_target(&self) -> RightSidebarPasteTarget {
+        let preview = if self.note_surface_installed == NoteSurface::FilePreview {
+            Some(self.note_surface_instance)
+        } else if self.right_sidebar_markdown_preview_focused() {
+            self.right_sidebar_markdown_preview
+                .as_ref()
+                .map(|preview| preview.instance)
+        } else {
+            None
+        };
+        let note_session = self
+            .right_sidebar_note
+            .session
+            .as_ref()
+            .filter(|_| preview.is_none())
+            .map(|session| Arc::as_ptr(session) as *const () as usize);
+        RightSidebarPasteTarget {
+            mode: self.right_sidebar_mode,
+            keys_held: self.plugin_panel_keys_held,
+            preview,
+            note_session,
+            file_focus: self.right_sidebar_file_focus,
+            snippet_view: self.right_sidebar_snippet_view.clone(),
+            snippet_focus: self.right_sidebar_snippet_focus,
+        }
     }
 
     pub(crate) fn clear_right_sidebar_focused_input_selection(&mut self) {
@@ -8415,9 +8518,11 @@ impl crate::TermWindow {
         let mut rect = self.right_sidebar_rect_for_width(self.right_sidebar_presented_width())?;
         // Off macOS the panel has no toggle of its own and the tab bar keeps
         // the window buttons at its right end; a hover-revealed panel stays
-        // below the tab bar so both remain reachable.
-        if !cfg!(target_os = "macos") && self.right_sidebar_collapsed {
-            let tab_bar = self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize;
+        // below the tab bar so both remain reachable -- below as much of it
+        // as is out, when it hides, or below the pane bar holding them. A
+        // docked one sliding away keeps its shape.
+        if !cfg!(target_os = "macos") && self.right_sidebar_floats() {
+            let tab_bar = self.window_top_right_chrome_height().ceil() as usize;
             let top = rect.y.saturating_add(tab_bar);
             rect.height = rect.height.saturating_sub(top - rect.y);
             rect.y = top;
@@ -8448,6 +8553,14 @@ impl crate::TermWindow {
             .dimensions
             .pixel_width
             .saturating_sub(border.right.get() as usize);
+        // Docked, it goes along with the terminal the Library pushes past the
+        // window's edge, there and back as the terminal is drawn; a hover
+        // reveal floats over it at the edge.
+        let right_edge = if self.right_sidebar_floats() {
+            right_edge
+        } else {
+            right_edge + self.library_drawn_push()
+        };
         Some(RightSidebarRect {
             x: right_edge.saturating_sub(width),
             y,
@@ -8974,7 +9087,7 @@ impl crate::TermWindow {
         let y = rect.y + self.ui_px(SIDEBAR_INSET) * 2;
         // A non-macOS hover panel already sits below the window buttons and
         // has no toggle of its own, so it needs no additional button row.
-        let height = if !cfg!(target_os = "macos") && self.right_sidebar_collapsed {
+        let height = if !cfg!(target_os = "macos") && self.right_sidebar_floats() {
             0
         } else {
             self.ui_px(RIGHT_SIDEBAR_TOP_BAR_HEIGHT).min(
@@ -10048,7 +10161,6 @@ impl crate::TermWindow {
             visible_height,
             row_metrics.row_height,
         );
-        let see_through = self.chrome_see_through();
         self.paint_right_sidebar_contents(layers, |this, layers| {
             let selected = this
                 .right_sidebar_note
@@ -10059,13 +10171,9 @@ impl crate::TermWindow {
                 let row = &rows[index];
                 let y = tree_top as f32 + (index * row_metrics.row_height) as f32
                     - this.right_sidebar_note_tree_scroll_offset;
-                // Opaque, a row scrolled part-way out stays whole at the top,
-                // under the fade. See-through has no fade, so the row keeps its
-                // place and what is above the list is cut away after the loop.
-                let y = y
-                    .floor()
-                    .max(if see_through { 0.0 } else { tree_top as f32 })
-                    as usize;
+                // A row scrolled part-way out keeps its place: what is above
+                // the list is cut away after the loop.
+                let y = y.floor().max(0.0) as usize;
                 let height = row_metrics.row_height.min(tree_bottom.saturating_sub(y));
                 // What is hovered and clicked: the part inside the list.
                 let hit_y = y.max(tree_top);
@@ -10157,16 +10265,14 @@ impl crate::TermWindow {
                     if active { foreground } else { muted_fg },
                 )?;
             }
-            if see_through {
-                this.paint_right_sidebar_file_mask(
-                    layers,
-                    chrome,
-                    content_x,
-                    content_top,
-                    content_width,
-                    tree_top.saturating_sub(content_top),
-                )?;
-            }
+            this.paint_right_sidebar_file_mask(
+                layers,
+                chrome,
+                content_x,
+                content_top,
+                content_width,
+                tree_top.saturating_sub(content_top),
+            )?;
             Ok(())
         })?;
 
@@ -13773,7 +13879,7 @@ impl crate::TermWindow {
     /// Horizontally centre a single line, falling back to the full width (and
     /// therefore ellipsizing) only when the text cannot fit.
     #[allow(clippy::too_many_arguments)]
-    fn paint_remote_files_centered_text(
+    pub(crate) fn paint_remote_files_centered_text(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
         ui_font: &Rc<LoadedFont>,
@@ -13871,14 +13977,19 @@ impl crate::TermWindow {
         content_width: usize,
         content_bottom: usize,
     ) -> anyhow::Result<()> {
-        let refresh_size = (ui_metrics.cell_size.height as usize + self.ui_px(12))
-            .clamp(self.ui_px(28), self.ui_px(38));
+        // Round buttons as tall as the filter box, spaced as the left
+        // sidebar's New Thread and notifications buttons are.
+        let refresh_size = self.ui_px(FILE_FILTER_HEIGHT);
         let refresh_x = content_x + content_width.saturating_sub(refresh_size);
-        let refresh_y =
-            content_top + self.ui_px(FILE_FILTER_HEIGHT).saturating_sub(refresh_size) / 2;
+        let refresh_y = content_top;
+        let upload_size = refresh_size;
+        let upload_gap = self.ui_px(SIDEBAR_ICON_GAP) + 4;
+        let upload_x = refresh_x.saturating_sub(upload_size + upload_gap);
         // The same filter box as a local project; the project's name heads
-        // the tree below it.
-        let filter_width = content_width.saturating_sub(refresh_size + self.ui_px(SIDEBAR_INSET));
+        // the tree below it. Leave room for both header buttons.
+        let filter_width = content_width.saturating_sub(
+            refresh_size + upload_size + upload_gap.saturating_mul(2),
+        );
         let filter_label = crate::i18n::tr("right-filter-files");
         let filter_input = self.right_sidebar_file_filter.clone();
         self.paint_snippet_text_box(
@@ -13899,7 +14010,18 @@ impl crate::TermWindow {
             UIItemType::RightSidebarFileFilter,
             false,
         )?;
-        self.paint_files_preview_header_icon_button(
+        self.paint_files_header_action_button(
+            layers,
+            chrome,
+            foreground,
+            muted_fg,
+            upload_x,
+            refresh_y,
+            upload_size,
+            SvgIcon::Upload,
+            UIItemType::RightSidebarRemoteFileUpload,
+        )?;
+        self.paint_files_header_action_button(
             layers,
             chrome,
             foreground,
@@ -14053,7 +14175,18 @@ impl crate::TermWindow {
                 UIItemType::RightSidebarFileFilter,
                 false,
             )?;
-            self.paint_files_preview_header_icon_button(
+            self.paint_files_header_action_button(
+                layers,
+                chrome,
+                foreground,
+                muted_fg,
+                upload_x,
+                refresh_y,
+                upload_size,
+                SvgIcon::Upload,
+                UIItemType::RightSidebarRemoteFileUpload,
+            )?;
+            self.paint_files_header_action_button(
                 layers,
                 chrome,
                 foreground,
@@ -14121,16 +14254,34 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    /// The transfers the strip still reports. Downloads and uploads are
+    /// excluded: their floating cards are the single place their progress and
+    /// completion appear, so a second spinner here would just duplicate them.
+    fn remote_transfer_strip_indices(&self) -> Vec<usize> {
+        self.right_sidebar_remote_transfers
+            .iter()
+            .enumerate()
+            .filter(|(_, transfer)| {
+                !matches!(
+                    transfer.kind,
+                    RemoteTransferKind::Download | RemoteTransferKind::Upload
+                )
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
     /// How many strip rows fit in `available` vertical pixels.
     ///
     /// Capped twice: by a fixed count, and by never taking more than half of
     /// what is left. Dropping thirty files at once must not collapse the tree
     /// to nothing or push rows up over the header.
     fn transfer_strip_rows(&self, available: usize, row_height: usize) -> usize {
-        if self.right_sidebar_remote_transfers.is_empty() {
+        let visible = self.remote_transfer_strip_indices();
+        if visible.is_empty() {
             return 0;
         }
-        self.right_sidebar_remote_transfers
+        visible
             .len()
             .min(REMOTE_TRANSFER_STRIP_MAX)
             .min((available / 2) / row_height.max(1))
@@ -14159,16 +14310,14 @@ impl crate::TermWindow {
         }
         // When some are hidden, the last visible row reports how many rather
         // than letting them vanish silently.
-        let hidden = self
-            .right_sidebar_remote_transfers
-            .len()
-            .saturating_sub(strip_rows);
+        let visible = self.remote_transfer_strip_indices();
+        let hidden = visible.len().saturating_sub(strip_rows);
         let painted = if hidden > 0 {
             strip_rows.saturating_sub(1)
         } else {
             strip_rows
         };
-        for index in 0..painted {
+        for &index in visible.iter().take(painted) {
             self.paint_remote_transfer_row(
                 layers,
                 ui_font,
@@ -15481,9 +15630,33 @@ impl crate::TermWindow {
             return false;
         };
 
+        // A Finder drag does not always activate the target window. Bring it
+        // forward as part of accepting the drop, so the running card is
+        // visible at once rather than after the focus flag catches up.
+        if let Some(window) = self.window.as_ref() {
+            window.focus();
+        }
+        self.upload_paths_to_directory(paths, &directory, coords);
+        true
+    }
+
+    /// Upload each local path into `directory`. Shared by a drop and the
+    /// header's Upload button; the caller has already checked that the remote
+    /// connection is the one it means to write to.
+    fn upload_paths_to_directory(
+        &mut self,
+        paths: &[PathBuf],
+        directory: &RemotePath,
+        anchor: Point,
+    ) {
         for path in paths {
             if path.is_dir() {
-                self.start_remote_folder_upload(path.clone(), directory.clone(), coords, None);
+                self.start_remote_folder_upload(
+                    path.clone(),
+                    directory.clone(),
+                    anchor,
+                    None,
+                );
                 continue;
             }
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -15513,7 +15686,116 @@ impl crate::TermWindow {
             self.start_remote_upload(path.clone(), remote, directory.clone(), None);
         }
         self.invalidate_window();
-        true
+    }
+
+    /// Where the header's Upload button puts files: the selected directory,
+    /// the parent of a selected file, or the tree root.
+    fn right_sidebar_remote_upload_directory(&self) -> Option<RemotePath> {
+        remote_upload_directory(
+            &self.right_sidebar_remote_files,
+            &self.right_sidebar_remote_file_search,
+        )
+    }
+
+    /// The header's Upload button. macOS puts files and folders in one native
+    /// panel and opens it straight away; the other platforms get a two-item
+    /// menu first because their native dialogs cannot offer both at once.
+    pub(crate) fn begin_remote_upload_picker(&mut self, anchor: Point) {
+        let Some(directory) = self.right_sidebar_remote_upload_directory() else {
+            self.right_sidebar_remote_files.error_message =
+                Some("No remote folder is available to upload into".to_string());
+            self.invalidate_window();
+            return;
+        };
+        let Some(origin) = self.current_remote_operation_origin() else {
+            self.right_sidebar_remote_files.error_message =
+                Some("Remote Files is not connected".to_string());
+            self.invalidate_window();
+            return;
+        };
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+
+        // Files go into the folder selected in the tree, or the one holding
+        // the selected file, as a drop onto that row would.
+        if window.supports_combined_path_picker() {
+            self.pick_remote_upload_paths(true, true, directory, origin, anchor);
+            return;
+        }
+        let path = directory.as_str().to_string();
+        let items = vec![
+            self.context_menu_application_item_with_icon(
+                right_sidebar_arg("right-upload-files-to", "path", path.clone()),
+                ContextMenuIcon::File,
+                crate::termwindow::ContextMenuApplicationAction::UploadFromPicker {
+                    allow_files: true,
+                    allow_directories: false,
+                    directory: directory.clone(),
+                    origin: origin.clone(),
+                    anchor,
+                },
+                true,
+            ),
+            self.context_menu_application_item_with_icon(
+                right_sidebar_arg("right-upload-folder-to", "path", path),
+                ContextMenuIcon::Folder,
+                crate::termwindow::ContextMenuApplicationAction::UploadFromPicker {
+                    allow_files: false,
+                    allow_directories: true,
+                    directory,
+                    origin,
+                    anchor,
+                },
+                true,
+            ),
+        ];
+        self.show_term_context_menu(&window, anchor, items);
+    }
+
+    /// Open the platform picker and, if it returned paths, upload them. The
+    /// origin is checked after the picker closes: its window can outlive a
+    /// switch to another host, and a remote absolute path means a different
+    /// object there.
+    pub(crate) fn pick_remote_upload_paths(
+        &mut self,
+        allow_files: bool,
+        allow_directories: bool,
+        directory: RemotePath,
+        origin: RemoteOperationOrigin,
+        anchor: Point,
+    ) {
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        let notify_window = window.clone();
+        let options = PathPickerOptions {
+            title: crate::i18n::tr("right-upload-picker-title"),
+            prompt: crate::i18n::tr("right-upload-picker-prompt"),
+            directory: None,
+            allow_files,
+            allow_directories,
+            multiple: true,
+        };
+        window.pick_paths_async(
+            options,
+            Box::new(move |paths| {
+                if paths.is_empty() {
+                    return;
+                }
+                notify_window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    if !term_window.remote_operation_origin_matches(&origin) {
+                        term_window.right_sidebar_remote_files.error_message = Some(
+                            "The panel moved to another host while the file picker was open"
+                                .to_string(),
+                        );
+                        term_window.invalidate_window();
+                        return;
+                    }
+                    term_window.upload_paths_to_directory(&paths, &directory, anchor);
+                })));
+            }),
+        );
     }
 
     /// Walk a dropped folder and upload it as a single transfer.
@@ -15623,6 +15905,7 @@ impl crate::TermWindow {
         // the confirmation has something on screen to be about.
         let id = self.next_remote_transfer_id();
         let progress = RemoteTransferProgress::default();
+        let remote_destination = directory.join_name(&name).ok();
         self.right_sidebar_remote_transfers.push(RemoteTransfer {
             id,
             kind: RemoteTransferKind::Upload,
@@ -15631,6 +15914,8 @@ impl crate::TermWindow {
             status: RemoteTransferStatus::Running,
             source: None,
             origin: Some(origin.clone()),
+            destination: None,
+            remote_destination,
         });
         self.trim_remote_transfers();
 
@@ -15791,6 +16076,43 @@ impl crate::TermWindow {
         let origin = source
             .as_ref()
             .and_then(|_| self.current_remote_operation_origin());
+        let remote_destination = match &source {
+            Some(RemoteTransferSource::Upload { remote, .. }) => Some(remote.clone()),
+            _ => None,
+        };
+        let remote_path = remote_destination
+            .as_ref()
+            .map(|path| path.as_str().to_string());
+        let remote_dir = remote_destination
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(|path| path.as_str().to_string());
+        let is_folder = matches!(&source, Some(RemoteTransferSource::DownloadFolder { .. }))
+            || matches!(&source, Some(RemoteTransferSource::Upload { local, .. }) if local.is_dir());
+        let retryable = source.is_some() && origin.is_some();
+        let now = Instant::now();
+        let toast = match kind {
+            RemoteTransferKind::Download => Some(TransferToast::download_failed(
+                id,
+                name.clone(),
+                None,
+                is_folder,
+                message.clone(),
+                retryable,
+                now,
+            )),
+            RemoteTransferKind::Upload => Some(TransferToast::upload_failed(
+                id,
+                name.clone(),
+                remote_path,
+                remote_dir,
+                is_folder,
+                message.clone(),
+                retryable,
+                now,
+            )),
+            _ => None,
+        };
         self.right_sidebar_remote_transfers.push(RemoteTransfer {
             id,
             kind,
@@ -15799,23 +16121,18 @@ impl crate::TermWindow {
             status: RemoteTransferStatus::Failed(message),
             source,
             origin,
+            destination: None,
+            remote_destination,
         });
+        if let Some(toast) = toast {
+            self.push_transfer_toast(toast);
+        }
         self.trim_remote_transfers();
     }
 
-    /// Keep the strip from growing without bound: finished entries are the
-    /// only ones ever dropped, and the oldest go first.
-    fn trim_remote_transfers(&mut self) {
-        while self.right_sidebar_remote_transfers.len() > REMOTE_TRANSFER_STRIP_MAX {
-            let Some(index) = self
-                .right_sidebar_remote_transfers
-                .iter()
-                .position(|transfer| !transfer.is_running())
-            else {
-                break;
-            };
-            self.right_sidebar_remote_transfers.remove(index);
-        }
+    /// Retry cards pin at most three finished records until they are dismissed.
+    pub(crate) fn trim_remote_transfers(&mut self) {
+        trim_remote_transfer_records(&mut self.right_sidebar_remote_transfers, &self.transfer_toasts);
     }
 
     fn start_remote_upload(
@@ -15867,6 +16184,8 @@ impl crate::TermWindow {
             status: RemoteTransferStatus::Running,
             source: Some(retry),
             origin: Some(origin.clone()),
+            destination: None,
+            remote_destination: Some(remote.clone()),
         });
         self.trim_remote_transfers();
 
@@ -16254,6 +16573,8 @@ impl crate::TermWindow {
             status: RemoteTransferStatus::Running,
             source: None,
             origin: None,
+            destination: None,
+            remote_destination: None,
         });
         self.trim_remote_transfers();
         self.invalidate_window();
@@ -16450,6 +16771,10 @@ impl crate::TermWindow {
             status: RemoteTransferStatus::Running,
             source: Some(retry),
             origin: Some(origin),
+            // Known from the reservation onwards; the card can open it as soon
+            // as the bytes land.
+            destination: Some(local.clone()),
+            remote_destination: None,
         });
         self.trim_remote_transfers();
         self.invalidate_window();
@@ -16530,6 +16855,9 @@ impl crate::TermWindow {
             status: RemoteTransferStatus::Running,
             source: Some(retry),
             origin: Some(origin.clone()),
+            // A folder's free name is reserved only when the walk is done.
+            destination: None,
+            remote_destination: None,
         });
         self.trim_remote_transfers();
         self.invalidate_window();
@@ -16684,11 +17012,12 @@ impl crate::TermWindow {
                 )
             });
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let destination = result.as_ref().ok().cloned();
                 let status = match &result {
                     Ok(destination) => {
                         let mut detail = format!("Saved to {}", destination.display());
                         if let Some(note) = &note {
-                            detail.push_str(&format!(" ({note})"));
+                            detail = format!("{note} · {detail}");
                         }
                         RemoteTransferStatus::Done(detail)
                     }
@@ -16700,7 +17029,7 @@ impl crate::TermWindow {
                         None => RemoteTransferStatus::Failed(failure.message.clone()),
                     },
                 };
-                term_window.finish_remote_transfer(id, status);
+                term_window.finish_remote_transfer_with_destination(id, status, destination);
                 if connection_died {
                     term_window
                         .release_remote_files_lease_if_connection(&connection_key, connection_id);
@@ -17027,6 +17356,8 @@ impl crate::TermWindow {
             // tree, and "run it again" deserves a fresh look, not a replay.
             source: None,
             origin: Some(origin.clone()),
+            destination: None,
+            remote_destination: None,
         });
         self.trim_remote_transfers();
         self.invalidate_window();
@@ -17375,16 +17706,19 @@ impl crate::TermWindow {
     }
 
     /// Run a failed transfer again from its recorded source.
-    pub(crate) fn retry_remote_transfer(&mut self, id: u64, anchor: Point) {
+    /// Run a finished transfer again. Returns whether a new attempt actually
+    /// started, so the floating card knows whether it should replace its
+    /// failure notice or keep it.
+    pub(crate) fn retry_remote_transfer(&mut self, id: u64, anchor: Point) -> bool {
         let Some(index) = self
             .right_sidebar_remote_transfers
             .iter()
             .position(|transfer| transfer.id == id)
         else {
-            return;
+            return false;
         };
         let Some(origin) = self.right_sidebar_remote_transfers[index].origin.clone() else {
-            return;
+            return false;
         };
         if !self.remote_operation_origin_matches(&origin) {
             // Keep the row and its source intact so switching back makes the
@@ -17394,11 +17728,11 @@ impl crate::TermWindow {
                 "Switch Files back to the original host to retry".to_string(),
             );
             self.invalidate_window();
-            return;
+            return false;
         }
         let transfer = self.right_sidebar_remote_transfers.remove(index);
         let Some(source) = transfer.source else {
-            return;
+            return false;
         };
         match source {
             RemoteTransferSource::Upload {
@@ -17414,6 +17748,7 @@ impl crate::TermWindow {
             }
         }
         self.invalidate_window();
+        true
     }
 
     /// Everything a transfer worker needs from the panel's lease. Takes an
@@ -17544,14 +17879,39 @@ impl crate::TermWindow {
     }
 
     fn finish_remote_transfer(&mut self, id: u64, status: RemoteTransferStatus) {
+        let now = Instant::now();
+        let toast = self
+            .right_sidebar_remote_transfers
+            .iter_mut()
+            .find(|transfer| transfer.id == id)
+            .and_then(|transfer| {
+                transfer.status = status;
+                TransferToast::from_transfer(transfer, now)
+            });
+        if let Some(toast) = toast {
+            self.push_transfer_toast(toast);
+        }
+        self.trim_remote_transfers();
+    }
+
+    /// A folder's free name is reserved only once its walk is complete, so its
+    /// destination arrives with the result rather than at creation.
+    fn finish_remote_transfer_with_destination(
+        &mut self,
+        id: u64,
+        status: RemoteTransferStatus,
+        destination: Option<PathBuf>,
+    ) {
         if let Some(transfer) = self
             .right_sidebar_remote_transfers
             .iter_mut()
             .find(|transfer| transfer.id == id)
         {
-            transfer.status = status;
+            if destination.is_some() {
+                transfer.destination = destination;
+            }
         }
-        self.trim_remote_transfers();
+        self.finish_remote_transfer(id, status);
     }
 
     pub(crate) fn request_right_sidebar_remote_files_connect(&mut self, explicit: bool) {
@@ -17584,6 +17944,12 @@ impl crate::TermWindow {
             .or_else(|| self.right_sidebar_remote_file_search.kind_for_path(&path));
         match kind {
             Some(RemoteFileKind::Directory) => {
+                if !self.leave_right_sidebar_file_preview() {
+                    return;
+                }
+                // Selecting a folder is also how the Upload button learns
+                // where the next files should go; expanding it is unchanged.
+                self.right_sidebar_remote_files.selected = Some(path.clone());
                 let effects = self
                     .right_sidebar_remote_files
                     .transition(RemoteFilesEvent::ToggleDirectory(path));
@@ -17657,7 +18023,7 @@ impl crate::TermWindow {
             // timeout only by a refresh or reconnect.
             RemoteFileSearchStatus::Failed(message) => {
                 query_changed
-                    && message != crate::termwindow::remote_files::REMOTE_LISTING_TIMED_OUT
+                    && !crate::termwindow::remote_files::remote_listing_is_timed_out(message)
             }
         };
         if needs_listing {
@@ -18076,15 +18442,13 @@ impl crate::TermWindow {
         content_bottom: usize,
         icon_size: usize,
     ) -> anyhow::Result<()> {
-        // Reserve room on the right for an icon-only Refresh button so it never
-        // eats into the filename/search width.
-        let refresh_size = (ui_metrics.cell_size.height as usize + self.ui_px(12))
-            .clamp(self.ui_px(28), self.ui_px(38));
-        let refresh_gap = self.ui_px(SIDEBAR_INSET);
+        // Reserve room on the right for a round Refresh button, as tall as the
+        // filter box, so it never eats into the filename/search width.
+        let refresh_size = self.ui_px(FILE_FILTER_HEIGHT);
+        let refresh_gap = self.ui_px(SIDEBAR_ICON_GAP) + 4;
         let filter_width = content_width.saturating_sub(refresh_size + refresh_gap);
         let refresh_x = content_x + content_width - refresh_size;
-        let refresh_y =
-            content_top + self.ui_px(FILE_FILTER_HEIGHT).saturating_sub(refresh_size) / 2;
+        let refresh_y = content_top;
         let filter_label = crate::i18n::tr("right-filter-files");
 
         let filter_input = self.right_sidebar_file_filter.clone();
@@ -18106,7 +18470,7 @@ impl crate::TermWindow {
             UIItemType::RightSidebarFileFilter,
             false,
         )?;
-        self.paint_files_preview_header_icon_button(
+        self.paint_files_header_action_button(
             layers,
             chrome,
             foreground,
@@ -18393,7 +18757,7 @@ impl crate::TermWindow {
                 UIItemType::RightSidebarFileFilter,
                 false,
             )?;
-            self.paint_files_preview_header_icon_button(
+            self.paint_files_header_action_button(
                 layers,
                 chrome,
                 foreground,
@@ -18593,7 +18957,7 @@ impl crate::TermWindow {
         width: usize,
         height: usize,
     ) -> anyhow::Result<()> {
-        if width == 0 || height == 0 || self.chrome_see_through() {
+        if width == 0 || height == 0 {
             return Ok(());
         }
         let opaque_height = self.ui_px(12).min(height);
@@ -18644,19 +19008,16 @@ impl crate::TermWindow {
     }
 
     /// Paints `contents` -- what a panel holds, over the ground it has
-    /// already painted -- into `layers`. See-through, they are recorded on
-    /// their own first, so that the scroll masks painted among them cut what
-    /// they cover out of what `contents` painted before them: painting the
-    /// ground over it again, as an opaque window does, would show as a darker
-    /// band. Nested, the inner block's masks cut only the inner block.
+    /// already painted -- into `layers`. They are recorded on their own
+    /// first, so that the scroll masks and fades painted among them cut and
+    /// fade what `contents` painted before them: painting the ground over it
+    /// again would show as a darker band over a see-through ground. Nested,
+    /// the inner block's masks cut only the inner block.
     pub(crate) fn paint_right_sidebar_contents(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
         contents: impl FnOnce(&mut Self, &mut TripleLayerQuadAllocator) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
-        if !self.chrome_see_through() {
-            return contents(self, layers);
-        }
         let mut recorded = self
             .right_sidebar_contents_scratch
             .pop()
@@ -18682,9 +19043,25 @@ impl crate::TermWindow {
         width: usize,
         height: usize,
     ) -> anyhow::Result<()> {
-        // See-through, the list is cut where the mask begins instead: a fade
-        // of the ground over it would darken the ground.
-        if width == 0 || height == 0 || self.chrome_see_through() {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        // In what is being recorded, the list fades in its own alpha.
+        if self.right_sidebar_recording_contents {
+            if let TripleLayerQuadAllocator::Heap(contents) = layers {
+                contents.fade_in_across(QuadClipRect::from_top_left_pixels(
+                    x as f32,
+                    y as f32,
+                    (x + width) as f32,
+                    (y + height) as f32,
+                    &self.dimensions,
+                ));
+                return Ok(());
+            }
+        }
+        // Otherwise a fade of the ground over a see-through one would
+        // darken it: the list is left cut where the mask begins.
+        if self.chrome_see_through() {
             return Ok(());
         }
 
@@ -19257,6 +19634,50 @@ impl crate::TermWindow {
             item_type,
         });
         let icon_size = (size * 58 / 100).max(self.ui_px(16));
+        self.paint_sidebar_icon(
+            layers,
+            icon,
+            x + (size.saturating_sub(icon_size)) / 2,
+            y + (size.saturating_sub(icon_size)) / 2,
+            icon_size,
+            if hovered { foreground } else { muted_fg },
+        )
+    }
+
+    /// A button beside the Files filter, Upload or Refresh: round, and made
+    /// like the left sidebar's New Thread and notifications buttons, so the
+    /// two sidebars' actions look alike.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_files_header_action_button(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        x: usize,
+        y: usize,
+        size: usize,
+        icon: SvgIcon,
+        item_type: UIItemType,
+    ) -> anyhow::Result<()> {
+        let hovered = self.is_pointer_over_ui_rect(x, y, size, size);
+        self.paint_sidebar_action_button(
+            layers,
+            1,
+            euclid::rect(x as f32, y as f32, size as f32, size as f32),
+            chrome,
+            hovered,
+            false,
+        )
+        .context("right sidebar files header button")?;
+        self.ui_items.push(UIItem {
+            x,
+            y,
+            width: size,
+            height: size,
+            item_type,
+        });
+        let icon_size = (size * 44 / 100).max(self.ui_px(14));
         self.paint_sidebar_icon(
             layers,
             icon,
@@ -21885,6 +22306,38 @@ fn file_row_placement(
         FileRowPlacement::Below
     } else {
         FileRowPlacement::Visible(row_top)
+    }
+}
+
+fn remote_upload_directory(
+    files: &crate::termwindow::remote_files::RemoteFilesState,
+    search: &RemoteFileSearchState,
+) -> Option<RemotePath> {
+    let root = files.root.clone()?;
+    let Some(selected) = files.selected.as_ref() else {
+        return Some(root);
+    };
+    match files
+        .kind_for_path(selected)
+        .or_else(|| search.kind_for_path(selected))
+    {
+        Some(RemoteFileKind::Directory) => Some(selected.clone()),
+        Some(_) => selected.parent().or(Some(root)),
+        None => None,
+    }
+}
+
+fn trim_remote_transfer_records(transfers: &mut Vec<RemoteTransfer>, toasts: &[TransferToast]) {
+    while transfers.len() > REMOTE_TRANSFER_STRIP_MAX {
+        let Some(index) = transfers.iter().position(|transfer| {
+            !transfer.is_running()
+                && !toasts
+                    .iter()
+                    .any(|toast| toast.id == transfer.id && toast.retryable)
+        }) else {
+            break;
+        };
+        transfers.remove(index);
     }
 }
 
@@ -26950,5 +27403,107 @@ mod wiki_link_name_tests {
         } else {
             assert_eq!(refused, None, "an ordinary note name here");
         }
+    }
+}
+
+#[cfg(test)]
+mod transfer_review_tests {
+    use super::*;
+    use crate::termwindow::remote_files::{RemoteFilesState, RemotePreviewStatus};
+
+    #[test]
+    fn upload_uses_an_unloaded_search_folder_and_rejects_unknown_kinds() {
+        let root = RemotePath::from_server_absolute("/srv/project").unwrap();
+        let folder = root
+            .join_name("unloaded")
+            .unwrap()
+            .join_name("folder")
+            .unwrap();
+        let mut files = RemoteFilesState::default();
+        files.root = Some(root.clone());
+        files.selected = Some(folder.clone());
+        let search = RemoteFileSearchState {
+            rows: Arc::new(vec![RemoteFileRow {
+                entry: RemoteFileEntry {
+                    path: folder.clone(),
+                    name: "folder".into(),
+                    kind: RemoteFileKind::Directory,
+                    size: None,
+                },
+                depth: 0,
+                expanded: false,
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(files.kind_for_path(&folder), None);
+        assert_eq!(
+            remote_upload_directory(&files, &search),
+            Some(folder.clone())
+        );
+        assert_eq!(
+            remote_upload_directory(&files, &RemoteFileSearchState::default()),
+            None
+        );
+        files.selected = None;
+        assert_eq!(remote_upload_directory(&files, &search), Some(root));
+    }
+
+    #[test]
+    fn closing_a_preview_before_selecting_a_folder_rejects_its_late_result() {
+        let file = RemotePath::from_server_absolute("/srv/project/a.txt").unwrap();
+        let folder = RemotePath::from_server_absolute("/srv/project/folder").unwrap();
+        for ready in [false, true] {
+            let mut files = RemoteFilesState::default();
+            files.transition(RemoteFilesEvent::SelectFile(file.clone()));
+            if ready {
+                files.transition(RemoteFilesEvent::PreviewFinished {
+                    generation: files.generation,
+                    path: file.clone(),
+                    error: None,
+                });
+            }
+            files.clear_selection();
+            files.selected = Some(folder.clone());
+            files.transition(RemoteFilesEvent::PreviewFinished {
+                generation: files.generation,
+                path: file.clone(),
+                error: None,
+            });
+            assert_eq!(files.selected.as_ref(), Some(&folder));
+            assert_eq!(files.preview, RemotePreviewStatus::None);
+        }
+    }
+
+    #[test]
+    fn retry_card_pins_the_only_finished_record_until_dismissal() {
+        let mut transfers: Vec<_> = (1..=4)
+            .map(|id| RemoteTransfer {
+                id,
+                kind: RemoteTransferKind::Download,
+                name: "file.txt".into(),
+                progress: RemoteTransferProgress::default(),
+                status: RemoteTransferStatus::Running,
+                source: Some(RemoteTransferSource::Download {
+                    remote: RemotePath::from_server_absolute("/srv/file.txt").unwrap(),
+                }),
+                origin: Some(RemoteOperationOrigin::new(
+                    "server-a".into(),
+                    "server-a".into(),
+                )),
+                destination: Some(PathBuf::from("/tmp/file.txt")),
+                remote_destination: None,
+            })
+            .collect();
+        transfers[3].status = RemoteTransferStatus::Failed("connection lost".into());
+        let toast = TransferToast::from_transfer(&transfers[3], Instant::now()).unwrap();
+        assert!(toast.retryable);
+        trim_remote_transfer_records(&mut transfers, &[toast.clone()]);
+        assert_eq!(transfers.len(), 4);
+        assert!(transfers
+            .iter()
+            .any(|transfer| transfer.id == toast.id && transfer.can_retry()));
+        trim_remote_transfer_records(&mut transfers, &[]);
+        assert_eq!(transfers.len(), REMOTE_TRANSFER_STRIP_MAX);
+        assert!(transfers.iter().all(|transfer| transfer.id != toast.id));
     }
 }

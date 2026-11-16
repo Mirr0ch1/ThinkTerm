@@ -64,6 +64,10 @@ on:
         description: Linux arm64 (deb + rpm + AppImage + tarballs)
         type: boolean
         default: true
+      android_arm64:
+        description: Android arm64 (APK)
+        type: boolean
+        default: true
       publish:
         description: Publish to a GitHub Release (otherwise artifacts only)
         type: boolean
@@ -184,6 +188,7 @@ jobs:
             echo "| macOS | \`$(jq -r 'if length == 0 then "none" else [.[].arch] | join(", ") end' <<<"$macos_matrix")\` |"
             echo "| Windows | \`$(jq -r 'if length == 0 then "none" else [.[].arch] | join(", ") end' <<<"$windows_matrix")\` |"
             echo "| Linux | \`$(jq -r 'if length == 0 then "none" else [.[] | "\(.name)/\(.arch)"] | join(", ") end' <<<"$linux_matrix")\` |"
+            echo "| Android arm64 | ${{ inputs.android_arm64 }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # One job per architecture, each producing its own zip. We deliberately do not
@@ -493,7 +498,7 @@ jobs:
         shell: cmd
         run: |
           PATH C:\Strawberry\perl\bin;%PATH%
-          cargo build --profile %CARGO_PROFILE% -p wezterm -p wezterm-gui -p wezterm-mux-server -p thinkterm-plugin-server -p strip-ansi-escapes
+          cargo build --profile %CARGO_PROFILE% -p wezterm -p wezterm-gui -p thinkterm-connect-auth -p wezterm-mux-server -p thinkterm-plugin-server -p strip-ansi-escapes
 
       - name: Fetch the browser bundle
         uses: actions/download-artifact@v8
@@ -628,6 +633,7 @@ jobs:
             cargo build --profile "$CARGO_PROFILE" \
               -p wezterm \
               -p wezterm-gui \
+              -p thinkterm-connect-auth \
               -p wezterm-mux-server \
               -p thinkterm-plugin-server \
               -p thinkterm-tailnet-node \
@@ -679,9 +685,136 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+  # Selected by default. The phone app speaks the mux codec of the commit
+  # it was built from, so it shares the servers' commit and version.
+  android:
+    name: android arm64
+    needs: [prepare, web]
+    if: inputs.android_arm64
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # The app signing key is this environment's secret, as the macOS
+    # certificate is: a run only reaches it once it is approved.
+    environment: release
+
+    env:
+      TAG_NAME: ${{ needs.prepare.outputs.version }}
+      # The one android/build.sh was last checked with; build.sh itself
+      # takes whichever NDK is newest on a developer's machine.
+      ANDROID_NDK_VERSION: 29.0.14206865
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Check submodules
+        run: bash ci/check-submodules.sh
+
+      # A release that would ship without the app stops here, a minute in.
+      # A test build without the key goes on and leaves the APK unsigned.
+      - name: Check signing credentials
+        env:
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          PUBLISH: ${{ needs.prepare.outputs.publish }}
+        run: |
+          set -eu
+          if [ -z "$ANDROID_KEYSTORE" ] || [ -z "$ANDROID_KEYSTORE_PASSWORD" ]; then
+            if [ "$PUBLISH" = true ]; then
+              echo "::error::the ANDROID_KEYSTORE and ANDROID_KEYSTORE_PASSWORD secrets are not both set"
+              exit 1
+            fi
+            echo "::warning::no Android signing key; this build's APK is unsigned"
+          fi
+
+      # See the macos job: the version comes from .tag, not from git.
+      - name: Stamp version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: echo "$RELEASE_TAG" > .tag
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, pinned
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: android-arm64
+          cache-on-failure: true
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      # The bindings generator is built for the runner itself.
+      - name: Install system deps
+        run: env CI=yes PATH=$PATH ./get-deps
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Install Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # The Gradle android/gradle-dist holds on a developer's machine.
+      - name: Install Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: 8.14.3
+
+      - name: Install the NDK
+        run: |
+          set -eu
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdkmanager" --licenses >/dev/null
+          "$sdkmanager" --install "ndk;$ANDROID_NDK_VERSION" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+
+      # The colour schemes the app lists come from the browser bundle.
+      - name: Fetch the browser bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: web-bundle
+          path: thinkterm-web/www
+
+      # The version reaches the script through env, as in the macos job.
+      - name: Build
+        env:
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+          THINKTERM_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          THINKTERM_ANDROID_KEY_ALIAS: thinkterm
+        run: |
+          set -eu
+          if [ -n "$ANDROID_KEYSTORE" ]; then
+            ( umask 077; printf '%s' "$ANDROID_KEYSTORE" | base64 -d > "$RUNNER_TEMP/android.p12" )
+            export THINKTERM_ANDROID_KEYSTORE="$RUNNER_TEMP/android.p12"
+          fi
+          android/build.sh release "$TAG_NAME"
+          rm -f "$RUNNER_TEMP/android.p12"
+          out=android/app/build/outputs/apk/release
+          if [ -f "$out/ThinkTerm-android-arm64-$TAG_NAME.apk" ]; then
+            mv "$out/ThinkTerm-android-arm64-$TAG_NAME.apk" .
+          else
+            mv "$out/app-release-unsigned.apk" "ThinkTerm-android-arm64-$TAG_NAME-unsigned.apk"
+          fi
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-arm64
+          path: ThinkTerm-android-arm64-*.apk
+          if-no-files-found: error
+          retention-days: 3
+
   publish:
     name: publish
-    needs: [prepare, macos, windows, linux]
+    needs: [prepare, macos, windows, linux, android]
     # Runs even when some platforms were deselected (those jobs report as
     # skipped), but never after a real failure -- half a release is worse than
     # none.
@@ -713,11 +846,6 @@ jobs:
           mkdir -p artifacts dist
           find artifacts -type f -exec mv -t dist {} +
 
-      # No checksum files are published. GitHub records a sha256 for every
-      # release asset as it is uploaded -- including the macOS zip attached by
-      # hand -- and shows it on the asset. A checksums file of our own would
-      # cover only what CI built, and unsigned it sits on the same server as
-      # the packages, so it proves no more than the digest already does.
       - name: Check there is something to publish
         run: |
           set -eu
@@ -741,10 +869,43 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: bash ci/retry.sh bash ci/create-release.sh "$RELEASE_TAG"
 
+      # A rerun may build only one platform. Keep the other release assets in
+      # the signed inventory, without uploading or replacing them again.
+      - name: Gather existing release packages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          previous="$RUNNER_TEMP/thinkterm-existing-release"
+          mkdir -p "$previous"
+          gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' > "$RUNNER_TEMP/thinkterm-assets.txt"
+          while IFS= read -r name; do
+            case "$name" in
+              thinkterm-release.txt|thinkterm-release.txt.sig|*-dSYM.zip|*-pdb.zip) continue ;;
+              ""|*[!A-Za-z0-9._+-]*) echo "::error::unexpected release asset name"; exit 1 ;;
+            esac
+            [ ! -f "dist/$name" ] || continue
+            gh release download "$RELEASE_TAG" --pattern "$name" --dir "$previous"
+          done < "$RUNNER_TEMP/thinkterm-assets.txt"
+
+      - name: Sign release metadata
+        env:
+          THINKTERM_RELEASE_SIGNING_KEY: ${{ secrets.THINKTERM_RELEASE_SIGNING_KEY }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: bash ci/sign-release.sh "$RELEASE_TAG" dist "$RUNNER_TEMP/thinkterm-existing-release"
+
       - name: Upload to release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
-          bash ci/retry.sh gh release upload --clobber \
-            "$RELEASE_TAG" dist/*
+          set -euo pipefail
+          packages=()
+          for file in dist/*; do
+            case "$file" in dist/thinkterm-release.txt|dist/thinkterm-release.txt.sig) continue ;; esac
+            packages+=("$file")
+          done
+          bash ci/retry.sh gh release upload --clobber "$RELEASE_TAG" "${packages[@]}"
+          bash ci/retry.sh gh release upload --clobber "$RELEASE_TAG" \
+            dist/thinkterm-release.txt dist/thinkterm-release.txt.sig

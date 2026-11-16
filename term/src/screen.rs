@@ -856,14 +856,21 @@ impl Screen {
             for _ in 0..to_move {
                 let mut line = self.lines.remove(remove_idx).unwrap();
                 let line = if default_blank == blank_attr {
-                    if RECYCLE && line.len() < self.physical_cols {
-                        if scroll_region.start == 0 && insert_at_end {
-                            // Full-screen rows go on into the scrollback: keep
-                            // no more than a new row would have allocated.
-                            line.reset_for_scrolling_as_new(seqno);
-                        } else {
-                            line.reset_for_scrolling(seqno, self.physical_cols);
-                        }
+                    if RECYCLE && !scrollback_ok {
+                        // The row stays on screen, which bounds what all of
+                        // them together can keep: it has its buffers back,
+                        // however wide what was in it. A screen of full rows
+                        // scrolling was otherwise an allocation, a growth
+                        // and a release for every one of them. (Rows of a
+                        // region of the main screen may go into the
+                        // scrollback later with what they kept: no more of
+                        // them than the region had.)
+                        line.reset_for_scrolling(seqno, self.physical_cols);
+                        line
+                    } else if RECYCLE && line.len() < self.physical_cols {
+                        // Rows of the main screen go on into the scrollback:
+                        // keep no more than a new row would have allocated.
+                        line.reset_for_scrolling_as_new(seqno);
                         line
                     } else {
                         Line::new(seqno)
@@ -1106,6 +1113,7 @@ impl Screen {
         F: FnMut(&[&Line]),
     {
         let (first, second) = self.lines.as_slices();
+        let first_len = first.len();
         let first_range = 0..first.len();
         let second_range = first.len()..first.len() + second.len();
         let first_range = phys_intersection(&first_range, &phys_range);
@@ -1115,7 +1123,9 @@ impl Screen {
         for line in &first[first_range] {
             lines.push(line);
         }
-        for line in &second[second_range] {
+        for line in &second[second_range.start.saturating_sub(first_len)
+            ..second_range.end.saturating_sub(first_len)]
+        {
             lines.push(line);
         }
         func(&lines)

@@ -7,9 +7,8 @@ use anyhow::{anyhow, Context, Error};
 use config::keyassignment::SpawnTabDomain;
 use config::{configuration, ExitBehavior, GuiPosition};
 use domain::{Domain, DomainId, DomainState, SplitSource};
-use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
 #[cfg(unix)]
-use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use filedescriptor::{poll, pollfd, AsRawSocketDescriptor, FileDescriptor, POLLIN};
 use log::error;
 use metrics::histogram;
 use parking_lot::{
@@ -20,8 +19,6 @@ use portable_pty::{CommandBuilder, ExitStatus, PtySize};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::io::{Read, Write};
-#[cfg(windows)]
-use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread;
@@ -34,13 +31,12 @@ use wezterm_term::color::ColorPalette;
 use wezterm_term::{
     Clipboard, ClipboardSelection, DownloadHandler, TerminalConfiguration, TerminalSize,
 };
-#[cfg(windows)]
-use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 
 pub mod activity;
 pub mod agent_status;
 pub mod client;
 pub mod command_spec;
+pub mod connect;
 pub mod connui;
 pub mod default_prog;
 pub mod domain;
@@ -48,6 +44,8 @@ pub mod foreground_program;
 pub mod geometrytrace;
 pub mod kept_output;
 pub mod localpane;
+mod output_buffer;
+pub mod pagepane;
 pub mod pane;
 mod parse_watchdog;
 pub mod renderable;
@@ -56,11 +54,38 @@ pub mod shell_integration;
 pub mod ssh;
 pub mod ssh_agent;
 pub mod tab;
+pub mod task_status;
 pub mod termwiztermtab;
 pub mod tmux;
 pub mod tmux_commands;
 mod tmux_pty;
 pub mod window;
+
+/// The Mux is a process-wide singleton, and tests that install one assert on
+/// its global state: they take this and run one at a time.
+#[cfg(test)]
+pub(crate) static GLOBAL_MUX_TESTS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+pub struct ConnectSuspension {
+    mux: Weak<Mux>,
+    resume: bool,
+}
+
+impl ConnectSuspension {
+    pub fn keep(mut self) {
+        self.resume = false;
+    }
+}
+
+impl Drop for ConnectSuspension {
+    fn drop(&mut self) {
+        if self.resume {
+            if let Some(mux) = self.mux.upgrade() {
+                mux.connect_suspended.store(false, Ordering::Release);
+            }
+        }
+    }
+}
 
 use crate::activity::Activity;
 
@@ -112,6 +137,9 @@ pub enum MuxNotification {
         tab_id: TabId,
         title: String,
     },
+    /// What the page a pane holds says of itself changed: its title, its
+    /// icon, what it is opened with. Read the fresh one via `Pane::page`.
+    PageChanged(PaneId),
     /// A pane was labelled, relabelled or had its label taken away.
     PaneLabelChanged {
         pane_id: PaneId,
@@ -264,6 +292,7 @@ pub struct FrontendAccessState {
 #[derive(Default)]
 struct TabFrontendLease {
     owner: Option<ClientId>,
+    ownership_generation: u64,
     /// Last geometry advertised by each renderer. Network claims always carry
     /// their geometry and never trust this cache; it remains useful for the
     /// in-process GUI, whose Pane input reaches the mux without a wire PDU.
@@ -272,6 +301,15 @@ struct TabFrontendLease {
     /// it can never describe a renderer that is no longer driving.
     view: Option<FrontendView>,
     generation: u64,
+}
+
+impl TabFrontendLease {
+    fn set_owner(&mut self, owner: Option<ClientId>) {
+        if self.owner != owner {
+            self.ownership_generation = self.ownership_generation.saturating_add(1);
+            self.owner = owner;
+        }
+    }
 }
 
 /// True when `me` is the only *live* client that has advertised geometry for
@@ -332,6 +370,7 @@ struct FrontendLeaseState {
     tabs: HashMap<TabId, TabFrontendLease>,
     access_mode: FrontendAccessMode,
     handoff_owner: Option<ClientId>,
+    ownership_generation: u64,
     /// Distinguishes initial server startup (first renderer auto-owns) from an
     /// owner disconnect (everyone stays blocked until an explicit takeover).
     handoff_ever_owned: bool,
@@ -362,12 +401,29 @@ impl Default for FrontendLeaseState {
             tabs: HashMap::new(),
             access_mode: FrontendAccessMode::Handoff,
             handoff_owner: None,
+            ownership_generation: 0,
             handoff_ever_owned: false,
             handoff_last_owner: None,
             ever_rendered: HashSet::new(),
             access_initialized: false,
             access_generation: 0,
             next_generation: 1,
+        }
+    }
+}
+
+impl FrontendLeaseState {
+    fn set_handoff_owner(&mut self, owner: Option<ClientId>) {
+        if self.handoff_owner != owner {
+            self.ownership_generation = self.ownership_generation.saturating_add(1);
+            self.handoff_owner = owner;
+        }
+    }
+
+    fn set_access_mode(&mut self, mode: FrontendAccessMode) {
+        if self.access_mode != mode {
+            self.ownership_generation = self.ownership_generation.saturating_add(1);
+            self.access_mode = mode;
         }
     }
 }
@@ -473,6 +529,8 @@ impl PaletteAdvisoryState {
 
 pub struct Mux {
     runtime_server_id: String,
+    connect_service: Mutex<Option<Arc<connect::service::Service>>>,
+    connect_suspended: AtomicBool,
     tabs: RwLock<HashMap<TabId, Arc<Tab>>>,
     panes: RwLock<HashMap<PaneId, Arc<dyn Pane>>>,
     windows: RwLock<HashMap<WindowId, Window>>,
@@ -618,13 +676,22 @@ impl Drop for TabGeometryTransaction<'_> {
     }
 }
 
-const BUFSIZE: usize = 1024 * 1024;
-
 /// Size of the per-pane pty read buffer. This lives for the lifetime of the
 /// pane's reader thread, so it is sized for what a single read() can actually
 /// return (the kernel tty buffer is far smaller than this) rather than
-/// BUFSIZE, which would pin 1MB per pane.
+/// a large parser batch, which would pin excess memory per pane.
 const PTY_READ_BUFSIZE: usize = 64 * 1024;
+
+/// What a read of a pty with more waiting comes to: as much as macOS gives at
+/// a time, and less than Linux does.
+const FULL_PTY_READ: usize = 1024;
+
+/// How many times a reader following a flood tries again when the pty runs
+/// dry. The program fills it again within microseconds, which is much less
+/// than waiting to be told takes, and a read that finds nothing is cheap.
+/// More catch no more of a flood, and cost a program that writes in bursts.
+#[cfg(unix)]
+const FLOOD_RETRIES: usize = 8;
 
 /// Bytes of external kitty payloads one flush may read into memory. A
 /// parser that fell behind a frame stream finds hundreds of frame escapes
@@ -752,29 +819,21 @@ fn release_action_buffer(actions: &Vec<Action>, read_capacity: usize, more_to_re
     actions.capacity() > 0 && (!more_to_read || actions.capacity() > read_capacity)
 }
 
-/// Whether `fd` has data to read right now, without waiting for any.
-fn readable_now(fd: &FileDescriptor) -> bool {
-    let mut pfd = [pollfd {
-        fd: fd.as_socket_descriptor(),
-        events: POLLIN,
-        revents: 0,
-    }];
-    matches!(poll(&mut pfd, Some(Duration::ZERO)), Ok(1))
-}
-
 fn parse_buffered_data(
     pane: Weak<dyn Pane>,
     pane_id: PaneId,
     dead: &Arc<AtomicBool>,
-    mut rx: FileDescriptor,
+    mut rx: output_buffer::OutputReceiver,
     heartbeat: Arc<parse_watchdog::ParseHeartbeat>,
     control: Option<Arc<ReaderControl>>,
 ) {
-    let mut buf = vec![0; configuration().mux_output_parser_buffer_size];
+    let mut read_capacity = configuration().mux_output_parser_buffer_size;
+    let mut buf = Vec::new();
     // Bytes read and not yet turned into applied actions; settled against
     // the reader's count whenever nothing is left waiting to be sent.
     let mut unapplied = 0usize;
     let mut parser = termwiz::escape::parser::Parser::new();
+    parser.set_text_keeps_line_controls(true);
     let mut actions = vec![];
     let mut hold = false;
     let mut action_size = 0;
@@ -784,12 +843,12 @@ fn parse_buffered_data(
 
     loop {
         if actions.is_empty() && actions.capacity() > 0 {
-            let more_to_read = readable_now(&rx);
-            if release_action_buffer(&actions, buf.len(), more_to_read) {
+            let more_to_read = rx.readable_now();
+            if release_action_buffer(&actions, read_capacity, more_to_read) {
                 actions = Vec::new();
             }
         }
-        match rx.read(&mut buf) {
+        match rx.read_buffered(&mut buf, read_capacity) {
             Ok(size) if size == 0 => {
                 dead.store(true, Ordering::Relaxed);
                 break;
@@ -844,7 +903,7 @@ fn parse_buffered_data(
                         action_size = 0;
                     }
                 });
-                // The poll() wait below is idle time, so busy work is
+                // The receive wait below is idle time, so busy work is
                 // recorded here (the parse, including any mid-parse flushes
                 // into the terminal) and separately around the flush below.
                 heartbeat.add(work_started.elapsed(), size);
@@ -854,7 +913,7 @@ fn parse_buffered_data(
                     // pause for a short while to increase the chances
                     // that we coalesce a full "frame" from an unoptimized
                     // TUI program
-                    if action_size < buf.len() {
+                    if action_size < read_capacity {
                         let poll_delay = match deadline {
                             None => {
                                 deadline.replace(Instant::now() + delay);
@@ -862,13 +921,8 @@ fn parse_buffered_data(
                             }
                             Some(target) => target.checked_duration_since(Instant::now()),
                         };
-                        if poll_delay.is_some() {
-                            let mut pfd = [pollfd {
-                                fd: rx.as_socket_descriptor(),
-                                events: POLLIN,
-                                revents: 0,
-                            }];
-                            if let Ok(1) = poll(&mut pfd, poll_delay) {
+                        if let Some(poll_delay) = poll_delay {
+                            if rx.wait_readable(poll_delay) {
                                 // We can read now without blocking, so accumulate
                                 // more data into actions
                                 continue;
@@ -888,7 +942,7 @@ fn parse_buffered_data(
                 }
 
                 let config = configuration();
-                buf.resize(config.mux_output_parser_buffer_size, 0);
+                read_capacity = config.mux_output_parser_buffer_size;
                 delay = Duration::from_millis(config.mux_output_parser_coalesce_delay_ms);
 
                 if actions.is_empty() {
@@ -917,36 +971,6 @@ fn parse_buffered_data(
         control.pending_bytes.fetch_sub(unapplied, Ordering::SeqCst);
     }
     parse_watchdog::unregister(pane_id);
-}
-
-fn set_socket_buffer(fd: &mut FileDescriptor, option: i32, size: usize) -> anyhow::Result<()> {
-    let size = size as c_int;
-    let socklen = std::mem::size_of_val(&size);
-    unsafe {
-        let res = libc::setsockopt(
-            fd.as_socket_descriptor(),
-            SOL_SOCKET,
-            option,
-            &size as *const c_int as *const _,
-            socklen as _,
-        );
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error()).context("setsockopt")
-        }
-    }
-}
-
-fn allocate_socketpair() -> anyhow::Result<(FileDescriptor, FileDescriptor)> {
-    let (mut tx, mut rx) = socketpair().context("socketpair")?;
-    set_socket_buffer(&mut tx, SO_SNDBUF, BUFSIZE)
-        .context("SO_SNDBUF")
-        .ok();
-    set_socket_buffer(&mut rx, SO_RCVBUF, BUFSIZE)
-        .context("SO_RCVBUF")
-        .ok();
-    Ok((tx, rx))
 }
 
 /// A pane's reader thread, from the outside. A takeover hands the pty to
@@ -1101,6 +1125,52 @@ lazy_static::lazy_static! {
         parking_lot::Mutex::new(HashMap::new());
 }
 
+/// Reads a flood of output without waiting to be told of each piece. macOS
+/// hands out a pty's output a KiB at a time, and finding out that there is
+/// more takes longer than reading it, which made that the limit on how fast a
+/// pane could take in output. Only for output with more behind it: anything
+/// less than a full read goes back to waiting, so typing never comes here.
+#[cfg(unix)]
+struct FloodReader {
+    /// A duplicate of the pty that, unlike the pane's reader, says when there
+    /// is nothing to read. Non-blocking is a mode of the pty and not of this
+    /// duplicate: the pane's reader and writer see it too, and allow for it.
+    pty: FileDescriptor,
+    following: bool,
+}
+
+#[cfg(unix)]
+impl FloodReader {
+    fn new(pty_fd: i32) -> Option<Self> {
+        Some(Self {
+            pty: FileDescriptor::dup(&pty_fd).ok()?,
+            following: false,
+        })
+    }
+
+    /// Whether what was just read has more behind it.
+    fn follow(&mut self, more: bool) {
+        self.following = more && (self.following || self.pty.set_non_blocking(true).is_ok());
+    }
+
+    /// Read what is there, or return None for the reader to go back to
+    /// waiting, which is also where the pty's end and any error are met.
+    fn read(&mut self, buf: &mut [u8]) -> Option<usize> {
+        if !self.following {
+            return None;
+        }
+        for _ in 0..FLOOD_RETRIES {
+            match self.pty.read(buf) {
+                Ok(size) if size > 0 => return Some(size),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => std::hint::spin_loop(),
+                _ => break,
+            }
+        }
+        self.following = false;
+        None
+    }
+}
+
 /// A pane reader that is parked. Dropping it lets the reader run again;
 /// `keep` does not, for the pty that now belongs to another process.
 pub struct PausedReader {
@@ -1143,11 +1213,11 @@ pub fn pause_pane_reader(pane_id: PaneId, timeout: Duration) -> anyhow::Result<P
     })
 }
 
-/// This function is run in a separate thread; its purpose is to perform
-/// blocking reads from the pty (non-blocking reads are not portable to
-/// all platforms) and to feed the bytes to the parser thread over a
-/// socketpair. With a pty file descriptor to poll, the reader can also be
-/// parked; see [`pause_pane_reader`].
+/// This function is run in a separate thread; its purpose is to read from
+/// the pty, blocking except through a flood on macOS (see `FloodReader`), and
+/// to feed the bytes to the parser thread through a bounded byte buffer. With
+/// a pty file descriptor to poll, the reader can also be parked; see
+/// [`pause_pane_reader`].
 fn read_from_pane_pty(
     pane: Weak<dyn Pane>,
     banner: Option<String>,
@@ -1158,25 +1228,12 @@ fn read_from_pane_pty(
 
     let dead = Arc::new(AtomicBool::new(false));
 
-    let (pane_id, exit_behavior) = match pane.upgrade() {
-        Some(pane) => (pane.pane_id(), pane.exit_behavior()),
-        None => return,
+    let Some(held) = pane.upgrade() else {
+        return;
     };
+    let (pane_id, exit_behavior) = (held.pane_id(), held.exit_behavior());
 
-    let (mut tx, rx) = match allocate_socketpair() {
-        Ok(pair) => pair,
-        Err(err) => {
-            log::error!("read_from_pane_pty: Unable to allocate a socketpair: {err:#}");
-            localpane::emit_output_for_pane(
-                pane_id,
-                &format!(
-                    "⚠️  ThinkTerm: read_from_pane_pty: \
-                    Unable to allocate a socketpair: {err:#}"
-                ),
-            );
-            return;
-        }
-    };
+    let (mut tx, rx) = output_buffer::channel();
 
     // The wake pipe and the control exist only when the pty can be polled;
     // without them the loop below is the plain blocking read.
@@ -1197,6 +1254,15 @@ fn read_from_pane_pty(
         }
         None => (None, None, None),
     };
+    // Only while the pane is held: once it has gone, the number of its pty can
+    // be another pane's, and this would read that pane's output.
+    #[cfg(unix)]
+    let mut flood = if cfg!(target_os = "macos") {
+        poll_fd.and_then(FloodReader::new)
+    } else {
+        None
+    };
+    drop(held);
     // Every reader can be paused here: a cancel ends the read it blocks in.
     #[cfg(windows)]
     let control = {
@@ -1226,6 +1292,10 @@ fn read_from_pane_pty(
         tx.write_all(banner.as_bytes()).ok();
     }
 
+    // What comes from elsewhere is not read in pty-sized pieces, and a parser
+    // left to come back on its own needs finer timers than Windows has.
+    let can_flood = cfg!(unix) && pty_fd.is_some();
+
     while !dead.load(Ordering::Relaxed) {
         #[cfg(windows)]
         if let Some(control) = &control {
@@ -1234,8 +1304,23 @@ fn read_from_pane_pty(
                 continue;
             }
         }
+        // What is read here needs no waiting. A pause goes the usual way, and
+        // whatever happens to the pty meanwhile, the flood starts again after.
         #[cfg(unix)]
-        if let (Some(control), Some(wake_read), Some(fd)) = (&control, &mut wake_read, poll_fd) {
+        let flood_read = match (&control, &mut flood) {
+            (Some(control), Some(flood)) if control.paused.load(Ordering::SeqCst) => {
+                flood.follow(false);
+                None
+            }
+            (_, Some(flood)) => flood.read(&mut buf),
+            _ => None,
+        };
+        #[cfg(not(unix))]
+        let flood_read: Option<usize> = None;
+        #[cfg(unix)]
+        if let (None, Some(control), Some(wake_read), Some(fd)) =
+            (flood_read, &control, &mut wake_read, poll_fd)
+        {
             let mut pfd = [
                 pollfd {
                     fd: fd as _,
@@ -1283,7 +1368,10 @@ fn read_from_pane_pty(
         if let Some(control) = &control {
             *control.in_read.lock() = true;
         }
-        let read = reader.read(&mut buf);
+        let read = match flood_read {
+            Some(size) => Ok(size),
+            None => reader.read(&mut buf),
+        };
         #[cfg(windows)]
         if let Some(control) = &control {
             *control.in_read.lock() = false;
@@ -1311,7 +1399,19 @@ fn read_from_pane_pty(
                 if let Some(control) = &control {
                     control.pending_bytes.fetch_add(size, Ordering::SeqCst);
                 }
-                if let Err(err) = tx.write_all(&buf[..size]) {
+                // A full read says more is coming, and the wake is the most
+                // expensive part of a read. Anything less goes straight on.
+                let flooding = can_flood && size >= FULL_PTY_READ;
+                #[cfg(unix)]
+                if let Some(flood) = &mut flood {
+                    flood.follow(flooding);
+                }
+                let written = if flooding {
+                    tx.write_all_flooding(&buf[..size])
+                } else {
+                    tx.write_all(&buf[..size])
+                };
+                if let Err(err) = written {
                     if let Some(control) = &control {
                         control.pending_bytes.fetch_sub(size, Ordering::SeqCst);
                     }
@@ -1451,6 +1551,8 @@ impl Mux {
 
         Self {
             runtime_server_id,
+            connect_service: Mutex::new(None),
+            connect_suspended: AtomicBool::new(false),
             tabs: RwLock::new(HashMap::new()),
             panes: RwLock::new(HashMap::new()),
             windows: RwLock::new(HashMap::new()),
@@ -1482,6 +1584,33 @@ impl Mux {
     /// to the old value.
     pub fn runtime_server_id(&self) -> &str {
         &self.runtime_server_id
+    }
+
+    pub fn connect_service(
+        self: &Arc<Self>,
+    ) -> thinkterm_reverse_access::Result<Arc<connect::service::Service>> {
+        let mut service = self.connect_service.lock();
+        if self.connect_suspended.load(Ordering::Acquire) {
+            return Err(thinkterm_reverse_access::Error::Unavailable);
+        }
+        if service.is_none() {
+            *service = Some(connect::service::Service::start(self)?);
+        }
+        Ok(Arc::clone(
+            service.as_ref().expect("initialized Connect service"),
+        ))
+    }
+
+    pub fn suspend_connect(self: &Arc<Self>) -> ConnectSuspension {
+        let mut service = self.connect_service.lock();
+        self.connect_suspended.store(true, Ordering::Release);
+        if let Some(service) = service.take() {
+            service.close();
+        }
+        ConnectSuspension {
+            mux: Arc::downgrade(self),
+            resume: true,
+        }
     }
 
     /// The agent socket panes here are given (`SSH_AUTH_SOCK`), if any.
@@ -1634,7 +1763,7 @@ impl Mux {
                 return;
             }
             let changed = lease.access_mode != mode;
-            lease.access_mode = mode;
+            lease.set_access_mode(mode);
             lease.access_initialized = true;
             changed
         };
@@ -1756,7 +1885,7 @@ impl Mux {
                         .as_ref()
                         .is_some_and(|last| same_device(last, client_id)))
             {
-                lease.handoff_owner = Some(client_id.clone());
+                lease.set_handoff_owner(Some(client_id.clone()));
                 lease.handoff_ever_owned = true;
                 lease.handoff_last_owner = None;
                 access_changed = true;
@@ -1784,7 +1913,7 @@ impl Mux {
             };
             let owner_changed = can_drive && !owner_was_me;
             if owner_changed {
-                state.owner = Some(client_id.clone());
+                state.set_owner(Some(client_id.clone()));
                 // Dropping the view on a takeover is safe because every path
                 // that vacates the owner also clears the view; a reseed
                 // therefore never discards a live scroll position.
@@ -2010,7 +2139,7 @@ impl Mux {
             let mut affected_tabs = vec![tab_id];
             if mode == FrontendAccessMode::Handoff {
                 access_changed = lease.handoff_owner.as_ref() != Some(client_id);
-                lease.handoff_owner = Some(client_id.clone());
+                lease.set_handoff_owner(Some(client_id.clone()));
                 lease.handoff_ever_owned = true;
                 // An explicit claim supersedes whoever drove before: the
                 // returning-device rule must not hand the lease back to it.
@@ -2025,7 +2154,7 @@ impl Mux {
             }
             let state = lease.tabs.entry(tab_id).or_default();
             state.viewports.insert(client_id.clone(), viewport.clone());
-            state.owner = Some(client_id.clone());
+            state.set_owner(Some(client_id.clone()));
             state.view = None;
             (access_changed, affected_tabs, joined)
         };
@@ -2138,14 +2267,14 @@ impl Mux {
 
         let affected_tabs = {
             let mut lease = self.frontend_lease.lock();
-            lease.access_mode = mode;
+            lease.set_access_mode(mode);
             lease.access_initialized = true;
             match mode {
                 FrontendAccessMode::TmuxLatest => {
-                    lease.handoff_owner = None;
+                    lease.set_handoff_owner(None);
                 }
                 FrontendAccessMode::Handoff => {
-                    lease.handoff_owner = Some(client_id.clone());
+                    lease.set_handoff_owner(Some(client_id.clone()));
                     lease.handoff_ever_owned = true;
                 }
             }
@@ -2157,7 +2286,7 @@ impl Mux {
             }
             let state = lease.tabs.entry(tab_id).or_default();
             state.viewports.insert(client_id.clone(), viewport.clone());
-            state.owner = Some(client_id.clone());
+            state.set_owner(Some(client_id.clone()));
             if !affected.contains(&tab_id) {
                 affected.push(tab_id);
             }
@@ -2379,7 +2508,7 @@ impl Mux {
         let (mode, mut affected_tabs) = {
             let mut lease = self.frontend_lease.lock();
             if let Some(mode) = restore_mode {
-                lease.access_mode = mode;
+                lease.set_access_mode(mode);
                 lease.access_initialized = true;
             }
             let mode = lease.access_mode;
@@ -2389,18 +2518,19 @@ impl Mux {
                     // The screen whose geometry failed is the one that gets
                     // to come back without a click, not whoever drove
                     // before it.
-                    lease.handoff_last_owner = lease.handoff_owner.take();
+                    lease.handoff_last_owner = lease.handoff_owner.clone();
+                    lease.set_handoff_owner(None);
                     lease.handoff_ever_owned = true;
                     for (affected_tab_id, state) in &mut lease.tabs {
-                        state.owner = None;
+                        state.set_owner(None);
                         state.view = None;
                         affected.push(*affected_tab_id);
                     }
                 }
                 FrontendAccessMode::TmuxLatest => {
-                    lease.handoff_owner = None;
+                    lease.set_handoff_owner(None);
                     let state = lease.tabs.entry(tab_id).or_default();
-                    state.owner = None;
+                    state.set_owner(None);
                     state.view = None;
                     affected.push(tab_id);
                 }
@@ -2729,7 +2859,7 @@ impl Mux {
                 if state.owner.as_ref() != Some(client_id) {
                     continue;
                 }
-                state.owner = None;
+                state.set_owner(None);
                 state.view = None;
                 affected.push(*tab_id);
             }
@@ -2740,7 +2870,7 @@ impl Mux {
                 // remaining device stays opaque until one explicitly clicks,
                 // wheels or swipes the takeover surface -- except this very
                 // device coming back, which inherits (see handoff_last_owner).
-                lease.handoff_owner = None;
+                lease.set_handoff_owner(None);
                 lease.handoff_ever_owned = true;
                 lease.handoff_last_owner = Some(client_id.clone());
             }
@@ -3667,6 +3797,9 @@ impl Mux {
             .cloned()
             .ok_or_else(|| anyhow!("pane {src_pane_id} not found in any tab"))?;
         let src_tab_id = src_tab.tab_id();
+        if Arc::ptr_eq(&src_tab, &target_tab) {
+            return src_tab.move_pane_to_split(src_pane_id, target_pane_id, request);
+        }
         let pane = src_tab.remove_pane(src_pane_id).ok_or_else(|| {
             anyhow!("pane {src_pane_id} not found in its containing tab {src_tab_id}")
         })?;
@@ -3740,6 +3873,12 @@ impl Mux {
                     CachePolicy::FetchImmediate,
                 ),
             },
+            SplitSource::Page(page) => {
+                if let Some(why) = page.refusal() {
+                    anyhow::bail!("{why}");
+                }
+                SplitSource::Page(page)
+            }
             other => other,
         };
 
@@ -3826,6 +3965,94 @@ impl Mux {
         tab.add_pane_to_stack(pane_id, Arc::clone(&pane))?;
 
         Ok(pane)
+    }
+
+    /// Opens a plugin's page as another level-2 tab in the stack `pane_id`
+    /// is in, of domain `domain`: as a rule `CurrentPaneDomain`, that
+    /// pane's, a page being the machine's its tab is on; one restored is of
+    /// the domain it was of.
+    pub async fn spawn_page_in_stack(
+        &self,
+        pane_id: PaneId,
+        domain: SpawnTabDomain,
+        page: thinkterm_proto::PageSpec,
+        size: TerminalSize,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        if let Some(why) = page.refusal() {
+            anyhow::bail!("{why}");
+        }
+        let (_, window_id, tab_id) = self
+            .resolve_pane_id(pane_id)
+            .ok_or_else(|| anyhow!("pane_id {} invalid", pane_id))?;
+        let tab = self
+            .get_tab(tab_id)
+            .ok_or_else(|| anyhow!("tab_id {} invalid", tab_id))?;
+        if tab.pane_index_for_pane(pane_id).is_none() {
+            anyhow::bail!("pane_id {} is not in tab {}", pane_id, tab_id);
+        }
+        let domain = self
+            .resolve_spawn_tab_domain(Some(pane_id), &domain)
+            .context("resolve_spawn_tab_domain")?;
+        if domain.state() == DomainState::Detached {
+            domain.attach(Some(window_id)).await?;
+        }
+        let pane = domain
+            .spawn_page_in_stack(pane_id, size, page)
+            .await
+            .with_context(|| format!("opening a page in domain `{}`", domain.domain_name()))?;
+        tab.add_pane_to_stack(pane_id, Arc::clone(&pane))?;
+        Ok(pane)
+    }
+
+    /// Opens a plugin's page as a tab of its own: in `window_id`, or in a
+    /// new window of `workspace_for_new_window`. It is of `domain`, as a
+    /// terminal spawned there would be: with `CurrentPaneDomain`, the one
+    /// `current_pane_id` is of -- the machine the user is on.
+    pub async fn spawn_page_tab(
+        &self,
+        window_id: Option<WindowId>,
+        domain: SpawnTabDomain,
+        page: thinkterm_proto::PageSpec,
+        size: TerminalSize,
+        current_pane_id: Option<PaneId>,
+        workspace_for_new_window: String,
+    ) -> anyhow::Result<(Arc<Tab>, Arc<dyn Pane>, WindowId)> {
+        if let Some(why) = page.refusal() {
+            anyhow::bail!("{why}");
+        }
+        let domain = self
+            .resolve_spawn_tab_domain(current_pane_id, &domain)
+            .context("resolve_spawn_tab_domain")?;
+
+        let window_builder;
+        let (window_id, size) = if let Some(window_id) = window_id {
+            let context = self.existing_window_spawn_context(window_id, size)?;
+            (window_id, context.size)
+        } else {
+            window_builder = self.new_empty_window(Some(workspace_for_new_window), None);
+            (*window_builder, size)
+        };
+
+        if domain.state() == DomainState::Detached {
+            domain.attach(Some(window_id)).await?;
+        }
+
+        let tab = domain
+            .spawn_page(size, page, window_id, current_pane_id)
+            .await
+            .with_context(|| format!("opening a page in domain `{}`", domain.domain_name()))?;
+        let pane = tab
+            .get_active_pane()
+            .ok_or_else(|| anyhow!("missing active pane on tab!?"))?;
+
+        let mut window = self
+            .get_window_mut(window_id)
+            .ok_or_else(|| anyhow!("no such window!?"))?;
+        if let Some(idx) = window.idx_by_id(tab.tab_id()) {
+            window.save_and_then_set_active(idx);
+        }
+
+        Ok((tab, pane, window_id))
     }
 
     /// Move an existing pane into another pane stack in the same tab.
@@ -4050,6 +4277,14 @@ impl Mux {
         let term_config = tab.get_active_pane().and_then(|pane| pane.get_config());
 
         Ok(ExistingWindowSpawnContext { size, term_config })
+    }
+}
+
+impl Drop for Mux {
+    fn drop(&mut self) {
+        if let Some(service) = self.connect_service.get_mut().take() {
+            service.close();
+        }
     }
 }
 
@@ -4434,7 +4669,7 @@ mod tests {
             Some(frontend_test_size(10, 5)),
             "only the driving frontend's sizes count"
         );
-        lease.handoff_owner = None;
+        lease.set_handoff_owner(None);
         assert_eq!(driving_frontend_size_over_root(&lease, 3, 7, root), None);
 
         lease.access_mode = FrontendAccessMode::TmuxLatest;
@@ -4616,7 +4851,7 @@ mod tests {
         mux.register_client(Arc::clone(&tui));
         {
             let mut lease = mux.frontend_lease.lock();
-            lease.handoff_owner = None;
+            lease.set_handoff_owner(None);
             lease.handoff_ever_owned = true;
             let state = lease.tabs.entry(tab_id).or_default();
             state
@@ -4645,7 +4880,7 @@ mod tests {
         let tui_registration = mux.register_client(Arc::clone(&tui));
         {
             let mut lease = mux.frontend_lease.lock();
-            lease.handoff_owner = None;
+            lease.set_handoff_owner(None);
             lease.handoff_ever_owned = true;
             let state = lease.tabs.entry(tab_id).or_default();
             state
@@ -5628,5 +5863,60 @@ mod tests {
             true
         });
         mux.notify(MuxNotification::PaneRemoved(999_998));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod flood_reader_tests {
+    use super::*;
+    use portable_pty::{native_pty_system, PtySize};
+
+    /// Typing into the pty echoes it back as output. A child printing it
+    /// instead could not exit until that output had been read.
+    fn echo(typing: &mut Box<dyn Write + Send>, fd: i32, text: &str) {
+        typing.write_all(text.as_bytes()).unwrap();
+        let mut output = [pollfd {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        }];
+        assert_eq!(poll(&mut output, Some(Duration::from_secs(10))).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_flood_is_read_until_it_stops_and_the_pane_reader_carries_on() {
+        let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+        let fd = pair.master.as_raw_fd().unwrap();
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let mut typing = pair.master.take_writer().unwrap();
+        let mut flood = FloodReader::new(fd).unwrap();
+        let mut buf = [0; 64];
+
+        // Only a full read starts it, or a quiet pane would never be waited on.
+        echo(&mut typing, fd, "first");
+        assert_eq!(flood.read(&mut buf), None);
+        let size = reader.read(&mut buf).unwrap();
+        assert_eq!(&buf[..size], b"first");
+
+        echo(&mut typing, fd, "second");
+        flood.follow(true);
+        let size = flood.read(&mut buf).unwrap();
+        assert_eq!(&buf[..size], b"second");
+
+        // Dry, it gives up rather than waiting for what may never come.
+        flood.follow(true);
+        assert_eq!(flood.read(&mut buf), None);
+        assert_eq!(flood.read(&mut buf), None);
+
+        // The pty stays non-blocking, so the pane's reader has to wait for the
+        // next output itself rather than take the empty pty for an error.
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            typing.write_all(b"third").unwrap();
+            typing
+        });
+        let size = reader.read(&mut buf).unwrap();
+        assert_eq!(&buf[..size], b"third");
+        drop(late.join().unwrap());
     }
 }

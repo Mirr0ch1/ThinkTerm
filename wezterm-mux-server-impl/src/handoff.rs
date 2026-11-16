@@ -21,6 +21,10 @@
 //! exits without touching the layout files, which the new one owns now
 //! (on macOS it stays as a process that only waits; see `hold`).
 //!
+//! A pane that holds a plugin's page has no pty to send: what it is
+//! follows the topology, and the new server makes its pane again under the
+//! same id (`HandoffPage`).
+//!
 //! Left behind: panes that hold a channel rather than a pty (ssh-domain
 //! and tmux-domain panes) and panes whose process already exited. They
 //! are pruned from the topology the new server gets, and end with the old
@@ -40,6 +44,7 @@ use std::convert::TryFrom;
 use thinkterm_proto::PaneNode;
 use mux::domain::DomainId;
 use mux::localpane::LocalPane;
+use mux::pagepane::PagePane;
 use mux::pane::{Pane, PaneId};
 use mux::tab::{Tab, TabId};
 use mux::window::{Window, WindowId};
@@ -158,6 +163,19 @@ struct HandoffPane {
     snapshot: Vec<u8>,
 }
 
+/// A pane that holds a plugin's page: all there is of it. The pages go in
+/// the frame of `Topology`, after the message, and only when there are
+/// any, so the messages keep their shape and `HANDOFF_VERSION` stays: a
+/// server with no page sends what it always did, and a successor from
+/// before pages, sent a tab that names one, finds a pane that was not
+/// handed over and gives up before anything is committed.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+struct HandoffPage {
+    pane_id: PaneId,
+    page: thinkterm_proto::PageSpec,
+    label: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct HandoffWindow {
     window_id: WindowId,
@@ -187,20 +205,28 @@ pub fn handoff_socket_path(socket_path: &Path) -> PathBuf {
 
 // ---------------------------------------------------------------- framing
 
-fn write_message(stream: &mut UnixStream, message: &HandoffMessage) -> anyhow::Result<()> {
+fn encode_message(message: &HandoffMessage) -> anyhow::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut encode = varbincode::Serializer::new(&mut bytes);
     message
         .serialize(&mut encode)
         .context("encoding a handoff message")?;
+    Ok(bytes)
+}
+
+fn write_frame(stream: &mut UnixStream, bytes: &[u8]) -> anyhow::Result<()> {
     let len = u32::try_from(bytes.len()).context("a handoff message is too large")?;
     stream.write_all(&len.to_le_bytes())?;
-    stream.write_all(&bytes)?;
+    stream.write_all(bytes)?;
     stream.flush()?;
     Ok(())
 }
 
-fn read_message(stream: &mut UnixStream) -> anyhow::Result<HandoffMessage> {
+fn write_message(stream: &mut UnixStream, message: &HandoffMessage) -> anyhow::Result<()> {
+    write_frame(stream, &encode_message(message)?)
+}
+
+fn read_frame(stream: &mut UnixStream) -> anyhow::Result<Vec<u8>> {
     let mut len = [0u8; 4];
     stream
         .read_exact(&mut len)
@@ -211,9 +237,70 @@ fn read_message(stream: &mut UnixStream) -> anyhow::Result<HandoffMessage> {
     }
     let mut bytes = vec![0u8; len];
     stream.read_exact(&mut bytes)?;
-    let mut reader = &bytes[..];
-    let mut decode = varbincode::Deserializer::new(&mut reader);
+    Ok(bytes)
+}
+
+fn decode_message(reader: &mut &[u8]) -> anyhow::Result<HandoffMessage> {
+    let mut decode = varbincode::Deserializer::new(reader);
     HandoffMessage::deserialize(&mut decode).context("decoding a handoff message")
+}
+
+fn read_message(stream: &mut UnixStream) -> anyhow::Result<HandoffMessage> {
+    let bytes = read_frame(stream)?;
+    decode_message(&mut &bytes[..])
+}
+
+/// `Ready`, then the build saying it, in the same frame but outside the
+/// message: a running server from before successors said their build
+/// decodes `Ready` and never looks past it, so this is not a change of
+/// shape and `HANDOFF_VERSION` stays, and updating from one still works.
+fn write_ready(stream: &mut UnixStream) -> anyhow::Result<()> {
+    let mut bytes = encode_message(&HandoffMessage::Ready {
+        version: HANDOFF_VERSION,
+    })?;
+    bytes.extend_from_slice(config::wezterm_version().as_bytes());
+    write_frame(stream, &bytes)
+}
+
+/// The handoff version and the build from `write_ready`. A successor from
+/// before it says no build.
+fn read_ready(stream: &mut UnixStream) -> anyhow::Result<(u32, Option<String>)> {
+    let bytes = read_frame(stream)?;
+    let mut rest = &bytes[..];
+    match decode_message(&mut rest)? {
+        HandoffMessage::Ready { version } => Ok((
+            version,
+            (!rest.is_empty()).then(|| String::from_utf8_lossy(rest).into_owned()),
+        )),
+        HandoffMessage::Refused(why) => bail!("the other side refused: {why}"),
+        message => bail!("expected Ready, got {message:?}"),
+    }
+}
+
+/// Why a server of release `own` keeps its panes from a successor of build
+/// `successor`, if it does. An app left behind by an update of the server
+/// (a distro package beside a newer install under ~/.local) starts its own
+/// server at every launch, and handing over to it would put the older build
+/// in charge of the panes and shut out the clients that updated the server
+/// in the first place. A successor that says no build predates this rule,
+/// and so this server. Development builds are not held to it, nor is one
+/// that says no build on Windows: there is only one install there, so that
+/// is a rollback on purpose, and an app from before this rule stops a server
+/// that refuses it, terminals and all.
+fn refusal_of_older_successor(own: &str, successor: Option<&str>) -> Option<String> {
+    if !thinkterm_update::is_release_version(own) {
+        return None;
+    }
+    match successor {
+        None if cfg!(windows) => None,
+        None => Some(format!(
+            "this server is {own}, which an older build does not take over"
+        )),
+        Some(successor) if thinkterm_update::is_older_release(successor, own) => Some(format!(
+            "this server is {own}, which the older build {successor} does not take over"
+        )),
+        Some(_) => None,
+    }
 }
 
 fn expect(stream: &mut UnixStream, what: &str) -> anyhow::Result<HandoffMessage> {
@@ -233,7 +320,6 @@ fn placeholder(what: &str) -> HandoffMessage {
     match what {
         "Ack" => HandoffMessage::Ack,
         "Owned" => HandoffMessage::Owned,
-        "Ready" => HandoffMessage::Ready { version: 0 },
         other => panic!("no placeholder for {}", other),
     }
 }
@@ -772,16 +858,21 @@ fn serve(mut stream: UnixStream, socket_path: &Path) {
 struct Capture {
     hello: Hello,
     panes: Vec<(HandoffPane, PaneObjects)>,
+    pages: Vec<HandoffPage>,
     topology: Vec<HandoffWindow>,
     paused: Vec<PausedReader>,
+    connect: mux::ConnectSuspension,
 }
 
 fn serve_inner(stream: &mut UnixStream, socket_path: &Path) -> anyhow::Result<()> {
-    let HandoffMessage::Ready { version } = expect(stream, "Ready")? else {
-        unreachable!()
-    };
+    let (version, successor_build) = read_ready(stream)?;
     if version != HANDOFF_VERSION {
         bail!("the successor speaks handoff version {version}, this server speaks {HANDOFF_VERSION}");
+    }
+    if let Some(why) =
+        refusal_of_older_successor(config::wezterm_version(), successor_build.as_deref())
+    {
+        bail!("{why}");
     }
     #[cfg(windows)]
     let successor = Successor::of(stream)?;
@@ -842,7 +933,10 @@ fn serve_inner(stream: &mut UnixStream, socket_path: &Path) -> anyhow::Result<()
         expect(stream, "Ack").with_context(|| format!("pane {pane_id}"))?;
     }
 
-    write_message(stream, &HandoffMessage::Topology(clone_topology(&capture.topology)))?;
+    write_frame(
+        stream,
+        &encode_topology(clone_topology(&capture.topology), &capture.pages)?,
+    )?;
     expect(stream, "Ack").context("topology")?;
 
     // On Windows the successor binds the socket itself once this server
@@ -859,7 +953,34 @@ fn serve_inner(stream: &mut UnixStream, socket_path: &Path) -> anyhow::Result<()
     for paused in capture.paused {
         paused.keep();
     }
+    capture.connect.keep();
     Ok(())
+}
+
+/// `Topology`, then the pages its tabs hold, in the same frame but outside
+/// the message (see `HandoffPage`).
+fn encode_topology(windows: Vec<HandoffWindow>, pages: &[HandoffPage]) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = encode_message(&HandoffMessage::Topology(windows))?;
+    if !pages.is_empty() {
+        let mut encode = varbincode::Serializer::new(&mut bytes);
+        pages
+            .serialize(&mut encode)
+            .context("encoding the pages of a handoff")?;
+    }
+    Ok(bytes)
+}
+
+/// A message, and the pages that follow a `Topology` in its frame.
+fn decode_with_pages(bytes: &[u8]) -> anyhow::Result<(HandoffMessage, Vec<HandoffPage>)> {
+    let mut rest = bytes;
+    let message = decode_message(&mut rest)?;
+    let pages = if matches!(message, HandoffMessage::Topology(_)) && !rest.is_empty() {
+        let mut decode = varbincode::Deserializer::new(&mut rest);
+        Vec::<HandoffPage>::deserialize(&mut decode).context("decoding the pages of a handoff")?
+    } else {
+        Vec::new()
+    };
+    Ok((message, pages))
 }
 
 fn clone_pane(pane: &HandoffPane) -> HandoffPane {
@@ -920,28 +1041,46 @@ where
 /// Runs on the main thread, where the mux is read.
 fn capture(pid_file: bool) -> anyhow::Result<Capture> {
     let mux = Mux::get();
+    let connect = mux.suspend_connect();
     let local_domain = mux.default_domain().domain_id();
     let mut paused = Vec::new();
     let mut panes = Vec::new();
+    let mut pages = Vec::new();
     let mut carried = HashSet::new();
     let mut left_behind = Vec::new();
 
     for pane in mux.iter_panes() {
         let pane_id = pane.pane_id();
-        let parts = match pane.downcast_ref::<LocalPane>() {
-            Some(local) if pane.domain_id() == local_domain => travelling_parts(local)
-                .with_context(|| format!("pane {pane_id} cannot be handed over"))?,
-            _ => None,
+        // A page runs nothing: there is no reader to pause and no pty to
+        // send, only what it is.
+        if let Some(page) = pane.page().filter(|_| pane.domain_id() == local_domain) {
+            pages.push(HandoffPage {
+                pane_id,
+                page,
+                label: mux.pane_label(pane_id),
+            });
+            carried.insert(pane_id);
+            continue;
+        }
+        let local = pane
+            .downcast_ref::<LocalPane>()
+            .filter(|_| pane.domain_id() == local_domain);
+        let Some(local) = local else {
+            left_behind.push(pane_id);
+            continue;
         };
+        let parts = travelling_parts(local)
+            .with_context(|| format!("pane {pane_id} cannot be handed over"))?;
         let Some(parts) = parts else {
+            local.quiesce_connect_input()?;
             left_behind.push(pane_id);
             continue;
         };
         let guard = mux::pause_pane_reader(pane_id, PAUSE_TIMEOUT)
             .with_context(|| format!("pausing pane {pane_id}"))?;
-        let local = pane
-            .downcast_ref::<LocalPane>()
-            .expect("checked above");
+        // Only now: this makes the pty blocking again, and a reader going
+        // through a flood would block in its read, where no pause reaches it.
+        local.quiesce_connect_input()?;
         let (snapshot, graphics, shell) = local.snapshot_terminal();
         paused.push(guard);
         panes.push((
@@ -1008,8 +1147,10 @@ fn capture(pid_file: bool) -> anyhow::Result<Capture> {
             left_behind,
         },
         panes,
+        pages,
         topology,
         paused,
+        connect,
     })
 }
 
@@ -1121,12 +1262,7 @@ pub fn begin(socket_path: &Path) -> anyhow::Result<Takeover> {
     })?;
     stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
     stream.set_write_timeout(Some(STEP_TIMEOUT))?;
-    write_message(
-        &mut stream,
-        &HandoffMessage::Ready {
-            version: HANDOFF_VERSION,
-        },
-    )?;
+    write_ready(&mut stream)?;
     let hello = match read_message(&mut stream)? {
         HandoffMessage::Hello(hello) => hello,
         HandoffMessage::Refused(why) => {
@@ -1217,13 +1353,16 @@ pub fn complete(
 ) -> anyhow::Result<UnixStream> {
     let mut stream = takeover.stream;
     let mut received: Vec<Received> = Vec::new();
+    let mut pages: Vec<HandoffPage> = Vec::new();
     let mut windows: Vec<HandoffWindow> = Vec::new();
     #[cfg(unix)]
     let mut listener: Option<OwnedFd> = None;
     let started = Instant::now();
 
     loop {
-        match read_message(&mut stream)? {
+        let (message, with_it) = decode_with_pages(&read_frame(&mut stream)?)?;
+        pages.extend(with_it);
+        match message {
             HandoffMessage::Pane(pane) => {
                 let pane_id = pane.pane_id;
                 #[cfg(unix)]
@@ -1242,7 +1381,11 @@ pub fn complete(
             }
             HandoffMessage::Topology(list) => {
                 fail_at("topology")?;
-                let have: HashSet<PaneId> = received.iter().map(|r| r.pane.pane_id).collect();
+                let have: HashSet<PaneId> = received
+                    .iter()
+                    .map(|r| r.pane.pane_id)
+                    .chain(pages.iter().map(|page| page.pane_id))
+                    .collect();
                 for window in &list {
                     for tab in &window.tabs {
                         let mut wanted = Vec::new();
@@ -1270,7 +1413,7 @@ pub fn complete(
                 fail_at("commit")?;
                 #[cfg(unix)]
                 let listener = listener.ok_or_else(|| anyhow!("Commit without a listener"))?;
-                install(received, windows, local_domain)?;
+                install(received, pages, windows, local_domain)?;
                 #[cfg(unix)]
                 start_listener(listener, socket_path)?;
                 #[cfg(windows)]
@@ -1288,6 +1431,7 @@ pub fn complete(
 /// The commit: build everything and make it the mux's.
 fn install(
     received: Vec<Received>,
+    pages: Vec<HandoffPage>,
     windows: Vec<HandoffWindow>,
     local_domain: DomainId,
 ) -> anyhow::Result<()> {
@@ -1304,6 +1448,28 @@ fn install(
             .with_context(|| format!("adopting pane {pane_id}"))?;
         if let Some(label) = label {
             labels.push((pane.pane_id(), label));
+        }
+        staged.panes.push(Arc::clone(&pane));
+        by_id.insert(pane_id, pane);
+    }
+    // The pages' panes are made anew, under the ids they had and at the
+    // sizes their tabs give them: nothing of one is anywhere but here.
+    let mut sizes = HashMap::new();
+    for tab in windows.iter().flat_map(|window| &window.tabs) {
+        for entry in tab.tree.entries() {
+            sizes.insert(entry.pane_id, entry.size);
+        }
+    }
+    for HandoffPage {
+        pane_id,
+        page,
+        label,
+    } in pages
+    {
+        let size = sizes.get(&pane_id).copied().unwrap_or_default();
+        let pane: Arc<dyn Pane> = Arc::new(PagePane::new(pane_id, local_domain, size, page));
+        if let Some(label) = label {
+            labels.push((pane_id, label));
         }
         staged.panes.push(Arc::clone(&pane));
         by_id.insert(pane_id, pane);
@@ -1339,7 +1505,8 @@ fn start_listener(listener: OwnedFd, socket_path: &Path) -> anyhow::Result<()> {
 }
 
 /// A session imported from another program keeps that program's O_NONBLOCK
-/// until the next handoff. Ordinary panes read and write blocking.
+/// until the next handoff, and a flood can leave a pane's pty the same way.
+/// A pane starts out here blocking, and what needs otherwise asks again.
 #[cfg(unix)]
 fn ensure_blocking(fd: &OwnedFd) -> anyhow::Result<()> {
     let flags = rustix::fs::fcntl_getfl(fd)?;
@@ -1699,6 +1866,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn the_build_of_a_successor_passes_servers_that_do_not_look_for_it() {
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        // What a server from before builds were said reads.
+        write_ready(&mut a).unwrap();
+        match read_message(&mut b).unwrap() {
+            HandoffMessage::Ready { version } => assert_eq!(version, HANDOFF_VERSION),
+            other => panic!("{:?}", other),
+        }
+
+        write_ready(&mut a).unwrap();
+        let (version, build) = read_ready(&mut b).unwrap();
+        assert_eq!(version, HANDOFF_VERSION);
+        assert_eq!(build.as_deref(), Some(config::wezterm_version()));
+
+        // What a successor from before builds were said sends.
+        write_message(
+            &mut a,
+            &HandoffMessage::Ready {
+                version: HANDOFF_VERSION,
+            },
+        )
+        .unwrap();
+        assert_eq!(read_ready(&mut b).unwrap(), (HANDOFF_VERSION, None));
+
+        write_message(&mut a, &HandoffMessage::Refused("no".to_string())).unwrap();
+        assert!(read_ready(&mut b).is_err());
+    }
+
+    #[test]
+    fn panes_go_only_to_a_successor_that_is_not_older() {
+        let refused = |own, successor| refusal_of_older_successor(own, successor).is_some();
+        assert!(refused("0.4.3", Some("0.4.2")));
+        // Says no build: from before successors did, so older than this.
+        assert_eq!(refused("0.4.3", None), !cfg!(windows));
+        assert!(!refused("0.4.3", Some("0.4.3")));
+        assert!(!refused("0.4.3", Some("0.4.4")));
+        // A development build on either side is free to.
+        assert!(!refused("0.4.3", Some("20261106-120000-abcdef12")));
+        assert!(!refused("20261106-120000-abcdef12", Some("0.4.2")));
+        assert!(!refused("20261106-120000-abcdef12", None));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn messages_and_snapshots_survive_their_bytes() {
         let (mut a, mut b) = UnixStream::pair().unwrap();
         write_message(
@@ -1922,6 +2133,59 @@ mod tests {
         assert!(!wait_for_predecessor_exit(&mut ours, Some(Duration::from_millis(50))));
         drop(theirs);
         assert!(wait_for_predecessor_exit(&mut ours, Some(Duration::from_millis(50))));
+    }
+
+    #[test]
+    fn pages_follow_the_topology_and_change_nothing_when_there_are_none() {
+        let windows = || {
+            vec![HandoffWindow {
+                window_id: 1,
+                workspace: "default".to_string(),
+                title: String::new(),
+                active_tab: 0,
+                tabs: vec![HandoffTab {
+                    tab_id: 2,
+                    title: String::new(),
+                    size: TerminalSize::default(),
+                    tree: PaneNode::Leaf(entry(7)),
+                }],
+            }]
+        };
+        let plain = encode_message(&HandoffMessage::Topology(windows())).unwrap();
+        assert_eq!(
+            encode_topology(windows(), &[]).unwrap(),
+            plain,
+            "a server with no page sends what it always did"
+        );
+        let (message, pages) = decode_with_pages(&plain).unwrap();
+        assert!(matches!(message, HandoffMessage::Topology(_)) && pages.is_empty());
+
+        let page = HandoffPage {
+            pane_id: 7,
+            page: thinkterm_proto::PageSpec {
+                plugin: "board".to_string(),
+                args: "{\"board\":\"release\"}".to_string(),
+                title: "Board".to_string(),
+                icon: String::new(),
+                // All of it is handed over: ids stay what they were here.
+                id: "0f3a9c2e5b7d1846".to_string(),
+                cwd: "/home/user/project".to_string(),
+                terminal: Some(3),
+            },
+            label: Some("plan".to_string()),
+        };
+        let sent = encode_topology(windows(), std::slice::from_ref(&page)).unwrap();
+        let (message, pages) = decode_with_pages(&sent).unwrap();
+        assert!(matches!(message, HandoffMessage::Topology(list) if list.len() == 1));
+        assert_eq!(pages, vec![page]);
+        // A successor from before pages reads the message and stops there.
+        assert!(matches!(
+            decode_message(&mut &sent[..]).unwrap(),
+            HandoffMessage::Topology(_)
+        ));
+        // Nothing follows any other message.
+        let commit = encode_message(&HandoffMessage::Commit).unwrap();
+        assert!(decode_with_pages(&commit).unwrap().1.is_empty());
     }
 
     #[test]

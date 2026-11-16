@@ -5,12 +5,12 @@ pub const SIDEBAR_INSET: usize = 10;
 pub const SIDEBAR_ICON_GAP: usize = 10;
 pub const SIDEBAR_ROW_GAP: usize = 10;
 pub const SIDEBAR_ROW_RADIUS: f32 = 10.0;
-/// Corner of the highlight behind a selected or hovered sidebar row. Scaled as
-/// a whole, unlike the `ui_f32(SIDEBAR_ROW_RADIUS) + 2.0` it replaces, where
-/// the added 2 stayed in raw pixels and so grew relative to the design on any
-/// display below the 2x grid the chrome is drawn for.
-pub const SIDEBAR_ROW_HIGHLIGHT_RADIUS: f32 = 20.0;
 pub const SIDEBAR_RESIZE_HANDLE_WIDTH: usize = 8;
+/// How much of a selected or hovered surface -- a sidebar row, a tab -- is
+/// kept over a see-through window, so that some of what is behind it shows.
+pub const SEE_THROUGH_SURFACE_ALPHA: f32 = 0.7;
+/// How much more of a selected surface's border is drawn there, for its edge.
+pub const SEE_THROUGH_BORDER_BOOST: f32 = 1.8;
 /// Left-edge strip that arms a hover reveal of the collapsed sidebar.
 ///
 /// Scaled through `ui_px`, not a raw pixel count: cell width scales with DPI
@@ -34,8 +34,28 @@ pub const SIDEBAR_HOVER_DWELL_MS: u64 = 180;
 /// Generous on purpose: it is the only defence against a native macOS menu,
 /// which sets no flag while open (see `ui/context_menu.rs`).
 pub const SIDEBAR_HOVER_GRACE_MS: u64 = 400;
+/// The window tab row's strip along the top, its counterpart of
+/// `SIDEBAR_HOVER_HOT_ZONE_WIDTH`. Deeper than that strip is wide: a window
+/// under the menu bar has nothing above it to stop the pointer, and an
+/// overshoot leaves the window.
+pub const WINDOW_TAB_REVEAL_HOT_ZONE_HEIGHT: usize = 20;
+/// The top strip's counterpart of `SIDEBAR_HOVER_STICKY_ZONE_WIDTH`.
+pub const WINDOW_TAB_REVEAL_STICKY_ZONE_HEIGHT: usize = 36;
+/// Over a pane bar's tabs and buttons, which the row's going leaves along
+/// the window's top, only this much of the strip counts: a pointer resting
+/// on one to click it is not asking for the row, one pushed on past it to
+/// the edge still is. So too over a blank standing in for the title bar,
+/// where the pointer comes to move the window.
+pub const WINDOW_TAB_REVEAL_EDGE_OVER_CONTROLS_HEIGHT: usize = 8;
+/// Off macOS, the top edge a window drawing its own frame leaves to the
+/// system for resizing, where the pointer never reaches the window: six
+/// logical pixels on X11 and Wayland, a little less on Windows.
+pub const WINDOW_RESIZE_EDGE_HEIGHT: usize = 12;
 pub const MACOS_TITLEBAR_CONTENT_TOP_INSET: usize = 52;
 pub const MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH: usize = 164;
+/// Where a thread's own window starts its tabs on macOS, nearer the traffic
+/// lights than a window tab row: nothing else shares the bar with them.
+pub const MACOS_THREAD_WINDOW_TAB_START: usize = 160;
 pub const MACOS_WINDOW_TAB_RESERVED_ACTION_SLOTS: usize = 1;
 
 /// A tab row's height, from its title font's line height.
@@ -70,6 +90,12 @@ pub const WINDOW_TAB_GAP: usize = 18;
 /// Matches `ssh_hosts_view`'s list fades, which solve the same problem
 /// vertically.
 pub const TAB_ROW_FADE_WIDTH: usize = 32;
+/// How far a title too long for its place takes to go out...
+pub const TITLE_FADE: f32 = 56.0;
+/// ...and the room it leaves before a tab's close button...
+pub const TAB_TITLE_FADE_GAP: f32 = 6.0;
+/// ...and before a sidebar row's mark, which a name runs right up to.
+pub const SIDEBAR_TITLE_FADE_GAP: f32 = 16.0;
 /// Pill: `snapped_rounded_corner_radius` clamps this to half the surface's
 /// short side, so the tab keeps semicircular ends at every row height.
 pub const WINDOW_TAB_RADIUS: f32 = 999.0;
@@ -109,7 +135,7 @@ pub const TAB_VERTICAL_PADDING: usize = 8;
 /// circle concentric with the pill's rounded end.
 pub const TAB_ICON_CIRCLE_INSET: usize = 6;
 /// A pane tab icon's glyph, as a share of its circle.
-pub const TAB_ICON_GLYPH_RATIO: f32 = 0.56;
+pub const TAB_ICON_GLYPH_RATIO: f32 = thinkterm_tab_icons::look::GLYPH_RATIO;
 
 pub const PANE_NAV_INSET: usize = 10;
 pub const PANE_NAV_ICON_GAP: usize = 8;

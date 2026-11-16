@@ -20,7 +20,7 @@ use crate::termwindow::ui::tokens::{
     PANE_NAV_ACTION_ICON_SIZE, PANE_NAV_BUTTON_GAP, PANE_NAV_ICON_GAP, PANE_NAV_INSET,
     PANE_NAV_TAB_GAP, PANE_NAV_TAB_RADIUS, TAB_CLOSE_HOVER_INSET, TAB_CLOSE_HOVER_RADIUS,
     TAB_CONTENT_INSET, TAB_ICON_CIRCLE_INSET, TAB_ICON_GLYPH_RATIO, TAB_ICON_SIZE,
-    TAB_VERTICAL_PADDING,
+    TAB_MIN_WIDTH, TAB_VERTICAL_PADDING,
 };
 use crate::termwindow::{PaneNavAction, ScrollHit, ScrollTrack, UIItem, UIItemType};
 use crate::ui::draw::DrawContext;
@@ -32,6 +32,7 @@ use config::VisualBellTarget;
 use mux::pane::{PaneId, WithPaneLines};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use crate::termwindow::render::split_slide::TabPlace;
+use crate::termwindow::window_tab_reveal::{PaneBarWindowChrome, ToggleSlot};
 use mux::tab::{CollapsedPaneLayout, PaneStackTab, PositionedPane, SplitDirection};
 use mux::Mux;
 use ordered_float::NotNan;
@@ -43,6 +44,11 @@ use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::{Line, StableRowIndex};
 use window::color::LinearRgba;
 use window::MouseEventKind as WMEK;
+
+/// Inside a viewer pane's pill, either side of its icon and words.
+const SHARE_PILL_PAD: usize = 12;
+/// The dot on a share button while someone asks to type.
+const SHARE_ASKING_DOT: usize = 12;
 
 fn clamp_pane_horizontal_span(
     pane_left: f32,
@@ -169,7 +175,7 @@ impl crate::TermWindow {
     /// Icon, action-icon and button sizes for a nav bar of `nav_height`.
     /// The painter and the scroll clamp both size their geometry from these, so
     /// they are derived once.
-    fn pane_nav_button_metrics(&self, nav_height: usize) -> (usize, usize, usize) {
+    pub(crate) fn pane_nav_button_metrics(&self, nav_height: usize) -> (usize, usize, usize) {
         // Fixed chrome sizes, clamped only so a nav bar squeezed by a short
         // pane cannot overflow its own row. The tab icon deliberately matches
         // the window tab row's; it used to be capped at 24 here and computed
@@ -188,13 +194,173 @@ impl crate::TermWindow {
 
     /// Width the trailing action buttons claim from the nav bar's right edge:
     /// new tab, split down, split right and zoom, plus collapse wherever the
-    /// split shape allows it.
+    /// split shape allows it, and the room kept for the window's buttons.
     fn pane_nav_action_reserved_width(&self, pos: &PositionedPane, nav_height: usize) -> usize {
         let (_, _, button_size) = self.pane_nav_button_metrics(nav_height);
-        let action_count = 4 + usize::from(self.can_collapse_pane_stack(pos));
+        self.pane_nav_actions_width(pos, button_size)
+            .saturating_add(self.pane_bar_window_chrome_room(pos, button_size))
+    }
+
+    /// The trailing action buttons alone.
+    fn pane_nav_actions_width(&self, pos: &PositionedPane, button_size: usize) -> usize {
+        let action_count = 3
+            + usize::from(self.pane_bar_shows_zoom(pos))
+            + usize::from(self.can_collapse_pane_stack(pos))
+            + usize::from(
+                self.pane_can_share(&pos.pane)
+                    || self.pane_is_watching_share(pos.pane.pane_id()),
+            );
+        // A viewer's pill stands where the share button would.
+        let pill = self
+            .pane_share_pill_width(pos, button_size)
+            .map_or(0, |width| width.saturating_sub(button_size));
         action_count
             .saturating_mul(button_size + self.ui_px(PANE_NAV_BUTTON_GAP))
             .saturating_add(self.ui_px(PANE_NAV_INSET))
+            .saturating_add(pill)
+    }
+
+    /// How wide the pill of a pane watching another account's share is:
+    /// its icon and its words.
+    fn pane_share_pill_width(&self, pos: &PositionedPane, button_size: usize) -> Option<usize> {
+        let pill = self.share_pill(pos.pane.pane_id())?;
+        let font = self
+            .fonts
+            .title_font_with_size(crate::native_settings::pane_header_font_size(
+                &crate::native_settings::load_shared(),
+            ))
+            .ok()?;
+        let text = self.sidebar_text_width(&font, &pill.label).ok()?.ceil() as usize;
+        let icon = self.ui_px(PANE_NAV_ACTION_ICON_SIZE).min(button_size);
+        Some(
+            self.ui_px(SHARE_PILL_PAD) * 2
+                + icon
+                + self.ui_px(PANE_NAV_ICON_GAP)
+                + text,
+        )
+    }
+
+    /// The pill of a pane watching another account's share: where the
+    /// watch stands, pressed to ask to type or to give it back.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_pane_share_pill(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        pill: &crate::termwindow::share::SharePill,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        icon_size: usize,
+        pos: &PositionedPane,
+        foreground: LinearRgba,
+    ) -> anyhow::Result<()> {
+        if pill.live {
+            self.ui_items.push(UIItem {
+                x,
+                y,
+                width,
+                height,
+                item_type: UIItemType::PaneNav {
+                    pane_id: pos.pane.pane_id(),
+                    pane_index: pos.index,
+                    action: PaneNavAction::SharePill,
+                },
+            });
+        }
+        let hovered = pill.live && self.is_pointer_over_ui_rect(x, y, width, height);
+        let pressed = hovered && self.is_pointer_pressing_ui_rect(x, y, width, height);
+        let chrome = self.chrome();
+        let (fill, border, ink) = if pill.lit {
+            let fill = if hovered {
+                chrome.accent_hover
+            } else {
+                chrome.accent
+            };
+            (fill, fill, chrome.on_accent)
+        } else {
+            let fill = if pressed {
+                chrome.control_pressed_bg
+            } else if hovered {
+                chrome.control_hover_bg
+            } else {
+                chrome.control_bg
+            };
+            (fill, chrome.control_border, foreground)
+        };
+        self.fill_rounded_rectangle_with_border(
+            layers,
+            1,
+            euclid::rect(x as f32, y as f32, width as f32, height as f32),
+            fill,
+            border,
+            PANE_NAV_ACTION_BUTTON_RADIUS,
+            ICON_BUTTON_BORDER_WIDTH,
+        )
+        .context("pane share pill")?;
+        let pad = self.ui_px(SHARE_PILL_PAD);
+        self.paint_pane_nav_icon(
+            layers,
+            pill.icon,
+            x + pad,
+            y + height.saturating_sub(icon_size) / 2,
+            icon_size,
+            ink,
+        )?;
+        let font = self
+            .fonts
+            .title_font_with_size(crate::native_settings::pane_header_font_size(
+                &crate::native_settings::load_shared(),
+            ))
+            .context("pane share pill font")?;
+        let metrics = RenderMetrics::with_font_metrics(&font.metrics());
+        let text_x = x + pad + icon_size + self.ui_px(PANE_NAV_ICON_GAP);
+        let text_y = y + height.saturating_sub(metrics.cell_size.height as usize) / 2;
+        // Its width measured the words: rounding is all that may cut them.
+        let text_width = (x + width).saturating_sub(text_x + pad) + 2;
+        self.paint_pane_nav_text(
+            layers,
+            &font,
+            metrics,
+            &pill.label,
+            text_x,
+            text_y,
+            text_width,
+            ink,
+        )
+    }
+
+    /// `pos`'s bar, `width` wide, has room for the window's `parts` beside
+    /// all of its own: the sidebar's toggle when it holds that too, half a
+    /// tab at the least -- its icon, the start of its title and its close
+    /// button -- and its action buttons.
+    pub(crate) fn pane_bar_fits_window_chrome(
+        &self,
+        pos: &PositionedPane,
+        parts: PaneBarWindowChrome,
+        width: f32,
+    ) -> bool {
+        let (_, _, button_size) =
+            self.pane_nav_button_metrics(self.pane_nav_bar_height_for_pane(pos));
+        let tab_start = if self.pane_bar_sidebar_toggle_share(pos) > 0.0 {
+            self.pane_bar_sidebar_toggle_clear(pos)
+        } else {
+            self.pane_nav_tab_left_inset(pos) as f32
+        };
+        let buttons = self.pane_nav_actions_width(pos, button_size)
+            + self.pane_bar_window_chrome_width(parts, button_size);
+        tab_start + self.ui_f32(TAB_MIN_WIDTH / 2.0) + buttons as f32 <= width
+    }
+
+    /// The room `pos`'s bar keeps at its end for the window's buttons
+    /// (see `pane_bar_window_chrome`), shrinking as the row comes down.
+    fn pane_bar_window_chrome_room(&self, pos: &PositionedPane, button_size: usize) -> usize {
+        let parts = self.pane_bar_window_chrome(pos);
+        if !parts.any() {
+            return 0;
+        }
+        let width = self.pane_bar_window_chrome_width(parts, button_size);
+        (width as f32 * self.pane_bars_stand_in_share()).round() as usize
     }
 
     /// The band `pos`'s nav bar runs along, and where along it the buttons
@@ -266,7 +432,7 @@ impl crate::TermWindow {
         let Ok((pane_x, pane_width)) = self.pane_chrome_span(pos) else {
             return 0.0;
         };
-        let tab_start = pane_x.max(0.0) as usize + self.pane_nav_tab_left_inset(pos.left);
+        let tab_start = pane_x.max(0.0) as usize + self.pane_nav_tab_left_inset(pos);
         let max_tab_right = ((pane_x + pane_width).max(0.0) as usize)
             .saturating_sub(self.pane_nav_action_reserved_width(pos, nav_height));
         max_tab_right.saturating_sub(tab_start) as f32
@@ -274,10 +440,13 @@ impl crate::TermWindow {
 
     pub(crate) fn terminal_viewport_right(&self) -> f32 {
         let border = self.get_os_border();
-        self.dimensions
+        // Past the window's edge, by as much as the Library pushes it.
+        (self
+            .dimensions
             .pixel_width
             .saturating_sub(border.right.get() as usize)
-            .saturating_sub(self.right_sidebar_width()) as f32
+            .saturating_sub(self.right_sidebar_width())
+            + self.library_push()) as f32
     }
 
     pub(crate) fn pane_content_origin(&self, pos: &PositionedPane) -> anyhow::Result<(f32, f32)> {
@@ -325,8 +494,14 @@ impl crate::TermWindow {
         let (_, pane_y) = self.pane_content_origin(pos)?;
         let (pane_x, pane_width) = self.pane_chrome_span(pos)?;
         let mut height = (pos.height as f32 * self.render_metrics.cell_size.height as f32).max(1.0);
-        if self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id) && pos.top > 0 {
-            height = height.max(self.pane_nav_bar_height() as f32);
+        if self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id) {
+            if pos.top > 0 {
+                height = height.max(self.pane_nav_bar_height() as f32);
+            }
+        } else {
+            // Along the tree's bottom edge, the room under it its rows go on
+            // into.
+            height += self.pane_bottom_slack(pos, self.terminal_size.rows) as f32;
         }
         // The frame starts at the nav bar, lifted for panes along the top.
         let lift = self.pane_nav_lift(pos);
@@ -720,6 +895,14 @@ impl crate::TermWindow {
         let tab_height = button_size;
         let tab_y = button_y;
         let tab_fg = if pos.is_active { foreground } else { muted_fg };
+        // The tabs are recorded, so that where the strip runs on past its
+        // viewport it can fade out in their own alpha: over a see-through
+        // bar a fade of its ground would show as a band.
+        let into = &mut *layers;
+        let mut row = std::mem::take(&mut self.tab_row_scratch);
+        row.recycle();
+        let row_start = row.mark();
+        let layers = &mut TripleLayerQuadAllocator::Heap(&mut row);
         for (idx, tab) in tabs.into_iter().enumerate() {
             if tab_width <= icon_size + self.ui_px(PANE_NAV_ICON_GAP) + button_size
                 || viewport_width == 0
@@ -953,11 +1136,10 @@ impl crate::TermWindow {
         // Dissolve the strip into the bar wherever it runs on past its
         // viewport, so a clipped tab reads as continuing rather than as one
         // sliced in half.
-        self.paint_tab_row_fades(
-            layers,
-            self.collapsed_bar_surface(),
-            tab_y,
-            tab_height,
+        self.apply_tab_row(
+            row,
+            &row_start,
+            into,
             tab_start,
             max_tab_right,
             scroll_offset > 0.5,
@@ -989,6 +1171,24 @@ impl crate::TermWindow {
             self.split_slides.bare_nav(pos.pane.pane_id());
         }
         tabs
+    }
+
+    /// Whether `pos`'s bar has the zoom button: zoomed, to come back out, or
+    /// beside another pane. One alone in its tab fills it already, and the
+    /// button did nothing there. A closed pane on its way out had another.
+    fn pane_bar_shows_zoom(&self, pos: &PositionedPane) -> bool {
+        let pane_id = pos.pane.pane_id();
+        if pos.is_zoomed
+            || self
+                .closed_pane_nav
+                .as_ref()
+                .is_some_and(|nav| nav.pane(pane_id).is_some())
+        {
+            return true;
+        }
+        Mux::get()
+            .get_active_tab_for_window(self.mux_window_id)
+            .is_some_and(|tab| tab.pane_split_direction_by_index(pos.index).is_some())
     }
 
     pub(crate) fn can_collapse_pane_stack(&self, pos: &PositionedPane) -> bool {
@@ -1079,6 +1279,83 @@ impl crate::TermWindow {
         // capsule and 4 under it — the row read as sagging.
         let button_y = pane_y as usize + nav_height.saturating_sub(button_size) / 2;
         let mut button_x = (pane_x + pane_width) as usize;
+        // Standing in for a window tab row that is away, the bars along the
+        // top take what it held: the window's buttons end the top-right one,
+        // the sidebar's toggle starts the top-left one. They slide in from
+        // the bar's ends and fade up as the row goes, and back out as it
+        // comes, which carries its own; only all the way in do they work.
+        // The right sidebar's toggle on its own goes up into the row instead
+        // (see `pane_bar_toggle_travels`).
+        let mut window_items = Vec::new();
+        let bar_clip = QuadClipRect::from_top_left_pixels(
+            pane_x,
+            pane_y,
+            pane_x + pane_width,
+            pane_y + nav_height as f32,
+            &self.dimensions,
+        );
+        let window_chrome = self.pane_bar_window_chrome(pos);
+        let room = self.pane_bar_window_chrome_room(pos, button_size);
+        if window_chrome.any() {
+            let mut held = HeapQuadAllocator::default();
+            let mut held_layers = TripleLayerQuadAllocator::Heap(&mut held);
+            let (left, toggle_x) = self.paint_pane_bar_window_chrome(
+                &mut held_layers,
+                &mut window_items,
+                window_chrome,
+                button_x,
+                pane_y as usize,
+                nav_height,
+                button_size,
+                icon_size,
+            )?;
+            drop(held_layers);
+            if self.pane_bar_toggle_travels(window_chrome) {
+                self.window_tab_reveal.note_toggle_in_bar(ToggleSlot {
+                    x: toggle_x as f32,
+                    y: (pane_y as usize + nav_height.saturating_sub(button_size) / 2) as f32,
+                    size: button_size as f32,
+                    icon: icon_size as f32,
+                });
+            }
+            let out = button_x.saturating_sub(left).saturating_sub(room) as f32;
+            held.apply_to_clipped_at(layers, out, 0.0, bar_clip, self.pane_bars_stand_in_share())
+                .context("pane bar window buttons")?;
+            if self.pane_bars_stand_in() {
+                self.window_tab_reveal
+                    .note_window_chrome(left, pane_y as usize + nav_height);
+            }
+        }
+        button_x = button_x.saturating_sub(room);
+        let toggle_share = self.pane_bar_sidebar_toggle_share(pos);
+        if toggle_share > 0.0 {
+            let toggle_x =
+                pane_x as usize + self.window_tab_leading_action_start_pixels().ceil() as usize;
+            let mut held = HeapQuadAllocator::default();
+            let mut held_layers = TripleLayerQuadAllocator::Heap(&mut held);
+            self.paint_window_sidebar_toggle_button(
+                &mut held_layers,
+                &mut window_items,
+                toggle_x,
+                button_y,
+                button_size,
+                self.window_tab_sidebar_toggle_icon_size(),
+                foreground,
+                muted_fg,
+            )?;
+            drop(held_layers);
+            // Out past the bar's start, just clear of its tabs on their way.
+            let out = ((toggle_x + button_size) as f32 - pane_x) * (1.0 - toggle_share);
+            held.apply_to_clipped_at(layers, -out, 0.0, bar_clip, toggle_share)
+                .context("pane bar sidebar toggle")?;
+            if toggle_share >= 1.0 {
+                self.window_tab_reveal
+                    .note_sidebar_toggle(toggle_x + button_size, pane_y as usize + nav_height);
+            }
+        }
+        if self.pane_bars_stand_in() {
+            self.ui_items.extend(window_items);
+        }
         let mut actions = vec![
             (SvgIcon::Plus, PaneNavAction::NewTab),
             (SvgIcon::SplitVertical, PaneNavAction::SplitDown),
@@ -1087,15 +1364,55 @@ impl crate::TermWindow {
         if self.can_collapse_pane_stack(pos) {
             actions.push((SvgIcon::Shrink, PaneNavAction::ToggleCollapse));
         }
-        actions.push((
-            if pos.is_zoomed {
-                SvgIcon::Minimize2
-            } else {
-                SvgIcon::Maximize2
-            },
-            PaneNavAction::ToggleZoom,
-        ));
+        if self.pane_bar_shows_zoom(pos) {
+            actions.push((
+                if pos.is_zoomed {
+                    SvgIcon::Minimize2
+                } else {
+                    SvgIcon::Maximize2
+                },
+                PaneNavAction::ToggleZoom,
+            ));
+        }
+        // A shared pane's button wears the accent while the share lasts,
+        // and a dot while someone asks to type; a pane watching another
+        // account's share has its pill in the button's place.
+        let share_state = self.pane_share_state(&pos.pane);
+        let watch_pill = self.share_pill(pos.pane.pane_id());
+        if self.pane_can_share(&pos.pane) || watch_pill.is_some() {
+            actions.push((SvgIcon::Share, PaneNavAction::Share));
+        }
+        let accent = self.chrome().accent;
         for (icon, action) in actions {
+            if action == PaneNavAction::Share {
+                if let Some(pill) = &watch_pill {
+                    let width = self
+                        .pane_share_pill_width(pos, button_size)
+                        .unwrap_or(button_size);
+                    button_x = button_x.saturating_sub(width + self.ui_px(PANE_NAV_BUTTON_GAP));
+                    if (button_x as f32) < pane_x {
+                        break;
+                    }
+                    self.paint_pane_share_pill(
+                        layers,
+                        pill,
+                        button_x,
+                        button_y,
+                        width,
+                        button_size,
+                        action_icon_size,
+                        pos,
+                        foreground,
+                    )?;
+                    continue;
+                }
+            }
+            let (color, hover_color) =
+                if share_state.is_some() && action == PaneNavAction::Share {
+                    (accent, accent)
+                } else {
+                    (muted_fg, foreground)
+                };
             button_x = button_x.saturating_sub(button_size + self.ui_px(PANE_NAV_BUTTON_GAP));
             // Stop once a button would spill past the pane's left edge (happens
             // when the pane is too narrow to hold all the action buttons).
@@ -1109,15 +1426,31 @@ impl crate::TermWindow {
                 button_y,
                 button_size,
                 action_icon_size,
-                muted_fg,
-                foreground,
+                color,
+                hover_color,
                 pos,
                 action,
             )?;
+            if share_state == Some(true) && action == PaneNavAction::Share {
+                let dot = self.ui_px(SHARE_ASKING_DOT);
+                self.fill_rounded_rectangle(
+                    layers,
+                    2,
+                    euclid::rect(
+                        (button_x + button_size).saturating_sub(dot + self.ui_px(4)) as f32,
+                        (button_y + self.ui_px(4)) as f32,
+                        dot as f32,
+                        dot as f32,
+                    ),
+                    AGENT_BLOCKED_COLOR,
+                    dot as f32 / 2.0,
+                )
+                .context("pane share asking dot")?;
+            }
         }
 
         let tabs = self.pane_nav_tabs(pos);
-        let tab_start = pane_x as usize + self.pane_nav_tab_left_inset(pos.left);
+        let tab_start = pane_x as usize + self.pane_nav_tab_left_inset(pos);
         let tab_gap = self.ui_px(PANE_NAV_TAB_GAP);
         let viewport_width = self.pane_nav_tab_viewport_width(pos) as usize;
         let max_tab_right = tab_start.saturating_add(viewport_width);
@@ -1184,6 +1517,14 @@ impl crate::TermWindow {
                 .collect(),
             None => vec![],
         };
+        // The tabs are recorded, so that where the strip runs on past its
+        // viewport it can fade out in their own alpha: over a see-through
+        // bar a fade of its ground would show as a band.
+        let into = &mut *layers;
+        let mut row = std::mem::take(&mut self.tab_row_scratch);
+        row.recycle();
+        let row_start = row.mark();
+        let layers = &mut TripleLayerQuadAllocator::Heap(&mut row);
         for place in places {
             if tab_width <= icon_size + self.ui_px(PANE_NAV_ICON_GAP) + button_size
                 || viewport_width == 0
@@ -1209,6 +1550,22 @@ impl crate::TermWindow {
 
             let tab_left = pane_x + place.x;
             let tab_right = tab_left + tab_width as f32;
+            // A tab pressed half out of the strip was hit where the strip
+            // stops; what the drag carries is all of it.
+            let carried = match self
+                .pane_tab_drag
+                .as_mut()
+                .filter(|drag| drag.pane_id == tab.pane_id)
+            {
+                Some(drag) => {
+                    drag.grip.width = tab_width;
+                    drag.active
+                }
+                None => false,
+            } || self
+                .pane_tab_landing
+                .as_ref()
+                .is_some_and(|landing| landing.what == tab.pane_id);
             if tab_right <= tab_start as f32 || tab_left >= max_tab_right as f32 {
                 continue;
             }
@@ -1272,6 +1629,12 @@ impl crate::TermWindow {
                         action: PaneNavAction::Activate(tab.pane_id),
                     },
                 });
+            }
+            // A tab a drag has is painted where the pointer is, then on its
+            // way into place, so it is not left here as well. Its place in
+            // the strip stays.
+            if carried {
+                continue;
             }
 
             // Reborrow: the surrounding loop cannot move the caller's `&mut`.
@@ -1455,11 +1818,10 @@ impl crate::TermWindow {
         // Dissolve the strip into the bar wherever it runs on past its
         // viewport, so a clipped tab reads as continuing rather than as one
         // sliced in half.
-        self.paint_tab_row_fades(
-            layers,
-            background,
-            pane_y.max(0.0) as usize,
-            nav_height,
+        self.apply_tab_row(
+            row,
+            &row_start,
+            into,
             tab_start,
             max_tab_right,
             scroll_offset > 0.5,
@@ -1538,6 +1900,104 @@ impl crate::TermWindow {
         )
     }
 
+    /// The tab a drag carries, laid out as the strip lays it out and
+    /// selected, as pressing it left it. Its close button stays behind:
+    /// nothing on it can be pressed while it is carried. Let go of, it goes
+    /// on to its place, taking on the width it finds there.
+    pub(crate) fn paint_pane_tab_ghost(&mut self, now: Instant) -> anyhow::Result<()> {
+        let window = (self.dimensions.pixel_width, self.dimensions.pixel_height);
+        let drag = self.pane_tab_drag.as_ref().filter(|drag| drag.active);
+        let (pane_id, raw_title, origin, grip) = if let Some(state) = drag {
+            let origin = state.grip.origin(state.current, window);
+            (state.pane_id, state.title.clone(), origin, state.grip)
+        } else if let Some(landing) = self.pane_tab_landing.clone() {
+            let rest = self.ui_items.iter().find(|item| {
+                matches!(
+                    &item.item_type,
+                    UIItemType::PaneNav { action: PaneNavAction::Activate(id), .. }
+                        if *id == landing.what
+                )
+            });
+            let Some(rest) = rest else {
+                self.pane_tab_landing = None;
+                return Ok(());
+            };
+            let origin = landing.place((rest.x as f32, rest.y as f32), now);
+            let landed = landing.progress(now);
+            let from = landing.grip.width as f32;
+            let width = (from + (rest.width as f32 - from) * landed).round() as usize;
+            // Its last frame here is the tab's first frame back, or there
+            // would be one with neither.
+            if landed >= 1.0 {
+                self.pane_tab_landing = None;
+            }
+            self.update_next_frame_time(Some(now + std::time::Duration::from_millis(16)));
+            let grip = crate::termwindow::DragGrip {
+                width,
+                ..landing.grip
+            };
+            (landing.what, landing.title, origin, grip)
+        } else {
+            return Ok(());
+        };
+        let (width, height) = (grip.width, grip.height);
+        let (title, running) = match split_leading_legacy_progress_marker(&raw_title) {
+            Some("") => ("Terminal", true),
+            Some(title) => (title, true),
+            None => (raw_title.as_str(), false),
+        };
+        let chrome = self.chrome();
+        let surface = crate::termwindow::render::paint::drag_ghost_surface(
+            chrome.active_tab_surface(),
+            self.tab_bar_surface(chrome.header_bg),
+        );
+        let ui_font = self
+            .fonts
+            .title_font_with_size(crate::native_settings::pane_header_font_size(
+                &crate::native_settings::load_shared(),
+            ))
+            .context("pane tab ghost font")?;
+        let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
+
+        let mut content = HeapQuadAllocator::default();
+        let mut layers = TripleLayerQuadAllocator::Heap(&mut content);
+        let icon_size = self.ui_px(TAB_ICON_SIZE).min(height);
+        let icon_right = self.paint_pane_tab_icon(
+            &mut layers,
+            pane_id,
+            0,
+            height,
+            icon_size,
+            running,
+            chrome.text,
+            surface,
+            self.focused.is_some(),
+        )?;
+        let text_x = icon_right + self.ui_px(PANE_NAV_ICON_GAP);
+        let text_right = self.tab_close_button_x(width, height, icon_size);
+        self.paint_pane_nav_text(
+            &mut layers,
+            &ui_font,
+            ui_metrics,
+            title,
+            text_x,
+            height.saturating_sub(ui_metrics.cell_size.height as usize) / 2,
+            text_right.saturating_sub(text_x + self.ui_px(PANE_NAV_ICON_GAP)),
+            chrome.text,
+        )?;
+        drop(layers);
+
+        self.paint_drag_ghost(
+            &content,
+            origin,
+            grip,
+            surface,
+            chrome.control_border,
+            1.0,
+            self.ui_f32(PANE_NAV_TAB_RADIUS),
+        )
+    }
+
     fn paint_pane_nav_text(
         &self,
         layers: &mut TripleLayerQuadAllocator,
@@ -1558,8 +2018,7 @@ impl crate::TermWindow {
             return Ok(());
         }
 
-        let text = self.ellipsize_ui_text(font, text, width)?;
-        self.paint_ui_title_text(layers, font, &metrics, &text, x, y, width, foreground)
+        self.paint_fading_title(layers, font, &metrics, text, x, y, width, foreground)
     }
 
     /// The icon heading a pane tab: the card dressing what the pane runs,
@@ -1612,6 +2071,10 @@ impl crate::TermWindow {
                 _ => None,
             })
             .map(|dot| (dot, surface));
+        // A plugin's page: its own icon, in the circle a terminal's has.
+        if let Some(page) = pane.as_ref().and_then(|pane| pane.page()) {
+            return self.paint_tab_page_icon(layers, &page, tab_y, tab_height);
+        }
         let icon = pane
             .as_ref()
             .map(|pane| crate::tab_icons::resolve(pane.as_ref()));
@@ -1723,6 +2186,48 @@ impl crate::TermWindow {
         if let Some(badge) = badge {
             self.paint_tab_icon_badge(layers, x, y, diameter, badge)?;
         }
+        Ok(x + diameter)
+    }
+
+    /// The icon heading the tab of a plugin's page: the one its plugin
+    /// named, in the circle the terminal's card has, so that it sits among
+    /// the terminals' as one of them. Returns where it ends.
+    pub(crate) fn paint_tab_page_icon(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        page: &thinkterm_proto::PageSpec,
+        tab_y: usize,
+        tab_height: usize,
+    ) -> anyhow::Result<usize> {
+        let card = crate::tab_icons::resolve_window_tab();
+        let inset = self.ui_px(TAB_ICON_CIRCLE_INSET).min(tab_height / 4);
+        let diameter = tab_height.saturating_sub(inset * 2).max(1);
+        let x = inset;
+        let y = tab_y + inset;
+        let gl_state = self.render_state.as_ref().unwrap();
+        let ctx = DrawContext::new(gl_state, self.dimensions, &self.render_metrics);
+        crate::tab_icons::draw_plate(
+            &ctx,
+            layers,
+            1,
+            x as f32,
+            y as f32,
+            diameter as f32,
+            card.circle,
+            self.chrome().is_dark(),
+        )
+        .context("page tab icon circle")?;
+        let glyph = ((diameter as f32 * TAB_ICON_GLYPH_RATIO).round() as usize).max(1);
+        let glyph_x = x + (diameter - glyph.min(diameter)) / 2;
+        let glyph_y = y + (diameter - glyph.min(diameter)) / 2;
+        self.paint_pane_nav_icon(
+            layers,
+            SvgIcon::for_panel(&page.icon),
+            glyph_x,
+            glyph_y,
+            glyph,
+            card.glyph_color.linear(),
+        )?;
         Ok(x + diameter)
     }
 
@@ -1894,8 +2399,13 @@ impl crate::TermWindow {
         if self.config.use_box_model_render {
             return self.paint_pane_box_model(pos);
         }
-
-        self.check_for_dirty_lines_and_invalidate_selection(&pos.pane);
+        // A plugin's page in the pane's place has the pane's ground and its
+        // bar, as a terminal has, and under the bar none of a terminal:
+        // no rows are asked after for it.
+        let page = pos.pane.page();
+        if page.is_none() {
+            self.check_for_dirty_lines_and_invalidate_selection(&pos.pane);
+        }
         /*
         let zone = {
             let dims = pos.pane.get_dimensions();
@@ -2095,6 +2605,9 @@ impl crate::TermWindow {
             .context("paint_pane_nav_bar")?;
         if self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id) {
             return Ok(());
+        }
+        if let Some(page) = &page {
+            return self.paint_plugin_page(pos, page, layers, pane_nav_height as f32);
         }
 
         // The Lua `enable_scroll_bar` gutter: one window-wide bar for the
@@ -2325,14 +2838,18 @@ impl crate::TermWindow {
             } else {
                 0
             };
+            // Cut at the pane area's bottom too: a window tab row brought down
+            // pushes the rows lower, and the last of them go under a terminal
+            // bar at the bottom rather than through it.
             let pane_clip = QuadClipRect::from_top_left_pixels(
                 left_pixel_x,
                 content_top,
                 left_pixel_x
                     + render_dims.cols as f32 * pane_render_metrics.cell_size.width as f32,
-                pane_top_pixel_y
+                (pane_top_pixel_y
                     + render_dims.viewport_rows as f32
-                        * pane_render_metrics.cell_size.height as f32,
+                        * pane_render_metrics.cell_size.height as f32)
+                    .min(self.pane_area_bottom()),
                 &self.dimensions,
             );
             let mut render = LineRender {

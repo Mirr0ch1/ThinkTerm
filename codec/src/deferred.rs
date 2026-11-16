@@ -14,8 +14,33 @@ impl DeferredPdu {
         max_serial: Option<u64>,
         push_budget: usize,
     ) -> anyhow::Result<Self> {
-        let mut decoded =
-            crate::decode_raw_async_limited(reader, max_serial, Some(push_budget)).await?;
+        Self::read_async_within(reader, max_serial, push_budget, None).await
+    }
+
+    /// Apply a connection's payload limit to replies as well as pushes,
+    /// including their decompressed representation before deserialization.
+    pub async fn read_async_bounded<R: AsyncRead + Unpin + std::fmt::Debug>(
+        reader: &mut R,
+        max_serial: Option<u64>,
+        push_budget: usize,
+        payload_limit: usize,
+    ) -> anyhow::Result<Self> {
+        Self::read_async_within(reader, max_serial, push_budget, Some(payload_limit)).await
+    }
+
+    async fn read_async_within<R: AsyncRead + Unpin + std::fmt::Debug>(
+        reader: &mut R,
+        max_serial: Option<u64>,
+        push_budget: usize,
+        payload_limit: Option<usize>,
+    ) -> anyhow::Result<Self> {
+        let mut decoded = crate::decode_raw_async_limited(
+            reader,
+            max_serial,
+            Some(push_budget),
+            payload_limit,
+        )
+        .await?;
         // Count decompressed bytes, not compressed wire bytes. A highly
         // compressible push must not bypass the registration budget.
         if decoded.serial == 0 && decoded.ident != 1 && decoded.is_compressed {
@@ -27,6 +52,12 @@ impl DeferredPdu {
             let data = read_bounded(reader, push_budget)?;
             decoded.data = data;
             decoded.is_compressed = false;
+        }
+        if decoded.serial == 0 && decoded.ident != 1 {
+            ensure!(
+                decoded.data.len() <= push_budget,
+                "registration push exceeds decompressed byte budget"
+            );
         }
         Ok(Self(decoded))
     }
@@ -174,6 +205,72 @@ mod protocol_tests {
                 .await
                 .unwrap_err();
             assert!(format!("{error:#}").contains("decompressed byte budget"));
+        });
+    }
+
+    #[test]
+    fn a_connection_limit_covers_raw_and_compressed_replies_and_pushes() {
+        futures_lite::future::block_on(async {
+            for link in [crate::Link::SameMachine, crate::Link::Network] {
+                for serial in [0, 7] {
+                    let pdu = Pdu::WindowTitleChanged(WindowTitleChanged {
+                        window_id: 0,
+                        title: "x".repeat(8192),
+                    });
+                    let mut wire = Vec::new();
+                    pdu.encode_async_over(&mut wire, serial, link).await.unwrap();
+                    let error = DeferredPdu::read_async_bounded(
+                        &mut &wire[..],
+                        None,
+                        16384,
+                        1024,
+                    )
+                    .await
+                    .unwrap_err();
+                    assert!(error.to_string().contains("more than this connection takes"));
+
+                    let deferred = DeferredPdu::read_async(&mut &wire[..], None, 16384)
+                        .await
+                        .unwrap();
+                    assert_eq!(deferred.decode().unwrap().pdu, pdu);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn a_connection_limit_preserves_the_smaller_registration_budget() {
+        futures_lite::future::block_on(async {
+            let pdu = Pdu::WindowTitleChanged(WindowTitleChanged {
+                window_id: 0,
+                title: "x".repeat(8192),
+            });
+            let mut wire = Vec::new();
+            pdu.encode_async(&mut wire, 0).await.unwrap();
+            assert!(wire.len() < 1024);
+            let error = DeferredPdu::read_async_bounded(&mut &wire[..], None, 1024, 16384)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("decompressed byte budget"));
+        });
+    }
+
+    #[test]
+    fn bounded_handshakes_accept_small_replies_with_no_push_budget_left() {
+        futures_lite::future::block_on(async {
+            for link in [crate::Link::SameMachine, crate::Link::Network] {
+                let pdu = Pdu::WindowTitleChanged(WindowTitleChanged {
+                    window_id: 0,
+                    title: "hello".repeat(40),
+                });
+                let mut wire = Vec::new();
+                pdu.encode_async_over(&mut wire, 7, link).await.unwrap();
+                let deferred = DeferredPdu::read_async_bounded(&mut &wire[..], None, 0, 1024)
+                    .await
+                    .unwrap();
+                assert!(!deferred.is_push());
+                assert_eq!(deferred.decode().unwrap().pdu, pdu);
+            }
         });
     }
 

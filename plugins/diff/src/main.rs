@@ -941,9 +941,11 @@ mod tests {
             locale: "en-US".into(),
             cwd: Some(DIR.into()),
             remote: None,
+            terminal: None,
             can_extend: false,
             close: None,
             features: Vec::new(),
+            pointer: Default::default(),
         }
     }
 

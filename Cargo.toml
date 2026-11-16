@@ -7,7 +7,10 @@ members = [
   "sync-color-schemes",
   "thinkterm-syntax",
   "thinkterm-core",
+  "thinkterm-reverse-access",
+  "thinkterm-connect-auth",
   "thinkterm-tailnet",
+  "thinkterm-tailnet-engine",
   "thinkterm-tailnet-node",
   "thinkterm-file-index",
   "thinkterm-font-core",
@@ -24,6 +27,7 @@ members = [
   "thinkterm-plugin-server",
   "plugins/diff",
   "plugins/example",
+  "plugins/showcase",
   "plugins/stocks",
   "thinkterm-session",
   "thinkterm-tab-icons",
@@ -189,6 +193,7 @@ colorgrad = "0.6"
 config = { path = "config" }
 thinkterm-core = { path = "thinkterm-core" }
 thinkterm-tailnet = { path = "thinkterm-tailnet" }
+thinkterm-tailnet-engine = { path = "thinkterm-tailnet-engine" }
 thinkterm-file-index = { path = "thinkterm-file-index" }
 thinkterm-font-core = { path = "thinkterm-font-core" }
 thinkterm-font-web = { path = "thinkterm-font-web" }
@@ -297,6 +302,8 @@ num-derive = "0.4"
 num-traits = {version="0.2", default-features=false }
 objc = "0.2"
 objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSDockTile", "NSResponder"] }
+objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "AVCaptureDevice", "AVMediaFormat"] }
 objc2-core-graphics = "0.3"
 objc2-foundation = "0.3"
 objc2-user-notifications = "0.3"
@@ -475,3 +482,6 @@ ts_control = {path="deps/tailscale-rs/ts_control", version="0.6.1"}
 # the dial and the frame's parse), and so that a connection gone quiet is
 # noticed rather than waited on for good.
 ts_derp = {path="deps/tailscale-rs/ts_derp", version="0.6.1"}
+# Vendored so that the library builds for iOS: 0.6.1 watches the network on
+# macOS, Linux and Windows only, and iOS has what the macOS monitor uses.
+ts_netmon = {path="deps/tailscale-rs/ts_netmon", version="0.6.1"}

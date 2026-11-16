@@ -532,6 +532,8 @@ pub(crate) const SUPPORTED_AGENTS: &[(&str, &[&str], IntegrationKind)] = &[
 ];
 
 static PATH_PROBE: Mutex<Option<HashMap<&'static str, bool>>> = Mutex::new(None);
+/// The same for the tools with task rules (`mux::task_status`), by id.
+static TOOL_PATH_PROBE: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
 
 /// Directories searched when probing for agent executables. A GUI process
 /// launched from Finder/Dock inherits launchd's minimal PATH (no
@@ -720,6 +722,15 @@ pub(crate) fn agent_on_path(agent_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// `agent_on_path` for a tool with task rules, by its id.
+pub(crate) fn tool_on_path(tool_id: &str) -> bool {
+    TOOL_PATH_PROBE
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().and_then(|map| map.get(tool_id).copied()))
+        .unwrap_or(false)
+}
+
 static PATH_PROBE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Re-run the executable probe on a worker thread (the login-shell PATH
@@ -754,6 +765,22 @@ pub(crate) fn refresh_path_probe() {
         }
         if let Ok(mut guard) = PATH_PROBE.lock() {
             *guard = Some(map);
+        }
+        let tools: HashMap<String, bool> = mux::task_status::tools()
+            .into_iter()
+            .map(|tool| {
+                let found = dirs.iter().any(|dir| {
+                    tool.programs.iter().any(|name| {
+                        candidate_file_names(name)
+                            .iter()
+                            .any(|file| is_executable_file(&dir.join(file)))
+                    })
+                });
+                (tool.id, found)
+            })
+            .collect();
+        if let Ok(mut guard) = TOOL_PATH_PROBE.lock() {
+            *guard = Some(tools);
         }
         promise::spawn::spawn_into_main_thread(async {
             // The settings window is the surface that reads this result,
@@ -906,6 +933,24 @@ mod tests {
                     matches!(brand_icon(id, appearance), Some(AgentIcon::Color(_))),
                     "{id} should stay colored in {appearance:?}"
                 );
+            }
+        }
+    }
+
+    /// Every agent the settings list calls supported must have a tab icon
+    /// of its own, or a pane's tab would keep the generic bot while its
+    /// agents row says which agent it is. Soul is native and has no mark;
+    /// it keeps the catch-all.
+    #[test]
+    fn every_supported_agent_has_a_tab_icon_card() {
+        let catalog =
+            thinkterm_tab_icons::Catalog::build(&Default::default(), |key| key.to_string());
+        for (id, _, _) in super::SUPPORTED_AGENTS {
+            let card = catalog.card_for(Some(id), None);
+            if *id == "soul" {
+                assert_eq!(card.id, "agent", "soul should keep the catch-all");
+            } else {
+                assert_eq!(card.id, *id, "{id} has no tab icon card");
             }
         }
     }

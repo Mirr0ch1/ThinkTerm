@@ -160,10 +160,12 @@ fn preview_refresh_interval() -> Duration {
 /// overview used to do in a single frame -- takes 397ms. The budget covers a
 /// card's *first* capture as well as its refreshes for that last reason.
 const MAX_PREVIEW_CAPTURES_PER_FRAME: usize = 1;
-/// The first capturing frame after opening may seed this many cards at once:
-/// a one-frame cost spike at the exact moment a spike is least visible (the
-/// open transition is still running) in exchange for the overview arriving
-/// mostly populated instead of popping thumbnails in one per frame.
+/// The first capturing frame after opening may capture this many cards at
+/// once. A capture only reads the terminal's rows; building the picture from
+/// it is what costs, and that waits for the open transition to end
+/// (`card_build_held` in the renderer). Captured early, a card shows the
+/// picture it had last time while the terminal is still travelling, and is
+/// ready to build the moment the transition is over.
 const FIRST_FRAME_CAPTURE_BUDGET: usize = 4;
 /// How often a card re-asks what its terminal is running.
 ///
@@ -534,6 +536,12 @@ pub(crate) struct LiveOverviewView {
     /// eye is following, and a second copy waiting in the slot is what made
     /// the transition look like two layers.
     terminal_in_flight: Option<TabId>,
+    /// When that terminal set off. Its card keeps the first picture captured
+    /// after this until it lands; see the capture in `paint`.
+    terminal_in_flight_since: Option<Instant>,
+    /// How far past its card that terminal is as it settles, and where it set
+    /// off: see `set_terminal_landing_settle`.
+    terminal_landing_settle: Option<(RectF, f32)>,
     visible_panes: HashSet<PaneId>,
     live_resizing: bool,
     card_motion: HashMap<LiveThreadKey, CardMotion>,
@@ -600,6 +608,8 @@ impl LiveOverviewView {
             preview_chrome: Vec::new(),
             card_preview_rects: HashMap::new(),
             terminal_in_flight: None,
+            terminal_in_flight_since: None,
+            terminal_landing_settle: None,
             visible_panes: HashSet::new(),
             live_resizing: false,
             card_motion: HashMap::new(),
@@ -1010,6 +1020,23 @@ impl LiveOverviewView {
                                 0.0,
                                 self.viewport.origin.y - self.scroll.offset,
                             ));
+                    let in_flight = self.terminal_in_flight == Some(card.tab_id);
+                    // Where the card's picture is at rest, which is what the
+                    // terminal landing in it has built...
+                    let resting_preview = card_preview_rect(
+                        rect,
+                        card_header_height,
+                        card_inset,
+                        self.host_preview_aspect,
+                    );
+                    // ...and the card, carried past it by that terminal as it
+                    // settles.
+                    let rect = match self.terminal_landing_settle.filter(|_| in_flight) {
+                        Some((source, past)) => {
+                            card_carried_past(rect, resting_preview, source, past)
+                        }
+                        None => rect,
+                    };
 
                     // Keep one complete row warm above and below the viewport
                     // so a scroll does not reveal an uncaptured thumbnail. All
@@ -1022,16 +1049,42 @@ impl LiveOverviewView {
                                 .get(&card.tab_id)
                                 .map(|cached| Arc::clone(&cached.snapshot))
                         } else {
-                            let fingerprint = terminal_preview_fingerprint(card.tab_id);
-                            let (snapshot, refresh_due) = resolve_snapshot(
-                                &mut self.snapshot_cache,
-                                &card.tab_id,
-                                fingerprint,
-                                now,
-                                refresh_interval,
-                                &mut capture_budget,
-                                || capture_terminal_snapshot(card.tab_id),
-                            );
+                            // The card the terminal is landing in captures on
+                            // an allowance of its own: its picture has to be
+                            // built by the time the terminal arrives, and the
+                            // shared budget is spent from the top of the grid
+                            // down, so a card further down could wait out the
+                            // flight for its turn. Once captured it keeps that
+                            // picture until it lands: a terminal that keeps
+                            // printing would otherwise hand it a new snapshot
+                            // every refresh, each one restarting a build that
+                            // might never finish in between.
+                            let landing_capture = self
+                                .terminal_in_flight_since
+                                .filter(|_| in_flight)
+                                .and_then(|since| {
+                                    self.snapshot_cache
+                                        .get(&card.tab_id)
+                                        .filter(|cached| cached.captured_at >= since)
+                                })
+                                .map(|cached| Arc::clone(&cached.snapshot));
+                            let mut landing_budget = 1;
+                            let (snapshot, refresh_due) = match landing_capture {
+                                Some(snapshot) => (Some(snapshot), None),
+                                None => resolve_snapshot(
+                                    &mut self.snapshot_cache,
+                                    &card.tab_id,
+                                    terminal_preview_fingerprint(card.tab_id),
+                                    now,
+                                    refresh_interval,
+                                    if in_flight {
+                                        &mut landing_budget
+                                    } else {
+                                        &mut capture_budget
+                                    },
+                                    || capture_terminal_snapshot(card.tab_id),
+                                ),
+                            };
                             if let Some(refresh_due) = refresh_due {
                                 // A `Some` here means the card's fingerprint no
                                 // longer matches what was captured. A future
@@ -1132,14 +1185,12 @@ impl LiveOverviewView {
                     let close_x = rect.max_x() - ctx.px(CARD_CLOSE_RIGHT_PAD) - close_size;
                     let close_y = rect.origin.y + (ctx.px(CAPSULE_HEIGHT) - close_size) / 2.0;
 
-                    let preview_width = (rect.size.width - card_inset * 2.0).max(1.0);
-                    let preview = euclid::rect(
-                        rect.origin.x + card_inset,
-                        panel.origin.y + card_inset,
-                        preview_width,
-                        preview_width / self.host_preview_aspect,
+                    let preview = card_preview_rect(
+                        rect,
+                        card_header_height,
+                        card_inset,
+                        self.host_preview_aspect,
                     );
-                    let in_flight = self.terminal_in_flight == Some(tab_id);
                     // A card whose terminal is currently flying to it is left
                     // empty, but not neutral: the panel takes that terminal's
                     // own background so the arriving picture settles onto the
@@ -1167,7 +1218,31 @@ impl LiveOverviewView {
                                 preview_fill,
                                 ctx.px(PREVIEW_RADIUS),
                             )?;
-                            if !in_flight {
+                            if in_flight {
+                                // Built, not shown. The terminal arriving here
+                                // gives way to this picture as it lands
+                                // (`flight_lands_in_card`), so it has to be
+                                // recorded by then -- and the renderer keeps
+                                // only the pictures a frame asks for. Left out
+                                // of the requests, the card lost its picture on
+                                // every open and the landing revealed a bare
+                                // panel while it was rebuilt.
+                                if let Some(snapshot) = snapshot.as_ref() {
+                                    self.previews.push(TerminalPreviewRequest {
+                                        tab_id,
+                                        snapshot: Arc::clone(snapshot),
+                                        // At rest: carried past, it would be
+                                        // built again for every frame of it.
+                                        area: resting_preview,
+                                        clip,
+                                        hold_scale: self.live_resizing,
+                                        opacity: 0.0,
+                                        prebuild: true,
+                                        corner_radius: 0.0,
+                                        background: None,
+                                    });
+                                }
+                            } else {
                                 // A card that changed tab fades the old
                                 // picture out under the new one. The old
                                 // tab's snapshot is kept warm for the length
@@ -1184,6 +1259,9 @@ impl LiveOverviewView {
                                             clip,
                                             hold_scale: self.live_resizing,
                                             opacity: 1.0 - arrived,
+                                            prebuild: false,
+                                            corner_radius: 0.0,
+                                            background: None,
                                         });
                                     }
                                 }
@@ -1195,6 +1273,9 @@ impl LiveOverviewView {
                                         clip,
                                         hold_scale: self.live_resizing,
                                         opacity: arrived,
+                                        prebuild: false,
+                                        corner_radius: 0.0,
+                                        background: None,
                                     });
                                     self.visible_panes
                                         .extend(snapshot.panes.iter().map(|pane| pane.pane_id));
@@ -2382,7 +2463,16 @@ impl ContentView for LiveOverviewView {
         self.card_preview_rects.get(&tab_id).copied()
     }
 
+    fn set_terminal_landing_settle(&mut self, settle: Option<(RectF, f32)>) {
+        self.terminal_landing_settle = settle;
+    }
+
     fn set_terminal_in_flight(&mut self, tab_id: Option<TabId>) {
+        if tab_id.is_none() {
+            self.terminal_in_flight_since = None;
+        } else if tab_id != self.terminal_in_flight {
+            self.terminal_in_flight_since = Some(Instant::now());
+        }
         self.terminal_in_flight = tab_id;
     }
 
@@ -2423,7 +2513,7 @@ impl ContentView for LiveOverviewView {
                 chrome.preview,
                 chrome.clip,
                 chrome.fill,
-                chrome.border,
+                Some(chrome.border),
                 ctx.px(PREVIEW_RADIUS),
             )?;
         }
@@ -2833,7 +2923,7 @@ fn palette_identity(palette: &wezterm_term::color::ColorPalette) -> u64 {
     hasher.finish()
 }
 
-fn capture_terminal_snapshot(tab_id: TabId) -> Option<TerminalPreviewSnapshot> {
+pub(crate) fn capture_terminal_snapshot(tab_id: TabId) -> Option<TerminalPreviewSnapshot> {
     let tab = Mux::get().get_tab(tab_id)?;
     let tab_size = tab.get_size();
     if tab_size.cols == 0 || tab_size.rows == 0 {
@@ -3138,6 +3228,36 @@ fn group_grid(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Where a card's picture is in `card`: below a header `header` high and
+/// `inset` inside the panel, `aspect` wide to high.
+fn card_preview_rect(card: RectF, header: f32, inset: f32, aspect: f32) -> RectF {
+    let width = (card.size.width - inset * 2.0).max(1.0);
+    euclid::rect(
+        card.origin.x + inset,
+        card.origin.y + header + inset,
+        width,
+        width / aspect,
+    )
+}
+
+/// `card`, carried by the terminal landing in it from `source` as that goes
+/// `past` of its way beyond the card's picture, `preview`: the whole card
+/// goes past and back, rather than the picture alone shrinking inside a card
+/// that stays put.
+fn card_carried_past(card: RectF, preview: RectF, source: RectF, past: f32) -> RectF {
+    let beyond = |from: f32, to: f32| to + (to - from) * past;
+    let left = beyond(source.min_x(), preview.min_x());
+    let top = beyond(source.min_y(), preview.min_y());
+    let scale_x = (beyond(source.max_x(), preview.max_x()) - left) / preview.size.width.max(1.0);
+    let scale_y = (beyond(source.max_y(), preview.max_y()) - top) / preview.size.height.max(1.0);
+    euclid::rect(
+        left + (card.origin.x - preview.origin.x) * scale_x,
+        top + (card.origin.y - preview.origin.y) * scale_y,
+        card.size.width * scale_x,
+        card.size.height * scale_y,
+    )
+}
+
 fn group_layouts(
     counts: &[usize],
     content_width: f32,
@@ -3195,6 +3315,29 @@ mod tests {
     use super::*;
     // Lives in `ui::geometry` now, and only the tests reach for it directly.
     use crate::ui::grid_columns;
+
+    #[test]
+    fn a_card_carried_past_goes_with_the_terminal_landing_in_it() {
+        let card = euclid::rect(100.0, 100.0, 300.0, 240.0);
+        let preview = card_preview_rect(card, 40.0, 10.0, 1.6);
+        assert_eq!(preview, euclid::rect(110.0, 150.0, 280.0, 175.0));
+        let source = euclid::rect(0.0, 0.0, 1600.0, 1000.0);
+        assert_eq!(card_carried_past(card, preview, source, 0.0), card);
+        // 2% past a terminal shrinking from 1600 wide into 280: the whole
+        // card narrows as its picture would, 26.4 of 280, inside where it was.
+        let carried = card_carried_past(card, preview, source, 0.02);
+        let scale = (280.0 - 1320.0 * 0.02) / 280.0;
+        assert!(
+            (carried.size.width - 300.0 * scale).abs() < 1e-3,
+            "{:?}",
+            carried
+        );
+        assert!(
+            carried.min_x() > card.min_x() && carried.max_x() < card.max_x(),
+            "{:?}",
+            carried
+        );
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn test_group_grid(

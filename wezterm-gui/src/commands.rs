@@ -1,3 +1,4 @@
+use crate::i18n::{tr, tr_args};
 use crate::inputmap::InputMap;
 use config::keyassignment::*;
 use config::window::WindowLevel;
@@ -80,6 +81,17 @@ pub struct ExpandedCommand {
     /// the Space a thread belongs to. `menubar` cannot serve here: it is
     /// `&'static` and these values are built from live state.
     pub accessory: Option<Cow<'static, str>>,
+    /// The English `brief`, when it differs from the one shown: the
+    /// palette's recents are kept by it, so they survive a language switch
+    /// and still match what was recorded before the names were translated.
+    pub english_brief: Option<Cow<'static, str>>,
+}
+
+impl ExpandedCommand {
+    /// What the palette's recents remember this command by.
+    pub fn recent_key(&self) -> &str {
+        self.english_brief.as_deref().unwrap_or(&self.brief)
+    }
 }
 
 impl std::fmt::Debug for CommandDef {
@@ -184,6 +196,7 @@ impl CommandDef {
                     brief: def.brief.into(),
                     doc: def.doc.into(),
                     keys,
+                    english_brief: english_brief_of(&action),
                     action,
                     menubar: def.menubar,
                     icon: def.icon.map(Cow::Borrowed),
@@ -206,26 +219,57 @@ impl CommandDef {
         result
     }
 
+    /// What the plugins that can be used do when asked by name, each a
+    /// command under its plugin's name. Not for the menubar, whose menus
+    /// are ThinkTerm's own.
+    pub fn plugin_actions() -> Vec<ExpandedCommand> {
+        crate::plugins::actions()
+            .into_iter()
+            .map(|action| ExpandedCommand {
+                brief: action.title.into(),
+                doc: "".into(),
+                keys: vec![],
+                // Kept among the palette's recents by its name, which stays
+                // when ThinkTerm's language, and with it the title, changes.
+                english_brief: Some(action.name.clone().into()),
+                action: KeyAssignment::PluginAction(action.name),
+                menubar: &[],
+                icon: None,
+                accessory: None,
+            })
+            .collect()
+    }
+
+    /// What Settings › Keymap lists, by the names it lists them under:
+    /// ThinkTerm's own commands, then what the plugins do, named as the
+    /// command palette names them.
+    pub fn keymap_commands(config: &ConfigHandle) -> Vec<(String, KeyAssignment)> {
+        Self::expanded_commands(config)
+            .into_iter()
+            .chain(Self::plugin_actions())
+            .map(|command| (command.brief.to_string(), command.action))
+            .collect()
+    }
+
     pub fn actions_for_palette_and_menubar(config: &ConfigHandle) -> Vec<ExpandedCommand> {
         let mut result = Self::expanded_commands(config);
 
         // Generate some stuff based on the config
         for cmd in &config.launch_menu {
-            let label = match cmd.label.as_ref() {
-                Some(label) => label.to_string(),
-                None => match cmd.args.as_ref() {
-                    Some(args) => args.join(" "),
-                    None => "(default shell)".to_string(),
-                },
+            let brief = || {
+                let mut args = fluent_bundle::FluentArgs::new();
+                args.set("label", launch_menu_label(cmd));
+                tr_args("command-launch-menu-new-tab", &args)
             };
             result.push(ExpandedCommand {
-                brief: format!("{label} (New Tab)").into(),
+                brief: brief().into(),
                 doc: "".into(),
                 keys: vec![],
                 action: KeyAssignment::SpawnCommandInNewTab(cmd.clone()),
                 menubar: &["Shell"],
                 icon: Some("md_tab_plus".into()),
                 accessory: None,
+                english_brief: in_english(brief),
             });
         }
 
@@ -252,7 +296,8 @@ impl CommandDef {
                 if dom.spawnable() {
                     if dom.state() == DomainState::Attached {
                         result.push(ExpandedCommand {
-                            brief: format!("New Tab (Domain {label})").into(),
+                            brief: named("command-new-tab-in-domain", label).into(),
+                            english_brief: in_english(|| named("command-new-tab-in-domain", label)),
                             doc: "".into(),
                             keys: vec![],
                             action: KeyAssignment::SpawnCommandInNewTab(SpawnCommand {
@@ -265,7 +310,8 @@ impl CommandDef {
                         });
                     } else {
                         result.push(ExpandedCommand {
-                            brief: format!("Attach Domain {label}").into(),
+                            brief: named("command-attach-domain", label).into(),
+                            english_brief: in_english(|| named("command-attach-domain", label)),
                             doc: "".into(),
                             keys: vec![],
                             action: KeyAssignment::AttachDomain(name.to_string()),
@@ -286,7 +332,8 @@ impl CommandDef {
                         continue;
                     }
                     result.push(ExpandedCommand {
-                        brief: format!("Detach Domain {label}").into(),
+                        brief: named("command-detach-domain", label).into(),
+                        english_brief: in_english(|| named("command-detach-domain", label)),
                         doc: "".into(),
                         keys: vec![],
                         action: KeyAssignment::DetachDomain(SpawnTabDomain::DomainName(
@@ -303,7 +350,10 @@ impl CommandDef {
             for workspace in mux.iter_workspaces() {
                 if workspace != active_workspace {
                     result.push(ExpandedCommand {
-                        brief: format!("Switch to workspace {workspace}").into(),
+                        brief: named("command-switch-to-workspace", &workspace).into(),
+                        english_brief: in_english(|| {
+                            named("command-switch-to-workspace", &workspace)
+                        }),
                         doc: "".into(),
                         keys: vec![],
                         action: KeyAssignment::SwitchToWorkspace {
@@ -317,7 +367,8 @@ impl CommandDef {
                 }
             }
             result.push(ExpandedCommand {
-                brief: "Create new Workspace".into(),
+                brief: tr("command-create-new-workspace").into(),
+                english_brief: in_english(|| tr("command-create-new-workspace")),
                 doc: "".into(),
                 keys: vec![],
                 action: KeyAssignment::SwitchToWorkspace {
@@ -329,6 +380,8 @@ impl CommandDef {
                 accessory: None,
             });
         }
+
+        result.extend(Self::plugin_actions());
 
         // And sweep to pick up stuff from their key assignments
         let inputmap = InputMap::new(config);
@@ -344,6 +397,7 @@ impl CommandDef {
                 result.push(ExpandedCommand {
                     brief: cmd.brief.into(),
                     doc: cmd.doc.into(),
+                    english_brief: english_brief_of(&entry.action),
                     keys: vec![(*mods, keycode.clone())],
                     action: entry.action.clone(),
                     menubar: cmd.menubar,
@@ -365,6 +419,7 @@ impl CommandDef {
                     result.push(ExpandedCommand {
                         brief: cmd.brief.into(),
                         doc: cmd.doc.into(),
+                        english_brief: english_brief_of(&entry.action),
                         keys: vec![],
                         action: entry.action.clone(),
                         menubar: cmd.menubar,
@@ -416,6 +471,7 @@ impl CommandDef {
 
         let main_menu = match Menu::get_main_menu() {
             Some(existing) => {
+                drop_renamed_menus(&existing);
                 mark_candidates(
                     &existing,
                     &mut candidates_for_removal,
@@ -449,7 +505,8 @@ impl CommandDef {
                     continue;
                 }
 
-                let mut submenu = main_menu.get_or_create_sub_menu(&cmd.menubar[0], |menu| {
+                let shown = menu_title(cmd.menubar[0]);
+                let mut submenu = main_menu.get_or_create_sub_menu(&shown, |menu| {
                     if cmd.menubar[0] == "Window" {
                         menu.assign_as_windows_menu();
                         // macOS will insert stuff at the top and bottom, so we add
@@ -458,8 +515,11 @@ impl CommandDef {
                     } else if cmd.menubar[0] == "ThinkTerm" {
                         menu.assign_as_app_menu();
 
-                        let about_item =
-                            MenuItem::new_with("About ThinkTerm", Some(thinkterm_about_sel), "");
+                        let about_item = MenuItem::new_with(
+                            &tr("menu-bar-about"),
+                            Some(thinkterm_about_sel),
+                            "",
+                        );
                         about_item.set_target_application_delegate();
                         about_item.set_system_symbol_image("info.circle");
 
@@ -468,7 +528,7 @@ impl CommandDef {
 
                         let services_menu = Menu::new_with_title("Services");
                         services_menu.assign_as_services_menu();
-                        let services_item = MenuItem::new_with("Services", None, "");
+                        let services_item = MenuItem::new_with(&tr("menu-bar-services"), None, "");
                         menu.add_item(&services_item);
                         services_item.set_sub_menu(&services_menu);
 
@@ -480,7 +540,7 @@ impl CommandDef {
 
                 // Fill out any submenu hierarchy
                 for sub_title in cmd.menubar.iter().skip(1) {
-                    submenu = submenu.get_or_create_sub_menu(sub_title, |_menu| {});
+                    submenu = submenu.get_or_create_sub_menu(&menu_title(sub_title), |_menu| {});
                 }
 
                 let mut candidate = inputmap.locate_app_wide_key_assignment(&cmd.action);
@@ -583,6 +643,87 @@ impl CommandDef {
     }
 }
 
+/// The fixed English names that place a command in the menu bar, and the
+/// keys they are shown by. They stay the commands' identity; only what is
+/// shown follows the language.
+const MENU_TITLES: &[(&str, &str)] = &[
+    ("Shell", "menu-bar-shell"),
+    ("Edit", "menu-bar-edit"),
+    ("View", "menu-bar-view"),
+    ("Window", "menu-bar-window"),
+    ("Help", "menu-bar-help"),
+    ("Attach", "menu-bar-attach"),
+    ("Detach", "menu-bar-detach"),
+    ("Copy Mode", "menu-bar-copy-mode"),
+    ("Font Size", "menu-bar-font-size"),
+    ("Level", "menu-bar-level"),
+    ("Move Tab", "menu-bar-move-tab"),
+    ("Resize Pane", "menu-bar-resize-pane"),
+    ("Rotate Pane", "menu-bar-rotate-pane"),
+    ("Select Pane", "menu-bar-select-pane"),
+    ("Select Tab", "menu-bar-select-tab"),
+    ("Select Thread", "menu-bar-select-thread"),
+    ("Select Window", "menu-bar-select-window"),
+    ("Workspace", "menu-bar-workspace"),
+];
+
+/// A menu bar name as shown; the app's own menu keeps the app's name.
+pub fn menu_title(name: &str) -> String {
+    match MENU_TITLES.iter().find(|(english, _)| *english == name) {
+        Some((_, id)) => tr(id),
+        None => name.to_string(),
+    }
+}
+
+/// Menus are found again by their title, so after a change of language the
+/// old ones would linger, emptied, beside the new. Drop each one named in
+/// another language: the commands in it are rebuilt under the new title.
+#[cfg(target_os = "macos")]
+fn drop_renamed_menus(menu: &window::os::macos::menu::Menu) {
+    let current: Vec<String> = MENU_TITLES.iter().map(|(_, id)| tr(id)).collect();
+    let mut stale = vec![];
+    for (_, id) in MENU_TITLES {
+        for title in thinkterm_i18n::tr_every_locale(id) {
+            if !current.contains(&title) && !stale.contains(&title) {
+                stale.push(title);
+            }
+        }
+    }
+    drop_menus_titled(menu, &stale);
+
+    // The two the app menu is built with once are renamed where they stand.
+    let Some(app_menu) = menu.item_at_index(0).and_then(|item| item.get_sub_menu()) else {
+        return;
+    };
+    for id in ["menu-bar-about", "menu-bar-services"] {
+        let current = tr(id);
+        for title in thinkterm_i18n::tr_every_locale(id) {
+            if title != current {
+                if let Some(item) = app_menu.item_with_title(&title) {
+                    item.set_title(&current);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn drop_menus_titled(menu: &window::os::macos::menu::Menu, stale: &[String]) {
+    for title in stale {
+        while let Some(item) = menu.item_with_title(title) {
+            if item.get_sub_menu().is_none() {
+                break;
+            }
+            menu.remove_item(&item);
+        }
+    }
+    for item in menu.items() {
+        if let Some(submenu) = item.get_sub_menu() {
+            drop_menus_titled(&submenu, stale);
+        }
+    }
+}
+
 /// Given "1" return "1st", "2" -> "2nd" and so on
 fn english_ordinal(n: isize) -> String {
     let n = n.to_string();
@@ -594,6 +735,48 @@ fn english_ordinal(n: isize) -> String {
         format!("{n}rd")
     } else {
         format!("{n}th")
+    }
+}
+
+/// `name` again in English, unless that is what the interface shows
+/// already; see `ExpandedCommand::english_brief`.
+fn in_english(name: impl FnOnce() -> String) -> Option<Cow<'static, str>> {
+    (crate::i18n::current_locale() != "en-US").then(|| crate::i18n::in_english(name).into())
+}
+
+fn english_brief_of(action: &KeyAssignment) -> Option<Cow<'static, str>> {
+    in_english(|| {
+        derive_command_from_key_assignment(action)
+            .map(|def| def.brief.into_owned())
+            .unwrap_or_default()
+    })
+}
+
+/// A command name that carries a domain's, workspace's or other name.
+fn named(id: &str, name: &str) -> String {
+    let mut args = fluent_bundle::FluentArgs::new();
+    args.set("name", name.to_string());
+    tr_args(id, &args)
+}
+
+/// A command name that carries a number, and for English its ordinal.
+fn counted(id: &str, n: i64, ordinal: Option<&str>) -> String {
+    let mut args = fluent_bundle::FluentArgs::new();
+    args.set("n", n);
+    if let Some(ordinal) = ordinal {
+        args.set("ordinal", ordinal.to_string());
+    }
+    tr_args(id, &args)
+}
+
+/// What a launch menu entry is called: its label, else its command line.
+pub fn launch_menu_label(cmd: &SpawnCommand) -> String {
+    match cmd.label.as_ref() {
+        Some(label) => label.to_string(),
+        None => match cmd.args.as_ref() {
+            Some(args) => args.join(" "),
+            None => tr("command-default-shell"),
+        },
     }
 }
 
@@ -623,7 +806,7 @@ fn label_string(action: &KeyAssignment, candidate: String) -> String {
 pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<CommandDef> {
     Some(match action {
         PasteFrom(ClipboardPasteSource::PrimarySelection) => CommandDef {
-            brief: "Paste primary selection".into(),
+            brief: tr("command-paste-primary-selection").into(),
             doc: "Pastes text from the primary selection".into(),
             keys: vec![(Modifiers::SHIFT, "Insert".into())],
             args: &[ArgType::ActivePane],
@@ -635,7 +818,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             destination: ClipboardCopyDestination::PrimarySelection,
         }
         | CopyTo(ClipboardCopyDestination::PrimarySelection) => CommandDef {
-            brief: "Copy to primary selection".into(),
+            brief: tr("command-copy-to-primary-selection").into(),
             doc: "Copies text to the primary selection".into(),
             keys: vec![(Modifiers::CTRL, "Insert".into())],
             args: &[ArgType::ActivePane],
@@ -647,7 +830,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             destination: ClipboardCopyDestination::Clipboard,
         }
         | CopyTo(ClipboardCopyDestination::Clipboard) => CommandDef {
-            brief: "Copy to clipboard".into(),
+            brief: tr("command-copy-to-clipboard").into(),
             doc: "Copies text to the clipboard".into(),
             keys: vec![
                 (Modifiers::SUPER, "c".into()),
@@ -662,7 +845,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             destination: ClipboardCopyDestination::ClipboardAndPrimarySelection,
         }
         | CopyTo(ClipboardCopyDestination::ClipboardAndPrimarySelection) => CommandDef {
-            brief: "Copy to clipboard and primary selection".into(),
+            brief: tr("command-copy-to-clipboard-and-primary-selection").into(),
             doc: "Copies text to the clipboard and the primary selection".into(),
             keys: vec![(Modifiers::CTRL, "Insert".into())],
             args: &[ArgType::ActivePane],
@@ -670,7 +853,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_content_copy"),
         },
         PasteFrom(ClipboardPasteSource::Clipboard) => CommandDef {
-            brief: "Paste from clipboard".into(),
+            brief: tr("command-paste-from-clipboard").into(),
             doc: "Pastes text from the clipboard".into(),
             keys: vec![
                 (Modifiers::SUPER, "v".into()),
@@ -681,7 +864,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_content_paste"),
         },
         ToggleFullScreen => CommandDef {
-            brief: "Toggle full screen mode".into(),
+            brief: tr("command-toggle-full-screen-mode").into(),
             doc: "Switch between normal and full screen mode".into(),
             keys: vec![(Modifiers::ALT, "Return".into())],
             args: &[ArgType::ActiveWindow],
@@ -689,7 +872,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_fullscreen"),
         },
         ToggleAlwaysOnTop => CommandDef {
-            brief: "Toggle always on Top".into(),
+            brief: tr("command-toggle-always-on-top").into(),
             doc: "Toggles the window between floating and non-floating states to stay on top of other windows.".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -698,7 +881,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
 
         },
         ToggleAlwaysOnBottom => CommandDef {
-            brief: "Toggle always on Bottom".into(),
+            brief: tr("command-toggle-always-on-bottom").into(),
             doc: "Toggles the window to remain behind all other windows.".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -706,7 +889,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         SetWindowLevel(WindowLevel::AlwaysOnTop) => CommandDef {
-            brief: "Always on Top".into(),
+            brief: tr("command-always-on-top").into(),
             doc: "Set the window level to be on top of other windows.".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -714,7 +897,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         SetWindowLevel(WindowLevel::Normal) => CommandDef {
-            brief: "Normal".into(),
+            brief: tr("command-normal").into(),
             doc: "Set window level to normal".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -722,7 +905,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         SetWindowLevel(WindowLevel::AlwaysOnBottom) => CommandDef {
-            brief: "Always on Bottom".into(),
+            brief: tr("command-always-on-bottom").into(),
             doc: "Set window to remain behind all other windows.".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -730,7 +913,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         Hide => CommandDef {
-            brief: "Hide/Minimize Window".into(),
+            brief: tr("command-hide-minimize-window").into(),
             doc: "Hides/Mimimizes the current window".into(),
             keys: vec![(Modifiers::SUPER, "m".into())],
             args: &[ArgType::ActiveWindow],
@@ -738,7 +921,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_window_minimize"),
         },
         Show => CommandDef {
-            brief: "Show/Restore Window".into(),
+            brief: tr("command-show-restore-window").into(),
             doc: "Show/Restore the current window".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -746,7 +929,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_window_restore"),
         },
         HideApplication => CommandDef {
-            brief: "Hide Application".into(),
+            brief: tr("command-hide-application").into(),
             doc: "Hides all of the windows of the application. \
               This is macOS specific."
                 .into(),
@@ -756,7 +939,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         OpenSettings => CommandDef {
-            brief: "Settings...".into(),
+            brief: tr("command-settings").into(),
             doc: "Opens the ThinkTerm settings UI".into(),
             keys: vec![(Modifiers::SUPER, ",".into())],
             args: &[ArgType::ActiveWindow],
@@ -764,7 +947,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("cod_settings_gear"),
         },
         QuitAndStopSessionServer => CommandDef {
-            brief: "Quit and Stop Session Server".into(),
+            brief: tr("command-quit-and-stop-session-server").into(),
             doc: "Quits ThinkTerm and stops the background session server; the terminals in it end".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -772,7 +955,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_power"),
         },
         CheckForUpdates => CommandDef {
-            brief: "Check for Updates...".into(),
+            brief: tr("command-check-for-updates").into(),
             doc: "Opens Settings on the Software Update page".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -780,7 +963,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_update"),
         },
         OpenSshHosts => CommandDef {
-            brief: "Remote Hosts...".into(),
+            brief: tr("command-remote-hosts").into(),
             doc: "Opens the ThinkTerm SSH host manager".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -788,7 +971,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_server_network"),
         },
         AddRemoteHost => CommandDef {
-            brief: "Add Remote Host...".into(),
+            brief: tr("command-add-remote-host").into(),
             // Says SSH so that typing it in the palette still finds this.
             doc: "Opens the ThinkTerm SSH host manager on a blank host".into(),
             keys: vec![],
@@ -797,15 +980,23 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_earth"),
         },
         ToggleLiveOverview => CommandDef {
-            brief: "Live Overview".into(),
+            brief: tr("command-live-overview").into(),
             doc: "Shows all live ThinkTerm threads grouped by Space".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
             menubar: &["Shell"],
             icon: Some("cod_multiple_windows"),
         },
+        ToggleLibrary => CommandDef {
+            brief: tr("command-library").into(),
+            doc: "Shows every Space, grouped by machine, in place of the left sidebar".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Shell"],
+            icon: Some("md_bookshelf"),
+        },
         OpenThreadSearch => CommandDef {
-            brief: "Find Thread".into(),
+            brief: tr("command-find-thread").into(),
             doc: "Searches every saved thread and jumps to the one picked".into(),
             keys: vec![
                 // Off macOS Ctrl+P is the shell's previous command, so the
@@ -819,7 +1010,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("cod_search"),
         },
         ToggleWorkspaceSidebar => CommandDef {
-            brief: "Toggle Left Sidebar".into(),
+            brief: tr("command-toggle-left-sidebar").into(),
             doc: "Shows or hides the left sidebar".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -827,7 +1018,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("cod_layout_sidebar_left"),
         },
         ToggleRightSidebar => CommandDef {
-            brief: "Toggle Right Sidebar".into(),
+            brief: tr("command-toggle-right-sidebar").into(),
             doc: "Shows or hides the right sidebar".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -835,7 +1026,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("cod_layout_sidebar_right"),
         },
         CreateWorkspaceThreadInActiveProject => CommandDef {
-            brief: "New Thread".into(),
+            brief: tr("command-new-thread").into(),
             doc: "Starts a thread in the project the sidebar has active".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -843,7 +1034,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("cod_add"),
         },
         ActivateSpaceRelative(-1) => CommandDef {
-            brief: "Previous Space".into(),
+            brief: tr("command-previous-space").into(),
             doc: "Moves this window to the Space before it, as a sidebar swipe does".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -851,7 +1042,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_chevron_left"),
         },
         ActivateSpaceRelative(1) => CommandDef {
-            brief: "Next Space".into(),
+            brief: tr("command-next-space").into(),
             doc: "Moves this window to the Space after it, as a sidebar swipe does".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -859,7 +1050,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_chevron_right"),
         },
         ActivateSpaceRelative(n) => CommandDef {
-            brief: format!("Move {n} Spaces").into(),
+            brief: counted("command-move-spaces", *n as i64, None).into(),
             doc: "Moves this window that many Spaces along, as sidebar swipes do".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -867,7 +1058,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         SpawnWindow => CommandDef {
-            brief: "New Window".into(),
+            brief: tr("command-new-window").into(),
             doc: "Launches the default program into a new window".into(),
             keys: vec![(Modifiers::SUPER, "n".into())],
             args: &[],
@@ -875,7 +1066,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("cod_empty_window"),
         },
         ClearScrollback(ScrollbackEraseMode::ScrollbackOnly) => CommandDef {
-            brief: "Clear scrollback".into(),
+            brief: tr("command-clear-scrollback").into(),
             doc: "Clears any text that has scrolled out of the \
               viewport of the current pane"
                 .into(),
@@ -885,7 +1076,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("cod_clear_all"),
         },
         ClearScrollback(ScrollbackEraseMode::ScrollbackAndViewport) => CommandDef {
-            brief: "Clear the scrollback and viewport".into(),
+            brief: tr("command-clear-the-scrollback-and-viewport").into(),
             doc: "Removes all content from the screen and scrollback".into(),
             keys: vec![],
             args: &[ArgType::ActivePane],
@@ -893,7 +1084,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("cod_clear_all"),
         },
         Search(Pattern::CurrentSelectionOrEmptyString) => CommandDef {
-            brief: "Search pane output".into(),
+            brief: tr("command-search-pane-output").into(),
             doc: "Enters the search mode UI for the current pane".into(),
             keys: vec![(Modifiers::SUPER, "f".into())],
             args: &[ArgType::ActivePane],
@@ -901,7 +1092,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("oct_search"),
         },
         Search(_) => CommandDef {
-            brief: "Search pane output".into(),
+            brief: tr("command-search-pane-output").into(),
             doc: "Enters the search mode UI for the current pane".into(),
             keys: vec![],
             args: &[ArgType::ActivePane],
@@ -909,7 +1100,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("oct_search"),
         },
         ShowDebugOverlay => CommandDef {
-            brief: "Show debug overlay".into(),
+            brief: tr("command-show-debug-overlay").into(),
             doc: "Activates the debug overlay and Lua REPL".into(),
             keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "l".into())],
             args: &[ArgType::ActiveWindow],
@@ -917,7 +1108,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("cod_debug"),
         },
         InputSelector(_) => CommandDef {
-            brief: "Prompt the user to choose from a list".into(),
+            brief: tr("command-prompt-the-user-to-choose-from-a-list").into(),
             doc: "Activates the selector overlay and wait for input".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -925,7 +1116,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         Confirmation(_) => CommandDef {
-            brief: "Prompt the user for confirmation".into(),
+            brief: tr("command-prompt-the-user-for-confirmation").into(),
             doc: "Activates the confirmation overlay and wait for input".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -933,7 +1124,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         PromptInputLine(_) => CommandDef {
-            brief: "Prompt the user for a line of text".into(),
+            brief: tr("command-prompt-the-user-for-a-line-of-text").into(),
             doc: "Activates the prompt overlay and wait for input".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -941,7 +1132,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         PromptRenameTab => CommandDef {
-            brief: "Rename Tab".into(),
+            brief: tr("command-rename-tab").into(),
             doc: "Prompts for a new title for the current tab".into(),
             keys: vec![],
             args: &[ArgType::ActiveTab],
@@ -949,7 +1140,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_edit"),
         },
         PromptRenamePaneTab(_) => CommandDef {
-            brief: "Rename Pane Tab".into(),
+            brief: tr("command-rename-pane-tab").into(),
             doc: "Prompts for a new title for the pane-local tab".into(),
             keys: vec![],
             args: &[ArgType::ActivePane],
@@ -957,7 +1148,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_edit"),
         },
         PromptRenameProject(_) => CommandDef {
-            brief: "Rename Workspace".into(),
+            brief: tr("command-rename-workspace").into(),
             doc: "Prompts for a new name for the ThinkTerm workspace".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -965,7 +1156,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_edit"),
         },
         RevealProjectInFolder(_) => CommandDef {
-            brief: "Reveal in Folder".into(),
+            brief: tr("command-reveal-in-folder").into(),
             doc: "Reveals the ThinkTerm workspace folder in the system file manager".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -973,7 +1164,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_folder_open"),
         },
         GrantProjectFolderAccess(_) => CommandDef {
-            brief: "Grant Folder Access".into(),
+            brief: tr("command-grant-folder-access").into(),
             doc: "Asks macOS to grant ThinkTerm access to the Project folder, then opens the Project".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -981,7 +1172,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_folder_open"),
         },
         OpenFileWith { .. } => CommandDef {
-            brief: "Open File With Application".into(),
+            brief: tr("command-open-file-with-application").into(),
             doc: "Opens a file with a selected application".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -989,7 +1180,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_open_in_new"),
         },
         OpenFileWithSystemDefault(_) => CommandDef {
-            brief: "Open File".into(),
+            brief: tr("command-open-file").into(),
             doc: "Opens a file with the system default application".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -997,7 +1188,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_open_in_new"),
         },
         PickOpenFileWithApp(_) => CommandDef {
-            brief: "Open File With Other Application".into(),
+            brief: tr("command-open-file-with-other-application").into(),
             doc: "Prompts for an application to open a file with".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1005,7 +1196,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_open_in_new"),
         },
         RevealFileInFolder(_) => CommandDef {
-            brief: "Reveal File in Folder".into(),
+            brief: tr("command-reveal-file-in-folder").into(),
             doc: "Reveals a file in the system file manager".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1013,7 +1204,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_folder_open"),
         },
         RenameSidebarFile(_) => CommandDef {
-            brief: "Rename File".into(),
+            brief: tr("command-rename-file").into(),
             doc: "Renames a file from the sidebar file list".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1021,7 +1212,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_edit"),
         },
         TrashSidebarFile(_) => CommandDef {
-            brief: "Move File to Trash".into(),
+            brief: tr("command-move-file-to-trash").into(),
             doc: "Moves a file from the sidebar file list to the system trash".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1029,7 +1220,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_delete"),
         },
         CopyFilePathToClipboard(_) => CommandDef {
-            brief: "Copy File Path".into(),
+            brief: tr("command-copy-file-path").into(),
             doc: "Copies a file path to the clipboard".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1037,7 +1228,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_content_copy"),
         },
         PromptRenameWorkspaceThread(_) => CommandDef {
-            brief: "Rename Thread".into(),
+            brief: tr("command-rename-thread").into(),
             doc: "Prompts for a new name for the ThinkTerm thread".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1045,7 +1236,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_edit"),
         },
         PromptRenameSpace(_) => CommandDef {
-            brief: "Rename Space".into(),
+            brief: tr("command-rename-space").into(),
             doc: "Prompts for a new name for the ThinkTerm space".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1053,7 +1244,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_edit"),
         },
         CreateSpace => CommandDef {
-            brief: "New Space".into(),
+            brief: tr("command-new-space").into(),
             doc: "Creates a new ThinkTerm space".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1061,7 +1252,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_add"),
         },
         CreateSpaceOnDomain(_) => CommandDef {
-            brief: "New Space Here".into(),
+            brief: tr("command-new-space-here").into(),
             doc: "Creates a new ThinkTerm space on this mux server".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1069,7 +1260,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_add"),
         },
         SwitchSpace(_) => CommandDef {
-            brief: "Switch Space".into(),
+            brief: tr("command-switch-space").into(),
             doc: "Switches the active ThinkTerm space for this window".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1077,7 +1268,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         DeleteSpace(_) => CommandDef {
-            brief: "Delete Space".into(),
+            brief: tr("command-delete-space").into(),
             doc: "Deletes a ThinkTerm space and its workspace/thread records".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1085,7 +1276,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_delete"),
         },
         DeleteSpaceEverywhere(_) => CommandDef {
-            brief: "Delete Space Everywhere".into(),
+            brief: tr("command-delete-space-everywhere").into(),
             doc: "Deletes the Space on the mux server that hosts it, so it \
                   disappears from every device"
                 .into(),
@@ -1095,7 +1286,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_delete"),
         },
         DeleteSpaceAndRemoteSessions(_) => CommandDef {
-            brief: "Delete Space & End Remote Sessions".into(),
+            brief: tr("command-delete-space-end-remote-sessions").into(),
             doc: "Kills the Space's sessions on the remote mux server, then \
                   deletes the Space everywhere"
                 .into(),
@@ -1105,7 +1296,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_delete"),
         },
         CreateWorkspaceThread(_) => CommandDef {
-            brief: "New Thread".into(),
+            brief: tr("command-new-thread").into(),
             doc: "Creates a new ThinkTerm thread for the workspace".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1113,7 +1304,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_add"),
         },
         ToggleWorkspaceThreadsCollapsed(_) => CommandDef {
-            brief: "Collapse or Expand Threads".into(),
+            brief: tr("command-collapse-or-expand-threads").into(),
             doc: "Toggles the ThinkTerm workspace thread list".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1121,7 +1312,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         RemoveProject(_) => CommandDef {
-            brief: "Remove Workspace".into(),
+            brief: tr("command-remove-workspace").into(),
             doc: "Removes the ThinkTerm workspace from the sidebar".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1129,7 +1320,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_delete"),
         },
         ArchiveProject(_) => CommandDef {
-            brief: "Archive Workspace".into(),
+            brief: tr("command-archive-workspace").into(),
             doc: "Closes the workspace's panes and hides it from the sidebar; \
                   its threads and layouts are kept for unarchiving"
                 .into(),
@@ -1139,7 +1330,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         UnarchiveProject(_) => CommandDef {
-            brief: "Unarchive Workspace".into(),
+            brief: tr("command-unarchive-workspace").into(),
             doc: "Restores an archived workspace to the sidebar".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1147,7 +1338,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         ArchiveActiveProject => CommandDef {
-            brief: "Archive Active Workspace".into(),
+            brief: tr("command-archive-active-workspace").into(),
             doc: "Closes the active workspace's panes and hides it from the \
                   sidebar; its threads and layouts are kept for unarchiving"
                 .into(),
@@ -1157,7 +1348,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         ToggleShowArchivedProjects => CommandDef {
-            brief: "Show Archived Workspaces".into(),
+            brief: tr("command-show-archived-workspaces").into(),
             doc: "Reveals archived workspaces at the bottom of the sidebar \
                   until toggled off or the window closes"
                 .into(),
@@ -1167,7 +1358,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         ConnectWorkspaceThread(_) => CommandDef {
-            brief: "Connect Thread".into(),
+            brief: tr("command-connect-thread").into(),
             doc: "Connects or reconnects the ThinkTerm remote thread".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1175,7 +1366,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         DisconnectWorkspaceThread(_) => CommandDef {
-            brief: "Disconnect Thread".into(),
+            brief: tr("command-disconnect-thread").into(),
             doc: "Disconnects the remote session while keeping the ThinkTerm thread".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1183,7 +1374,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         ToggleWorkspaceThreadPinned(_) => CommandDef {
-            brief: "Pin Thread".into(),
+            brief: tr("command-pin-thread").into(),
             doc: "Toggles the pinned state for the ThinkTerm thread".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1191,7 +1382,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         DeleteWorkspaceThread(_) => CommandDef {
-            brief: "Delete Thread".into(),
+            brief: tr("command-delete-thread").into(),
             doc: "Deletes the ThinkTerm thread from the thread store".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1199,7 +1390,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         MarkWorkspaceThreadUnread(_) => CommandDef {
-            brief: "Mark Thread as Unread".into(),
+            brief: tr("command-mark-thread-as-unread").into(),
             doc: "Marks the ThinkTerm thread as unread".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1207,7 +1398,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         QuickSelect => CommandDef {
-            brief: "Enter QuickSelect mode".into(),
+            brief: tr("command-enter-quickselect-mode").into(),
             doc: "Activates the quick selection UI for the current pane".into(),
             keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "Space".into())],
             args: &[ArgType::ActivePane],
@@ -1215,7 +1406,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         QuickSelectArgs(_) => CommandDef {
-            brief: "Enter QuickSelect mode".into(),
+            brief: tr("command-enter-quickselect-mode").into(),
             doc: "Activates the quick selection UI for the current pane".into(),
             keys: vec![],
             args: &[ArgType::ActivePane],
@@ -1223,7 +1414,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         CharSelect(_) => CommandDef {
-            brief: "Enter Emoji / Character selection mode".into(),
+            brief: tr("command-enter-emoji-character-selection-mode").into(),
             doc: "Activates the character selection UI for the current pane".into(),
             keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "u".into())],
             args: &[ArgType::ActivePane],
@@ -1234,7 +1425,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             mode: PaneSelectMode::Activate,
             ..
         }) => CommandDef {
-            brief: "Enter Pane selection mode".into(),
+            brief: tr("command-enter-pane-selection-mode").into(),
             doc: "Activates the pane selection UI".into(),
             keys: vec![], // FIXME: find a new assignment
             args: &[ArgType::ActivePane],
@@ -1245,7 +1436,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             mode: PaneSelectMode::SwapWithActive,
             ..
         }) => CommandDef {
-            brief: "Swap a pane with the active pane".into(),
+            brief: tr("command-swap-a-pane-with-the-active-pane").into(),
             doc: "Activates the pane selection UI".into(),
             keys: vec![], // FIXME: find a new assignment
             args: &[ArgType::ActivePane],
@@ -1256,7 +1447,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             mode: PaneSelectMode::SwapWithActiveKeepFocus,
             ..
         }) => CommandDef {
-            brief: "Swap a pane with the active pane, keeping focus".into(),
+            brief: tr("command-swap-a-pane-with-the-active-pane-keeping-focus").into(),
             doc: "Activates the pane selection UI".into(),
             keys: vec![], // FIXME: find a new assignment
             args: &[ArgType::ActivePane],
@@ -1267,7 +1458,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             mode: PaneSelectMode::MoveToNewTab,
             ..
         }) => CommandDef {
-            brief: "Move a pane into its own tab".into(),
+            brief: tr("command-move-a-pane-into-its-own-tab").into(),
             doc: "Activates the pane selection UI".into(),
             keys: vec![], // FIXME: find a new assignment
             args: &[ArgType::ActivePane],
@@ -1278,7 +1469,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             mode: PaneSelectMode::MoveToNewWindow,
             ..
         }) => CommandDef {
-            brief: "Move a pane into its own window".into(),
+            brief: tr("command-move-a-pane-into-its-own-window").into(),
             doc: "Activates the pane selection UI".into(),
             keys: vec![], // FIXME: find a new assignment
             args: &[ArgType::ActivePane],
@@ -1286,7 +1477,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("cod_multiple_windows"),
         },
         DecreaseFontSize => CommandDef {
-            brief: "Decrease font size".into(),
+            brief: tr("command-decrease-font-size").into(),
             doc: "Scales the font size smaller by 10%".into(),
             keys: vec![
                 (Modifiers::SUPER, "-".into()),
@@ -1297,7 +1488,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_format_size"),
         },
         IncreaseFontSize => CommandDef {
-            brief: "Increase font size".into(),
+            brief: tr("command-increase-font-size").into(),
             doc: "Scales the font size larger by 10%".into(),
             keys: vec![
                 (Modifiers::SUPER, "=".into()),
@@ -1308,7 +1499,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_format_size"),
         },
         ResetFontSize => CommandDef {
-            brief: "Reset font size".into(),
+            brief: tr("command-reset-font-size").into(),
             doc: "Restores the font size to match your configuration file".into(),
             keys: vec![
                 (Modifiers::SUPER, "0".into()),
@@ -1319,7 +1510,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_format_size"),
         },
         ResetFontAndWindowSize => CommandDef {
-            brief: "Reset the window and font size".into(),
+            brief: tr("command-reset-the-window-and-font-size").into(),
             doc: "Restores the original window and font size".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1327,7 +1518,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_format_size"),
         },
         SpawnTabToRight(_) => CommandDef {
-            brief: "New Terminal Tab to Right".into(),
+            brief: tr("command-new-terminal-tab-to-right").into(),
             doc: "Create a new tab immediately to the right of the current tab".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1335,7 +1526,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_tab_plus"),
         },
         SpawnTab(SpawnTabDomain::CurrentPaneDomain) => CommandDef {
-            brief: "New Tab".into(),
+            brief: tr("command-new-tab").into(),
             doc: "Create a new tab in the same domain as the current pane".into(),
             keys: vec![(Modifiers::SUPER, "t".into())],
             args: &[ArgType::ActiveWindow],
@@ -1343,7 +1534,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_tab_plus"),
         },
         SpawnTab(SpawnTabDomain::DefaultDomain) => CommandDef {
-            brief: "New Tab (Default Domain)".into(),
+            brief: tr("command-new-tab-default-domain").into(),
             doc: "Create a new tab in the default domain".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1387,9 +1578,9 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_open_in_new"),
         },
         ActivateTab(-1) => CommandDef {
-            brief: "Activate right-most tab".into(),
+            brief: tr("command-activate-right-most-tab").into(),
             doc: "Activates the tab on the far right".into(),
-            keys: vec![(Modifiers::SUPER, "9".into())],
+            keys: vec![(Modifiers::CTRL, "9".into())],
             args: &[ArgType::ActiveWindow],
             menubar: &["Window", "Select Tab"],
             icon: None,
@@ -1398,12 +1589,12 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             let n = *n;
             let ordinal = english_ordinal(n + 1);
             let keys = if n >= 0 && n <= 7 {
-                vec![(Modifiers::SUPER, (n + 1).to_string())]
+                vec![(Modifiers::CTRL, (n + 1).to_string())]
             } else {
                 vec![]
             };
             CommandDef {
-                brief: format!("Activate {ordinal} Tab").into(),
+                brief: counted("command-activate-tab", n as i64 + 1, Some(&ordinal)).into(),
                 doc: format!("Activates the {ordinal} tab").into(),
                 keys,
                 args: &[ArgType::ActiveWindow],
@@ -1456,7 +1647,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         CloseCurrentTab { confirm: true } => CommandDef {
-            brief: "Close current Tab".into(),
+            brief: tr("command-close-current-tab").into(),
             doc: "Closes the current tab, terminating all the \
             processes that are running in its panes."
                 .into(),
@@ -1466,7 +1657,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_close_box_outline"),
         },
         CloseCurrentTab { confirm: false } => CommandDef {
-            brief: "Close current Tab".into(),
+            brief: tr("command-close-current-tab").into(),
             doc: "Closes the current tab, terminating all the \
             processes that are running in its panes."
                 .into(),
@@ -1476,7 +1667,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_close_box_outline"),
         },
         CloseCurrentPane { confirm: true } => CommandDef {
-            brief: "Close current Pane".into(),
+            brief: tr("command-close-current-pane").into(),
             doc: "Closes the current pane, terminating the \
             processes that are running inside it."
                 .into(),
@@ -1486,7 +1677,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_close_box_outline"),
         },
         CloseCurrentPane { confirm: false } => CommandDef {
-            brief: "Close current Pane".into(),
+            brief: tr("command-close-current-pane").into(),
             doc: "Closes the current pane, terminating the \
             processes that are running inside it."
                 .into(),
@@ -1499,7 +1690,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             let n = *n;
             let ordinal = english_ordinal(n as isize + 1);
             CommandDef {
-                brief: format!("Activate {ordinal} Window").into(),
+                brief: counted("command-activate-window", n as i64 + 1, Some(&ordinal)).into(),
                 doc: format!("Activates the {ordinal} window").into(),
                 keys: vec![],
                 args: &[ArgType::ActiveWindow],
@@ -1508,7 +1699,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             }
         }
         ActivateWindowRelative(-1) => CommandDef {
-            brief: "Activate the preceeding window".into(),
+            brief: tr("command-activate-the-preceeding-window").into(),
             doc: "Activates the preceeding window. If this is the first \
             window then cycles around and activates last window"
                 .into(),
@@ -1518,7 +1709,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         ActivateWindowRelative(1) => CommandDef {
-            brief: "Activate the next window".into(),
+            brief: tr("command-activate-the-next-window").into(),
             doc: "Activates the next window. If this is the last \
             window then cycles around and activates first window"
                 .into(),
@@ -1548,7 +1739,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             }
         }
         ActivateWindowRelativeNoWrap(-1) => CommandDef {
-            brief: "Activate the preceeding window".into(),
+            brief: tr("command-activate-the-preceeding-window").into(),
             doc: "Activates the preceeding window, stopping at the first \
             window"
                 .into(),
@@ -1558,7 +1749,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         ActivateWindowRelativeNoWrap(1) => CommandDef {
-            brief: "Activate the next window".into(),
+            brief: tr("command-activate-the-next-window").into(),
             doc: "Activates the next window, stopping at the last \
             window"
                 .into(),
@@ -1584,7 +1775,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             }
         }
         ActivateTabRelative(-1) => CommandDef {
-            brief: "Activate the tab to the left".into(),
+            brief: tr("command-activate-the-tab-to-the-left").into(),
             doc: "Activates the tab to the left. If this is the left-most \
             tab then cycles around and activates the right-most tab"
                 .into(),
@@ -1598,7 +1789,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         ActivateTabRelative(1) => CommandDef {
-            brief: "Activate the tab to the right".into(),
+            brief: tr("command-activate-the-tab-to-the-right").into(),
             doc: "Activates the tab to the right. If this is the right-most \
             tab then cycles around and activates the left-most tab"
                 .into(),
@@ -1628,7 +1819,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             }
         }
         ActivateTabRelativeNoWrap(-1) => CommandDef {
-            brief: "Activate the tab to the left (no wrapping)".into(),
+            brief: tr("command-activate-the-tab-to-the-left-no-wrapping").into(),
             doc: "Activates the tab to the left. Stopping at the left-most tab".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1636,7 +1827,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         ActivateTabRelativeNoWrap(1) => CommandDef {
-            brief: "Activate the tab to the right (no wrapping)".into(),
+            brief: tr("command-activate-the-tab-to-the-right-no-wrapping").into(),
             doc: "Activates the tab to the right. Stopping at the right-most tab".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1656,7 +1847,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             }
         }
         ReloadConfiguration => CommandDef {
-            brief: "Reload configuration".into(),
+            brief: tr("command-reload-configuration").into(),
             doc: "Reloads the configuration file".into(),
             keys: vec![(Modifiers::SUPER, "r".into())],
             args: &[],
@@ -1664,7 +1855,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_reload"),
         },
         QuitApplication => CommandDef {
-            brief: "Quit ThinkTerm".into(),
+            brief: tr("command-quit-thinkterm").into(),
             doc: "Quits ThinkTerm".into(),
             keys: vec![(Modifiers::SUPER, "q".into())],
             args: &[],
@@ -1672,7 +1863,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("oct_stop"),
         },
         MoveTabRelative(-1) => CommandDef {
-            brief: "Move tab one place to the left".into(),
+            brief: tr("command-move-tab-one-place-to-the-left").into(),
             doc: "Rearranges the tabs so that the current tab moves \
             one place to the left"
                 .into(),
@@ -1682,7 +1873,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("fa_long_arrow_left"),
         },
         MoveTabRelative(1) => CommandDef {
-            brief: "Move tab one place to the right".into(),
+            brief: tr("command-move-tab-one-place-to-the-right").into(),
             doc: "Rearranges the tabs so that the current tab moves \
             one place to the right"
                 .into(),
@@ -1730,7 +1921,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             let amount = amount.into_inner();
             if amount == -1.0 {
                 CommandDef {
-                    brief: "Scroll Up One Page".into(),
+                    brief: tr("command-scroll-up-one-page").into(),
                     doc: "Scrolls the viewport up by 1 page".into(),
                     keys: vec![(Modifiers::SHIFT, "PageUp".into())],
                     args: &[ArgType::ActivePane],
@@ -1739,7 +1930,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
                 }
             } else if amount == 1.0 {
                 CommandDef {
-                    brief: "Scroll Down One Page".into(),
+                    brief: tr("command-scroll-down-one-page").into(),
                     doc: "Scrolls the viewport down by 1 page".into(),
                     keys: vec![(Modifiers::SHIFT, "PageDown".into())],
                     args: &[ArgType::ActivePane],
@@ -1815,7 +2006,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         ScrollToBottom => CommandDef {
-            brief: "Scroll to the bottom".into(),
+            brief: tr("command-scroll-to-the-bottom").into(),
             doc: "Scrolls to the bottom of the viewport".into(),
             keys: vec![],
             args: &[ArgType::ActivePane],
@@ -1823,7 +2014,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_format_align_bottom"),
         },
         ScrollToTop => CommandDef {
-            brief: "Scroll to the top".into(),
+            brief: tr("command-scroll-to-the-top").into(),
             doc: "Scrolls to the top of the viewport".into(),
             keys: vec![],
             args: &[ArgType::ActivePane],
@@ -1831,7 +2022,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_format_align_top"),
         },
         ActivateCopyMode => CommandDef {
-            brief: "Activate Copy Mode".into(),
+            brief: tr("command-activate-copy-mode").into(),
             doc: "Enter mouse-less copy mode to select text using only \
             the keyboard"
                 .into(),
@@ -1844,7 +2035,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             domain: SpawnTabDomain::CurrentPaneDomain,
             ..
         }) => CommandDef {
-            brief: label_string(action, "Split Vertically (Top/Bottom)".to_string()).into(),
+            brief: label_string(action, tr("command-split-vertically")).into(),
             doc: "Split the current pane vertically into two panes, by spawning \
             the default program into the bottom half"
                 .into(),
@@ -1862,7 +2053,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             domain: SpawnTabDomain::CurrentPaneDomain,
             ..
         }) => CommandDef {
-            brief: label_string(action, "Split Horizontally (Left/Right)".to_string()).into(),
+            brief: label_string(action, tr("command-split-horizontally")).into(),
             doc: "Split the current pane horizontally into two panes, by spawning \
             the default program into the right hand side"
                 .into(),
@@ -1877,7 +2068,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("cod_split_horizontal"),
         },
         SplitHorizontal(_) => CommandDef {
-            brief: label_string(action, "Split Horizontally (Left/Right)".to_string()).into(),
+            brief: label_string(action, tr("command-split-horizontally")).into(),
             doc: "Split the current pane horizontally into two panes, by spawning \
             the default program into the right hand side"
                 .into(),
@@ -1887,7 +2078,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("cod_split_horizontal"),
         },
         SplitVertical(_) => CommandDef {
-            brief: label_string(action, "Split Vertically (Top/Bottom)".to_string()).into(),
+            brief: label_string(action, tr("command-split-vertically")).into(),
             doc: "Split the current pane veritically into two panes, by spawning \
             the default program into the bottom"
                 .into(),
@@ -1897,7 +2088,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("cod_split_vertical"),
         },
         AdjustPaneSize(PaneDirection::Left, amount) => CommandDef {
-            brief: format!("Resize Pane {amount} cell(s) to the Left").into(),
+            brief: counted("command-resize-pane-left", *amount as i64, None).into(),
             doc: "Adjusts the closest split divider to the left".into(),
             keys: vec![(
                 Modifiers::CTRL
@@ -1910,7 +2101,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         AdjustPaneSize(PaneDirection::Right, amount) => CommandDef {
-            brief: format!("Resize Pane {amount} cell(s) to the Right").into(),
+            brief: counted("command-resize-pane-right", *amount as i64, None).into(),
             doc: "Adjusts the closest split divider to the right".into(),
             keys: vec![(
                 Modifiers::CTRL
@@ -1923,7 +2114,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         AdjustPaneSize(PaneDirection::Up, amount) => CommandDef {
-            brief: format!("Resize Pane {amount} cell(s) Upwards").into(),
+            brief: counted("command-resize-pane-up", *amount as i64, None).into(),
             doc: "Adjusts the closest split divider towards the top".into(),
             keys: vec![(
                 Modifiers::CTRL
@@ -1936,7 +2127,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         AdjustPaneSize(PaneDirection::Down, amount) => CommandDef {
-            brief: format!("Resize Pane {amount} cell(s) Downwards").into(),
+            brief: counted("command-resize-pane-down", *amount as i64, None).into(),
             doc: "Adjusts the closest split divider towards the bottom".into(),
             keys: vec![(
                 Modifiers::CTRL
@@ -1951,7 +2142,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         AdjustPaneSize(PaneDirection::Next | PaneDirection::Prev, _) => return None,
         ActivatePaneDirection(PaneDirection::Next | PaneDirection::Prev) => return None,
         ActivatePaneDirection(PaneDirection::Left) => CommandDef {
-            brief: "Activate Pane Left".into(),
+            brief: tr("command-activate-pane-left").into(),
             doc: "Activates the pane to the left of the current pane".into(),
             keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "LeftArrow".into())],
             args: &[ArgType::ActivePane],
@@ -1959,7 +2150,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("fa_long_arrow_left"),
         },
         ActivatePaneDirection(PaneDirection::Right) => CommandDef {
-            brief: "Activate Pane Right".into(),
+            brief: tr("command-activate-pane-right").into(),
             doc: "Activates the pane to the right of the current pane".into(),
             keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "RightArrow".into())],
             args: &[ArgType::ActivePane],
@@ -1967,7 +2158,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("fa_long_arrow_right"),
         },
         ActivatePaneDirection(PaneDirection::Up) => CommandDef {
-            brief: "Activate Pane Up".into(),
+            brief: tr("command-activate-pane-up").into(),
             doc: "Activates the pane to the top of the current pane".into(),
             keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "UpArrow".into())],
             args: &[ArgType::ActivePane],
@@ -1975,7 +2166,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("fa_long_arrow_up"),
         },
         ActivatePaneDirection(PaneDirection::Down) => CommandDef {
-            brief: "Activate Pane Down".into(),
+            brief: tr("command-activate-pane-down").into(),
             doc: "Activates the pane to the bottom of the current pane".into(),
             keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "DownArrow".into())],
             args: &[ArgType::ActivePane],
@@ -1983,7 +2174,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("fa_long_arrow_down"),
         },
         TogglePaneZoomState => CommandDef {
-            brief: "Toggle Pane Zoom".into(),
+            brief: tr("command-toggle-pane-zoom").into(),
             doc: "Toggles the zoom state for the current pane".into(),
             keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "z".into())],
             args: &[ArgType::ActivePane],
@@ -1991,7 +2182,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_fullscreen"),
         },
         ActivateLastTab => CommandDef {
-            brief: "Activate the last active tab".into(),
+            brief: tr("command-activate-the-last-active-tab").into(),
             doc: "If there was no prior active tab, has no effect.".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -1999,7 +2190,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         ClearKeyTableStack => CommandDef {
-            brief: "Clear the key table stack".into(),
+            brief: tr("command-clear-the-key-table-stack").into(),
             doc: "Removes all entries from the stack".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -2007,7 +2198,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         OpenLinkAtMouseCursor => CommandDef {
-            brief: "Open link at mouse cursor".into(),
+            brief: tr("command-open-link-at-mouse-cursor").into(),
             doc: "If there is no link under the mouse cursor, has no effect.".into(),
             keys: vec![],
             args: &[ArgType::ActivePane],
@@ -2015,7 +2206,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         ShowLauncherArgs(_) | ShowLauncher => CommandDef {
-            brief: "Show the launcher".into(),
+            brief: tr("command-show-the-launcher").into(),
             doc: "Shows the launcher menu".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -2023,7 +2214,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         ShowTabNavigator => CommandDef {
-            brief: "Navigate tabs".into(),
+            brief: tr("command-navigate-tabs").into(),
             doc: "Shows the tab navigator".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -2031,7 +2222,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("cod_list_flat"),
         },
         DetachDomain(SpawnTabDomain::CurrentPaneDomain) => CommandDef {
-            brief: "Detach the domain of the active pane".into(),
+            brief: tr("command-detach-the-domain-of-the-active-pane").into(),
             doc: "Detaches (disconnects from) the domain of the active pane".into(),
             keys: vec![],
             args: &[ArgType::ActivePane],
@@ -2039,7 +2230,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_pipe_disconnected"),
         },
         DetachDomain(SpawnTabDomain::DefaultDomain) => CommandDef {
-            brief: "Detach the default domain".into(),
+            brief: tr("command-detach-the-default-domain").into(),
             doc: "Detaches (disconnects from) the default domain".into(),
             keys: vec![],
             args: &[ArgType::ActivePane],
@@ -2064,7 +2255,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         },
         OpenUri(uri) => match uri.as_ref() {
             "https://github.com/RoversX/thinkterm" => CommandDef {
-                brief: "Documentation".into(),
+                brief: tr("command-documentation").into(),
                 doc: "Visit the ThinkTerm project page".into(),
                 keys: vec![],
                 args: &[],
@@ -2072,7 +2263,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
                 icon: Some("md_help"),
             },
             "https://github.com/RoversX/thinkterm/discussions/" => CommandDef {
-                brief: "Discuss on GitHub".into(),
+                brief: tr("command-discuss-on-github").into(),
                 doc: "Visit ThinkTerm's GitHub discussions".into(),
                 keys: vec![],
                 args: &[],
@@ -2080,7 +2271,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
                 icon: Some("oct_comment_discussion"),
             },
             "https://github.com/RoversX/thinkterm/issues/" => CommandDef {
-                brief: "Search or report issue on GitHub".into(),
+                brief: tr("command-search-or-report-issue-on-github").into(),
                 doc: "Visit ThinkTerm's GitHub issues".into(),
                 keys: vec![],
                 args: &[],
@@ -2129,7 +2320,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_keyboard_variant"),
         },
         Nop => CommandDef {
-            brief: "Does nothing".into(),
+            brief: tr("command-does-nothing").into(),
             doc: "Has no effect".into(),
             keys: vec![],
             args: &[],
@@ -2140,6 +2331,9 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         // A plugin's panel shows in the sidebar and nowhere else: not in the
         // palette, whatever key the user gave it.
         FocusPluginPanel(_) => return None,
+        // Listed with the plugins' other actions, under the name its plugin
+        // gives it; one of a plugin that is gone is not a command.
+        PluginAction(_) => return None,
         SelectTextAtMouseCursor(mode) => CommandDef {
             brief: format!(
                 "Selects text at the mouse cursor \
@@ -2173,7 +2367,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         ClearSelection => CommandDef {
-            brief: "Clears the selection in the current pane".into(),
+            brief: tr("command-clears-the-selection-in-the-current-pane").into(),
             doc: "Clears the selection in the current pane".into(),
             keys: vec![],
             args: &[],
@@ -2341,7 +2535,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         PopKeyTable => CommandDef {
-            brief: "Pop the current key table".into(),
+            brief: tr("command-pop-the-current-key-table").into(),
             doc: "Pop the current key table".into(),
             keys: vec![],
             args: &[ArgType::ActivePane],
@@ -2365,7 +2559,11 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         RotatePanes(direction) => CommandDef {
-            brief: format!("Rotate panes {direction:?}").into(),
+            brief: match direction {
+                RotationDirection::Clockwise => tr("command-rotate-panes-clockwise"),
+                RotationDirection::CounterClockwise => tr("command-rotate-panes-counter-clockwise"),
+            }
+            .into(),
             doc: format!("Rotate panes {direction:?}").into(),
             keys: vec![],
             args: &[ArgType::ActivePane],
@@ -2391,7 +2589,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             }
         }
         ResetTerminal => CommandDef {
-            brief: "Reset the terminal emulation state in the current pane".into(),
+            brief: tr("command-reset-the-terminal-emulation-state-in-the-current-pane").into(),
             doc: "Reset the terminal emulation state in the current pane".into(),
             keys: vec![],
             args: &[ArgType::ActivePane],
@@ -2399,7 +2597,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         ActivateCommandPalette => CommandDef {
-            brief: "Activate Command Palette".into(),
+            brief: tr("command-activate-command-palette").into(),
             doc: "Shows the command palette modal".into(),
             keys: vec![
                 (Modifiers::CTRL.union(Modifiers::SHIFT), "p".into()),
@@ -2430,7 +2628,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: Some("md_palette"),
         },
         ActivateWorkspaceThread { .. } => CommandDef {
-            brief: "Open thread".into(),
+            brief: tr("command-open-thread").into(),
             doc: "Switch to a saved thread, changing Space when needed".into(),
             keys: vec![],
             args: &[ArgType::ActiveWindow],
@@ -2439,6 +2637,25 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &[],
             icon: Some("oct_terminal"),
         },
+        ActivateWorkspaceThreadByIndex(n) => {
+            let n = *n;
+            let ordinal = english_ordinal(n as isize + 1);
+            // The same digits as the numbers the sidebar shows while these
+            // keys are held: see `termwindow::thread_numbers`.
+            let keys = if n < crate::termwindow::thread_numbers::MOST_NUMBERS {
+                vec![(Modifiers::SUPER, (n + 1).to_string())]
+            } else {
+                vec![]
+            };
+            CommandDef {
+                brief: counted("command-activate-thread", n as i64 + 1, Some(&ordinal)).into(),
+                doc: format!("Opens the {ordinal} thread in the sidebar").into(),
+                keys,
+                args: &[ArgType::ActiveWindow],
+                menubar: &["Window", "Select Thread"],
+                icon: None,
+            }
+        }
     })
 }
 
@@ -2459,6 +2676,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         // ----------------- Shell
         CreateWorkspaceThreadInActiveProject,
         ToggleLiveOverview,
+        ToggleLibrary,
         OpenSshHosts,
         AddRemoteHost,
         ArchiveActiveProject,
@@ -2540,6 +2758,15 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         }),
         RotatePanes(RotationDirection::Clockwise),
         RotatePanes(RotationDirection::CounterClockwise),
+        ActivateWorkspaceThreadByIndex(0),
+        ActivateWorkspaceThreadByIndex(1),
+        ActivateWorkspaceThreadByIndex(2),
+        ActivateWorkspaceThreadByIndex(3),
+        ActivateWorkspaceThreadByIndex(4),
+        ActivateWorkspaceThreadByIndex(5),
+        ActivateWorkspaceThreadByIndex(6),
+        ActivateWorkspaceThreadByIndex(7),
+        ActivateWorkspaceThreadByIndex(8),
         ActivateTab(0),
         ActivateTab(1),
         ActivateTab(2),
@@ -2587,4 +2814,34 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         // ----------------- Misc
         OpenLinkAtMouseCursor,
     ];
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn number_keys_reach_threads_and_ctrl_reaches_tabs() {
+        use super::KeyAssignment::{ActivateTab, ActivateWorkspaceThreadByIndex};
+        use crate::inputmap::default_chords;
+        use window::{KeyCode, Modifiers};
+
+        let chord = |c, mods| vec![(KeyCode::Char(c), mods)];
+        assert_eq!(
+            default_chords(&ActivateWorkspaceThreadByIndex(0)),
+            chord('1', Modifiers::SUPER)
+        );
+        assert_eq!(
+            default_chords(&ActivateWorkspaceThreadByIndex(8)),
+            chord('9', Modifiers::SUPER)
+        );
+        assert!(default_chords(&ActivateWorkspaceThreadByIndex(9)).is_empty());
+        assert_eq!(default_chords(&ActivateTab(0)), chord('1', Modifiers::CTRL));
+        assert_eq!(default_chords(&ActivateTab(-1)), chord('9', Modifiers::CTRL));
+    }
+
+    #[test]
+    fn every_menu_title_has_an_english_text() {
+        for (_, id) in super::MENU_TITLES {
+            assert!(thinkterm_i18n::has_key(id), "{} has no en-US text", id);
+        }
+    }
 }

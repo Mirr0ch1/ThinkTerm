@@ -9,12 +9,13 @@ use crate::connection::ConnectionOps;
 use crate::os::macos::menu::{Menu, MenuItem, RepresentedItem};
 use crate::parameters::{Border, Parameters, TitleBar};
 use crate::{
+    FloatingCard,
     Clipboard, ClipboardContents, Connection, ContextMenuItem, DeadKeyStatus, Dimensions,
     FilePickerOptions, FolderPickerOptions, Handled, Image, KeyCode, KeyEvent, Modifiers,
     MouseButtons, MouseCursor, MouseEvent, MouseEventKind, MousePress, NativeTextInputSnapshot,
-    Point, PreciseScrollDelta, RawKeyEvent, Rect, RequestedWindowGeometry, ResizeIncrement,
-    ResolvedGeometry, ScreenPoint, ScrollPhase, Size, TextCheckCapabilities, TextCheckIssue,
-    TextCheckRequest, TextCheckResponse, ULength, WindowDecorations, WindowEvent,
+    PathPickerOptions, Point, PreciseScrollDelta, RawKeyEvent, Rect, RequestedWindowGeometry,
+    ResizeIncrement, ResolvedGeometry, ScreenPoint, ScrollPhase, Size, TextCheckCapabilities,
+    TextCheckIssue, TextCheckRequest, TextCheckResponse, ULength, WindowDecorations, WindowEvent,
     WindowEventSender, WindowOps, WindowState,
 };
 use anyhow::{anyhow, bail, ensure};
@@ -447,6 +448,24 @@ extern "C" {
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
+    fn CGPathCreateWithRoundedRect(
+        rect: NSRect,
+        corner_width: CGFloat,
+        corner_height: CGFloat,
+        transform: *const std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+    fn CGPathCreateMutable() -> *mut std::ffi::c_void;
+    fn CGPathAddRect(
+        path: *mut std::ffi::c_void,
+        transform: *const std::ffi::c_void,
+        rect: NSRect,
+    );
+    fn CGPathAddPath(
+        path: *mut std::ffi::c_void,
+        transform: *const std::ffi::c_void,
+        other: *const std::ffi::c_void,
+    );
+    fn CGPathRelease(path: *mut std::ffi::c_void);
     fn CGSMainConnectionID() -> id;
     fn CGSSetWindowBackgroundBlurRadius(
         connection_id: id,
@@ -771,34 +790,105 @@ pub(crate) struct WindowInner {
     window: StrongPtr,
     config: ConfigHandle,
     titlebar_sidebar_button_visible: bool,
-    /// The Liquid Glass the view sits in while the window is see-through,
-    /// in place of it as the window's content view, and the look it was
-    /// made for: see `update_glass`.
-    glass: Option<(StrongPtr, GlassLook)>,
-    /// What the glass sits on when the look has a blur under it: an
-    /// `NSVisualEffectView` blurring the desktop behind the window, as the
-    /// window's content view in the glass's place.
-    glass_backing: Option<StrongPtr>,
+    /// What the view sits in while the window is see-through -- Liquid
+    /// Glass or the frosted material -- in place of it as the window's
+    /// content view, and the backdrop it was made for: see
+    /// `update_backdrop`.
+    backdrop: Option<(StrongPtr, Backdrop)>,
+    /// What the window hangs on itself to be a card.
+    floating: Option<FloatingViews>,
 }
 
-/// Liquid Glass as `NSGlassEffectView` draws it: its style, and whether it
-/// sits on a blur of its own.
+/// A card's views and layers beyond the ones every window has.
+struct FloatingViews {
+    /// The window's content view now, holding the rest.
+    _root: StrongPtr,
+    /// Casts the shadow of the card's outline, with `cut` as its mask so as
+    /// not to darken what shows through the card.
+    shadow: StrongPtr,
+    cut: StrongPtr,
+    /// Where the picture shows, on glass; the card's top stays with it.
+    picture_mask: Option<StrongPtr>,
+    /// The picture's layer has its sublayers measured from the top.
+    top_down: bool,
+    card: FloatingCard,
+}
+
+impl FloatingViews {
+    /// Fit the shadow and the picture's mask to `size`, in points. On a layer
+    /// as the card grows, so nothing may animate this.
+    unsafe fn fit(&self, size: NSSize, scale: CGFloat) {
+        let () = msg_send![class!(CATransaction), begin];
+        let () = msg_send![class!(CATransaction), setDisableActions: YES];
+
+        let margin = CGFloat::from(self.card.margin) / scale;
+        let body = NSRect::new(NSPoint::new(margin, margin), size);
+        let () = msg_send![*self.shadow, setFrame: body];
+        let radius = (CGFloat::from(self.card.corner_radius) / scale)
+            .min(size.width / 2.0)
+            .min(size.height / 2.0);
+        let local = NSRect::new(NSPoint::new(0.0, 0.0), size);
+        let outline = CGPathCreateWithRoundedRect(local, radius, radius, std::ptr::null());
+        let () = msg_send![*self.shadow, setShadowPath: outline];
+        let around = NSRect::new(
+            NSPoint::new(-margin, -margin),
+            NSSize::new(size.width + margin * 2.0, size.height + margin * 2.0),
+        );
+        let outside = CGPathCreateMutable();
+        CGPathAddRect(outside, std::ptr::null(), around);
+        CGPathAddPath(outside, std::ptr::null(), outline);
+        let () = msg_send![*self.cut, setPath: outside];
+        CGPathRelease(outside);
+        CGPathRelease(outline);
+
+        if let Some(mask) = self.picture_mask.as_ref() {
+            let full = NSSize::new(
+                CGFloat::from(self.card.full_width) / scale,
+                CGFloat::from(self.card.full_height) / scale,
+            );
+            let y = if self.top_down {
+                0.0
+            } else {
+                size.height - full.height
+            };
+            let frame = NSRect::new(NSPoint::new(0.0, y), full);
+            let () = msg_send![**mask, setFrame: frame];
+        }
+
+        let () = msg_send![class!(CATransaction), commit];
+    }
+}
+
+/// A layer of the plain, opaque sort a mask is cut from, `frame` in points.
+unsafe fn opaque_mask_part(frame: NSRect) -> id {
+    let part: id = msg_send![class!(CALayer), layer];
+    let white: id = msg_send![class!(NSColor), whiteColor];
+    let white: id = msg_send![white, CGColor];
+    let () = msg_send![part, setBackgroundColor: white];
+    let () = msg_send![part, setFrame: frame];
+    part
+}
+
+/// What a see-through window's view sits in: Liquid Glass as
+/// `NSGlassEffectView` draws it, in one of its styles, or the frosted
+/// material of an `NSVisualEffectView` blurring the desktop behind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GlassLook {
-    style: isize,
-    over_blur: bool,
+enum Backdrop {
+    Glass { style: isize },
+    Frosted,
 }
 
-impl GlassLook {
-    /// The look `glass` asks for, or `None` for the plain blur.
+impl Backdrop {
+    /// The backdrop `glass` asks for here, or `None` for the plain blur:
+    /// also where this macOS has no Liquid Glass.
     fn of(glass: MacosWindowGlass) -> Option<Self> {
-        let (style, over_blur) = match glass {
-            MacosWindowGlass::Blur => return None,
-            MacosWindowGlass::Regular => (0, false),
-            MacosWindowGlass::Clear => (1, false),
-            MacosWindowGlass::ClearOverBlur => (1, true),
-        };
-        Some(Self { style, over_blur })
+        let glass_style = |style| liquid_glass_available().then_some(Self::Glass { style });
+        match glass {
+            MacosWindowGlass::Blur => None,
+            MacosWindowGlass::Frosted => Some(Self::Frosted),
+            MacosWindowGlass::Regular => glass_style(0),
+            MacosWindowGlass::Clear => glass_style(1),
+        }
     }
 }
 
@@ -930,6 +1020,8 @@ impl Window {
                 view_id: None,
                 window_id,
                 window: None,
+                floating_card: false,
+                moved_on_request_only: false,
                 titlebar_sidebar_button_visible: false,
                 screen_changed: false,
                 gl_context_pair: None,
@@ -1093,8 +1185,8 @@ impl Window {
                 view,
                 config: config.clone(),
                 titlebar_sidebar_button_visible: false,
-                glass: None,
-                glass_backing: None,
+                backdrop: None,
+                floating: None,
             }));
             inner.borrow_mut().window.replace(weak_window);
             conn.windows
@@ -1217,6 +1309,37 @@ impl WindowOps for Window {
             inner.show();
             Ok(())
         });
+    }
+
+    fn show_floating(&self, card: FloatingCard) {
+        Connection::with_window_inner(self.id, move |inner| {
+            inner.bring_up(Some(card));
+            Ok(())
+        });
+    }
+
+    fn resize_floating(&self, width: f32, height: f32) {
+        Connection::with_window_inner(self.id, move |inner| {
+            inner.resize_floating(width, height);
+            Ok(())
+        });
+    }
+
+    fn pixels_per_point(&self) -> f32 {
+        unsafe { NSWindow::backingScaleFactor(self.ns_window) as f32 }
+    }
+
+    fn screen_units_per_pixel(&self) -> f32 {
+        // Screen points go by the primary screen's scale, wherever they are
+        // (`cartesian_to_screen_point`), and this window may be on another.
+        unsafe {
+            let screens = NSScreen::screens(nil);
+            let primary = screens.objectAtIndex(0);
+            let frame = NSScreen::frame(primary);
+            let backing_frame = NSScreen::convertRectToBacking_(primary, frame);
+            let primary_scale = backing_frame.size.height / frame.size.height;
+            (primary_scale / NSWindow::backingScaleFactor(self.ns_window)) as f32
+        }
     }
 
     fn set_cursor(&self, cursor: Option<MouseCursor>) {
@@ -1372,6 +1495,71 @@ impl WindowOps for Window {
         }
     }
 
+    fn pick_paths_async(
+        &self,
+        options: PathPickerOptions,
+        callback: Box<dyn FnOnce(Vec<PathBuf>) + 'static>,
+    ) {
+        unsafe {
+            let _pool = NSAutoreleasePool::new(nil);
+            let panel: id = msg_send![class!(NSOpenPanel), openPanel];
+            let panel = StrongPtr::retain(panel);
+            let can_files: BOOL = if options.allow_files { YES } else { NO };
+            let can_directories: BOOL = if options.allow_directories { YES } else { NO };
+            let multiple: BOOL = if options.multiple { YES } else { NO };
+            let () = msg_send![*panel, setCanChooseFiles: can_files];
+            let () = msg_send![*panel, setCanChooseDirectories: can_directories];
+            let () = msg_send![*panel, setAllowsMultipleSelection: multiple];
+            let () = msg_send![*panel, setCanCreateDirectories: NO];
+            let () = msg_send![*panel, setResolvesAliases: YES];
+            let title = nsstring(&options.title);
+            let prompt = nsstring(&options.prompt);
+            let () = msg_send![*panel, setTitle: *title];
+            let () = msg_send![*panel, setPrompt: *prompt];
+            if let Some(directory) = options.directory.as_ref().and_then(|dir| dir.to_str()) {
+                let directory = nsstring(directory);
+                let url: id = msg_send![class!(NSURL), fileURLWithPath: *directory isDirectory: YES];
+                if url != nil {
+                    let () = msg_send![*panel, setDirectoryURL: url];
+                }
+            }
+
+            const NS_MODAL_RESPONSE_OK: NSInteger = 1;
+            let callback = Arc::new(Mutex::new(Some(callback)));
+            let callback_for_block = callback.clone();
+            let panel_for_block = panel.clone();
+            let block = RcBlock::new(move |result: NSInteger| {
+                let mut paths = Vec::new();
+                if result == NS_MODAL_RESPONSE_OK {
+                    let urls: id = msg_send![*panel_for_block, URLs];
+                    if urls != nil {
+                        let count: NSUInteger = msg_send![urls, count];
+                        for index in 0..count {
+                            let url: id = msg_send![urls, objectAtIndex: index];
+                            if url == nil {
+                                continue;
+                            }
+                            let path: id = msg_send![url, path];
+                            if path != nil {
+                                paths.push(PathBuf::from(nsstring_to_str(path)));
+                            }
+                        }
+                    }
+                }
+                if let Ok(mut callback) = callback_for_block.lock() {
+                    if let Some(callback) = callback.take() {
+                        callback(paths);
+                    }
+                }
+            });
+            let () = msg_send![*panel, beginWithCompletionHandler: &*block];
+        }
+    }
+
+    fn supports_combined_path_picker(&self) -> bool {
+        true
+    }
+
     fn invalidate(&self) {
         Connection::with_window_inner(self.id, |inner| {
             inner.invalidate();
@@ -1439,6 +1627,13 @@ impl WindowOps for Window {
     fn set_window_position(&self, coords: ScreenPoint) {
         Connection::with_window_inner(self.id, move |inner| {
             inner.set_window_position(coords);
+            Ok(())
+        });
+    }
+
+    fn set_moved_on_request_only(&self) {
+        Connection::with_window_inner(self.id, |inner| {
+            inner.change_view_state(|state| state.moved_on_request_only = true);
             Ok(())
         });
     }
@@ -1694,14 +1889,15 @@ impl WindowInner {
         }
     }
 
+    fn change_view_state(&self, change: impl FnOnce(&mut Inner)) {
+        if let Some(window_view) = WindowView::get_this(unsafe { &**self.view }) {
+            change(&mut window_view.inner.borrow_mut());
+        }
+    }
+
     fn set_titlebar_sidebar_button_visible(&mut self, visible: bool) {
         self.titlebar_sidebar_button_visible = visible;
-        if let Some(window_view) = WindowView::get_this(unsafe { &**self.view }) {
-            window_view
-                .inner
-                .borrow_mut()
-                .titlebar_sidebar_button_visible = visible;
-        }
+        self.change_view_state(|state| state.titlebar_sidebar_button_visible = visible);
         self.update_titlebar_sidebar_button();
     }
 
@@ -1824,14 +2020,14 @@ impl WindowInner {
             {
                 false
             } else {
-                // Glass is a surface of its own, and its shadow takes its
-                // shape -- except clear glass alone, which lets the text's
-                // alpha through as the plain window does (wezterm#310).
+                // Glass and the material are surfaces of their own, and the
+                // shadow takes their shape -- except clear glass, which lets
+                // the text's alpha through as the plain window does
+                // (wezterm#310).
                 is_opaque == YES
-                    || self
-                        .glass
-                        .as_ref()
-                        .is_some_and(|(_, look)| look.style == 0 || look.over_blur)
+                    || self.backdrop.as_ref().is_some_and(|(_, made)| {
+                        matches!(made, Backdrop::Glass { style: 0 } | Backdrop::Frosted)
+                    })
             };
             self.window.setHasShadow_(if shadow { YES } else { NO });
         }
@@ -1853,10 +2049,10 @@ impl WindowInner {
     }
 
     fn update_window_background_blur(&mut self) {
-        // The glass blurs what is behind it itself, or sits on a blur of its
-        // own: this one, the window server's, under it puts a dark band
-        // along its rim.
-        let radius = if self.glass.is_some() {
+        // The glass and the material blur what is behind them themselves:
+        // this one, the window server's, under them puts a dark band along
+        // the rim.
+        let radius = if self.backdrop.is_some() {
             0
         } else {
             self.config.macos_window_background_blur
@@ -1870,56 +2066,70 @@ impl WindowInner {
         }
     }
 
-    /// Put the view in Liquid Glass while the window is see-through and
-    /// the configuration asks for it, and take it out again otherwise. The
-    /// glass is the window's content view then -- or sits in the blur that
-    /// is -- with ours as its content: what we draw see-through shows the
-    /// glass behind it. A different look is made afresh.
-    fn update_glass(&mut self) {
-        let look = GlassLook::of(self.config.macos_window_glass)
-            .filter(|_| self.config.window_background_opacity < 1.0)
-            .filter(|_| liquid_glass_available());
-        if self.glass.as_ref().map(|(_, made)| *made) == look {
+    /// Put the view in Liquid Glass or the frosted material while the
+    /// window is see-through and the configuration asks for one, and take
+    /// it out again otherwise. That is the window's content view then, with
+    /// ours in it: what we draw see-through shows it behind. A different
+    /// backdrop is made afresh.
+    fn update_backdrop(&mut self) {
+        let wanted = Backdrop::of(self.config.macos_window_glass)
+            .filter(|_| self.config.window_background_opacity < 1.0);
+        if self.backdrop.as_ref().map(|(_, made)| *made) == wanted {
             return;
         }
         unsafe {
-            if let Some((glass, _)) = self.glass.take() {
-                let () = msg_send![*glass, setContentView: nil];
+            if let Some((holder, made)) = self.backdrop.take() {
+                match made {
+                    Backdrop::Glass { .. } => {
+                        let () = msg_send![*holder, setContentView: nil];
+                    }
+                    Backdrop::Frosted => {
+                        let () = msg_send![*self.view, removeFromSuperview];
+                    }
+                }
                 self.window.setContentView_(*self.view);
-                self.glass_backing = None;
             }
-            if let Some(look) = look {
+            if let Some(backdrop) = wanted {
                 let frame = NSView::frame(*self.view);
-                let glass: id = msg_send![class!(NSGlassEffectView), alloc];
-                let glass = StrongPtr::new(msg_send![glass, initWithFrame: frame]);
-                let () = msg_send![*glass, setStyle: look.style];
-                let () = msg_send![*glass, setCornerRadius: window_corner_radius(*self.window)];
+                let holder = match backdrop {
+                    Backdrop::Glass { style } => {
+                        let glass: id = msg_send![class!(NSGlassEffectView), alloc];
+                        let glass = StrongPtr::new(msg_send![glass, initWithFrame: frame]);
+                        let () = msg_send![*glass, setStyle: style];
+                        let () = msg_send![
+                            *glass,
+                            setCornerRadius: window_corner_radius(*self.window)
+                        ];
+                        self.window.setContentView_(*glass);
+                        let () = msg_send![*glass, setContentView: *self.view];
+                        glass
+                    }
+                    Backdrop::Frosted => {
+                        let material: id = msg_send![class!(NSVisualEffectView), alloc];
+                        let material = StrongPtr::new(msg_send![material, initWithFrame: frame]);
+                        // Blending behind the window, always active, with the
+                        // under-window material.
+                        let () = msg_send![*material, setBlendingMode: 0isize];
+                        let () = msg_send![*material, setState: 1isize];
+                        let () = msg_send![*material, setMaterial: 21isize];
+                        self.window.setContentView_(*material);
+                        let bounds: NSRect = msg_send![*material, bounds];
+                        let () = msg_send![*self.view, setFrame: bounds];
+                        let () = msg_send![
+                            *self.view,
+                            setAutoresizingMask: NSViewHeightSizable | NSViewWidthSizable
+                        ];
+                        let () = msg_send![*material, addSubview: *self.view];
+                        material
+                    }
+                };
                 let () = msg_send![
-                    *glass,
+                    *holder,
                     setAutoresizingMask: NSViewHeightSizable | NSViewWidthSizable
                 ];
-                if look.over_blur {
-                    let backing: id = msg_send![class!(NSVisualEffectView), alloc];
-                    let backing = StrongPtr::new(msg_send![backing, initWithFrame: frame]);
-                    // Blending behind the window, always active, with the
-                    // under-window material.
-                    let () = msg_send![*backing, setBlendingMode: 0isize];
-                    let () = msg_send![*backing, setState: 1isize];
-                    let () = msg_send![*backing, setMaterial: 21isize];
-                    let () = msg_send![
-                        *backing,
-                        setAutoresizingMask: NSViewHeightSizable | NSViewWidthSizable
-                    ];
-                    self.window.setContentView_(*backing);
-                    let () = msg_send![*backing, addSubview: *glass];
-                    self.glass_backing = Some(backing);
-                } else {
-                    self.window.setContentView_(*glass);
-                }
-                let () = msg_send![*glass, setContentView: *self.view];
-                self.glass = Some((glass, look));
+                self.backdrop = Some((holder, backdrop));
             }
-            log::info!("liquid glass: {look:?}");
+            log::info!("window backdrop: {wanted:?}");
             let () = msg_send![*self.window, makeFirstResponder: *self.view];
         }
     }
@@ -1927,9 +2137,16 @@ impl WindowInner {
 
 impl WindowInner {
     fn show(&mut self) {
+        self.bring_up(None);
+    }
+
+    /// Up and focused, or floating with the focus left alone, fading in.
+    fn bring_up(&mut self, floating: Option<FloatingCard>) {
         unsafe {
-            let current_app = NSRunningApplication::currentApplication(nil);
-            current_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps);
+            if floating.is_none() {
+                let current_app = NSRunningApplication::currentApplication(nil);
+                current_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps);
+            }
 
             // Stupid hack: adjust the window style mask and set it back
             // to what it was.
@@ -1938,16 +2155,33 @@ impl WindowInner {
             self.window
                 .setStyleMask_(NSWindowStyleMask::NSBorderlessWindowMask);
 
-            apply_decorations_to_window(
-                &self.window,
-                self.config.window_decorations,
-                self.config.integrated_title_button_style,
-            );
+            // A floating window stays that bare: with no title bar there are
+            // no window buttons for anything to bring back.
+            if floating.is_none() {
+                apply_decorations_to_window(
+                    &self.window,
+                    self.config.window_decorations,
+                    self.config.integrated_title_button_style,
+                );
+            }
 
             self.update_titlebar_background();
             self.update_titlebar_sidebar_button();
 
-            self.window.makeKeyAndOrderFront_(nil);
+            match floating {
+                Some(card) => {
+                    self.dress_as_card(card);
+                    self.window.setAlphaValue_(0.0);
+                    self.window.orderFront_(nil);
+                    let () = msg_send![class!(NSAnimationContext), beginGrouping];
+                    let context: id = msg_send![class!(NSAnimationContext), currentContext];
+                    let () = msg_send![context, setDuration: card.fade_in.as_secs_f64()];
+                    let animator: id = msg_send![*self.window, animator];
+                    let () = msg_send![animator, setAlphaValue: 1.0 as CGFloat];
+                    let () = msg_send![class!(NSAnimationContext), endGrouping];
+                }
+                None => self.window.makeKeyAndOrderFront_(nil),
+            }
             self.update_titlebar_background();
         }
         // A window that opens out of sight -- on another Space, behind a
@@ -1955,6 +2189,133 @@ impl WindowInner {
         // notification would ever tell the app layer it is hidden. Read the
         // state it starts in once it is on screen.
         WindowView::perform_in_common_modes(*self.view, sel!(thinktermRecheckOcclusion));
+    }
+
+    /// Hang the card's outline in the window: `margin` of nothing all round
+    /// for the shadow to fall in, and in it the glass, or the bare view,
+    /// which then only shows as much of itself as there is card.
+    fn dress_as_card(&mut self, card: FloatingCard) {
+        unsafe {
+            let scale = CGFloat::from(card.scale);
+            let points = |pixels: f32| CGFloat::from(pixels) / scale;
+            let margin = points(card.margin);
+            let size = NSSize::new(points(card.width), points(card.height));
+            let whole = NSSize::new(size.width + margin * 2.0, size.height + margin * 2.0);
+            NSWindow::setContentSize_(*self.window, whole);
+            let body = NSRect::new(NSPoint::new(margin, margin), size);
+
+            let root: id = msg_send![class!(NSView), alloc];
+            let root = StrongPtr::new(msg_send![
+                root,
+                initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), whole)
+            ]);
+            let () = msg_send![*root, setWantsLayer: YES];
+            let () = msg_send![
+                *root,
+                setAutoresizingMask: NSViewHeightSizable | NSViewWidthSizable
+            ];
+            let root_layer: id = msg_send![*root, layer];
+
+            let shadow: id = msg_send![class!(CALayer), layer];
+            let shadow = StrongPtr::retain(shadow);
+            let black: id = msg_send![class!(NSColor), blackColor];
+            let black: id = msg_send![black, CGColor];
+            let () = msg_send![*shadow, setShadowColor: black];
+            let () = msg_send![*shadow, setShadowOpacity: 0.32f32];
+            let () = msg_send![*shadow, setShadowRadius: 12.0 as CGFloat];
+            let () = msg_send![*shadow, setShadowOffset: NSSize::new(0.0, -5.0)];
+            let cut: id = msg_send![class!(CAShapeLayer), layer];
+            let cut = StrongPtr::retain(cut);
+            let () = msg_send![*cut, setFillRule: *nsstring("even-odd")];
+            let () = msg_send![*shadow, setMask: *cut];
+            let () = msg_send![root_layer, addSublayer: *shadow];
+
+            self.window.setContentView_(*root);
+            let content = match self.backdrop.as_ref() {
+                Some((holder, _)) => **holder,
+                None => *self.view,
+            };
+            let () = msg_send![content, setFrame: body];
+            let () = msg_send![
+                content,
+                setAutoresizingMask: NSViewHeightSizable | NSViewWidthSizable
+            ];
+            let () = msg_send![*root, addSubview: content];
+
+            let picture_layer: id = msg_send![*self.view, layer];
+            let top_down: BOOL = msg_send![picture_layer, isGeometryFlipped];
+            let glass = self.backdrop.as_ref().and_then(|(holder, made)| {
+                matches!(made, Backdrop::Glass { .. }).then_some(holder)
+            });
+            let picture_mask = glass.map(|glass| {
+                // Borderless, the window has no corners for the glass to follow.
+                let () = msg_send![**glass, setCornerRadius: points(card.corner_radius)];
+
+                let full_width = points(card.full_width);
+                let full_height = points(card.full_height);
+                let title_height = points(card.title_height);
+                let inset = points(card.thumbnail_inset);
+                let mask: id = msg_send![class!(CALayer), layer];
+                // Flipping adds up: measured from the top is flipping it once
+                // in all, here or in the layer it masks.
+                let () = msg_send![
+                    mask,
+                    setGeometryFlipped: if top_down == YES { NO } else { YES }
+                ];
+                let title = opaque_mask_part(NSRect::new(
+                    NSPoint::new(0.0, 0.0),
+                    NSSize::new(full_width, title_height),
+                ));
+                let () = msg_send![mask, addSublayer: title];
+                let thumbnail = opaque_mask_part(NSRect::new(
+                    NSPoint::new(inset, title_height),
+                    NSSize::new(
+                        full_width - inset * 2.0,
+                        full_height - title_height - inset,
+                    ),
+                ));
+                let () = msg_send![thumbnail, setCornerRadius: points(card.thumbnail_radius)];
+                let () = msg_send![thumbnail, setCornerCurve: *nsstring("continuous")];
+                let () = msg_send![mask, addSublayer: thumbnail];
+                let () = msg_send![picture_layer, setMask: mask];
+                StrongPtr::retain(mask)
+            });
+            // The picture stays whole as the card opens up over it, and the
+            // size it was rendered at on any display the card goes to.
+            let () = msg_send![picture_layer, setMasksToBounds: YES];
+            let () = msg_send![picture_layer, setContentsScale: scale];
+            self.change_view_state(|state| state.floating_card = true);
+
+            let views = FloatingViews {
+                _root: root,
+                shadow,
+                cut,
+                picture_mask,
+                top_down: top_down == YES,
+                card,
+            };
+            views.fit(size, scale);
+            self.floating = Some(views);
+        }
+    }
+
+    fn resize_floating(&mut self, width: f32, height: f32) {
+        let Some(views) = self.floating.as_ref() else {
+            return;
+        };
+        unsafe {
+            let scale = CGFloat::from(views.card.scale);
+            let size = NSSize::new(
+                CGFloat::from(width) / scale,
+                CGFloat::from(height) / scale,
+            );
+            let margin = CGFloat::from(views.card.margin) / scale;
+            NSWindow::setContentSize_(
+                *self.window,
+                NSSize::new(size.width + margin * 2.0, size.height + margin * 2.0),
+            );
+            views.fit(size, scale);
+        }
     }
 
     fn close(&mut self) {
@@ -2415,7 +2776,7 @@ impl WindowInner {
                 inner.screen_changed = true;
             }
         }
-        self.update_glass();
+        self.update_backdrop();
         self.update_window_shadow();
         self.update_window_background_blur();
         self.update_titlebar_background();
@@ -2657,6 +3018,16 @@ fn thinkterm_titlebar_sidebar_button(titlebar_view_container: &StrongPtr) -> Opt
     }
 }
 
+/// Whether a window with these decorations has its content run on under the
+/// title bar, rather than starting below it.
+pub fn content_under_title_bar(
+    decorations: WindowDecorations,
+    integrated_title_button_style: IntegratedTitleButtonStyle,
+) -> bool {
+    decoration_to_mask(decorations, integrated_title_button_style)
+        .contains(NSWindowStyleMask::NSFullSizeContentViewWindowMask)
+}
+
 fn decoration_to_mask(
     decorations: WindowDecorations,
     integrated_title_button_style: IntegratedTitleButtonStyle,
@@ -2789,6 +3160,10 @@ struct Inner {
     events: WindowEventSender,
     view_id: Option<WeakPtr>,
     window: Option<WeakPtr>,
+    /// The window is a card, whose picture keeps the scale it was made at.
+    floating_card: bool,
+    /// The system's own moving of the window, by its title bar, is off.
+    moved_on_request_only: bool,
     titlebar_sidebar_button_visible: bool,
     screen_changed: bool,
     window_id: usize,
@@ -3850,6 +4225,19 @@ impl WindowView {
         NO
     }
 
+    /// What `NSView` answers for a view that is not opaque, unless the window
+    /// was told otherwise.
+    extern "C" fn mouse_down_can_move_window(this: &Object, _sel: Sel) -> BOOL {
+        let on_request_only = Self::get_this(this)
+            .and_then(|view| view.inner.try_borrow().ok().map(|i| i.moved_on_request_only))
+            .unwrap_or(false);
+        if on_request_only {
+            NO
+        } else {
+            YES
+        }
+    }
+
     // Don't use Cocoa native window tabbing
     extern "C" fn allow_automatic_tabbing(_this: &Object, _sel: Sel) -> BOOL {
         NO
@@ -4806,13 +5194,19 @@ impl WindowView {
     }
 
     extern "C" fn layer_should_inherit_contents_scale_from_window(
-        _: &Object,
+        this: &Object,
         _: Sel,
         layer: *mut Object,
         _: CGFloat,
         _: *mut Object,
     ) -> BOOL {
         log::trace!("layer_should_inherit_contents_scale_from_window");
+        let floating_card = Self::get_this(this)
+            .and_then(|view| view.inner.try_borrow().ok().map(|i| i.floating_card))
+            .unwrap_or(false);
+        if floating_card {
+            return NO;
+        }
         unsafe {
             let () = msg_send![layer, setContentsScale: 1.0];
         }
@@ -5214,6 +5608,11 @@ impl WindowView {
             cls.add_method(
                 sel!(isOpaque),
                 Self::is_opaque as extern "C" fn(&Object, Sel) -> BOOL,
+            );
+
+            cls.add_method(
+                sel!(mouseDownCanMoveWindow),
+                Self::mouse_down_can_move_window as extern "C" fn(&Object, Sel) -> BOOL,
             );
 
             cls.add_method(

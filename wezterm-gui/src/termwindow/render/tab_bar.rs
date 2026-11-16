@@ -70,9 +70,17 @@ impl crate::TermWindow {
     }
 
     /// Pixels the window tab row and the terminal bar take above and below
-    /// the pane tree.
+    /// the pane tree, as painted and pointed at: a window tab row brought
+    /// down from the top edge pushes the panes down with it.
     pub(crate) fn pane_area_insets(&self) -> (f32, f32) {
-        let window_tabs = self.tab_bar_pixel_height().unwrap_or(0.);
+        let (top, bottom) = self.pane_area_layout_insets();
+        (top + self.window_tab_reveal_offset(), bottom)
+    }
+
+    /// As `pane_area_insets`, for sizing the terminal: a brought-down row
+    /// moves the panes without taking any rows from them.
+    pub(crate) fn pane_area_layout_insets(&self) -> (f32, f32) {
+        let window_tabs = self.window_tab_row_layout_height();
         match self.terminal_bar_placement() {
             Some(bar) if bar.at_bottom => (window_tabs, bar.height),
             Some(bar) => (window_tabs + bar.height, 0.),

@@ -22,6 +22,11 @@ pub enum SvgIcon {
     Check,
     ChevronDown,
     ChevronRight,
+    ChevronUp,
+    CornerDownLeft,
+    ArrowBigUp,
+    ArrowRightToLine,
+    Option,
     ChevronsUpDown,
     Cloud,
     CodeXml,
@@ -53,6 +58,7 @@ pub enum SvgIcon {
     Info,
     Keyboard,
     Layers,
+    LibraryBig,
     Link2,
     Loader,
     LoaderCircle,
@@ -72,6 +78,7 @@ pub enum SvgIcon {
     PanelRightOpen,
     Package,
     Pencil,
+    PersonStanding,
     Pin,
     PinOff,
     Pipette,
@@ -89,12 +96,16 @@ pub enum SvgIcon {
     Shield,
     SlidersHorizontal,
     SlidersVertical,
+    Share,
     Shrink,
+    User,
+    Users,
     CircleAlert,
     CircleCheck,
     CircleX,
     CirclePlus,
     SquarePlus,
+    SquarePen,
     Square,
     SquareRoundCorner,
     SquareStack,
@@ -105,6 +116,7 @@ pub enum SvgIcon {
     Terminal,
     Trash2,
     Unlink2,
+    Command,
     ALargeSmall,
     AppWindow,
     Bold,
@@ -121,13 +133,24 @@ pub enum SvgIcon {
     Timer,
     Type,
     Laptop,
+    /// The laptop crossed out: a machine that cannot be reached now. Not in
+    /// lucide, which has the server's and the monitor's; drawn after them.
+    LaptopOff,
+    ServerOff,
     KeyRound,
     LogOut,
     Monitor,
+    Mic,
+    Camera,
     Network,
+    /// The Mac mini a remote host can be shown as: lucide has none.
+    HardDrive,
     /// The mux server of the README's architecture diagram: a host whose
     /// sessions live on it, which is what ThinkTerm Connect means.
     MuxServer,
+    /// A folder with its plus in a gap at the top right: the sidebar's new
+    /// project button.
+    ProjectAdd,
     /// Apple's mark, tinted like the rest rather than painted in its own
     /// black: drawn white, it vanishes on a light theme.
     Apple,
@@ -235,6 +258,19 @@ impl SvgIcon {
             Self::ChevronRight => {
                 include_bytes!("../../../../third_party/lucide/icons/chevron-right.svg")
             }
+            Self::ChevronUp => {
+                include_bytes!("../../../../third_party/lucide/icons/chevron-up.svg")
+            }
+            Self::CornerDownLeft => {
+                include_bytes!("../../../../third_party/lucide/icons/corner-down-left.svg")
+            }
+            Self::ArrowBigUp => {
+                include_bytes!("../../../../third_party/lucide/icons/arrow-big-up.svg")
+            }
+            Self::ArrowRightToLine => {
+                include_bytes!("../../../../third_party/lucide/icons/arrow-right-to-line.svg")
+            }
+            Self::Option => include_bytes!("../../../../third_party/lucide/icons/option.svg"),
             Self::ChevronsUpDown => {
                 include_bytes!("../../../../third_party/lucide/icons/chevrons-up-down.svg")
             }
@@ -283,6 +319,9 @@ impl SvgIcon {
             Self::Info => include_bytes!("../../../../third_party/lucide/icons/info.svg"),
             Self::Keyboard => include_bytes!("../../../../third_party/lucide/icons/keyboard.svg"),
             Self::Layers => include_bytes!("../../../../third_party/lucide/icons/layers.svg"),
+            Self::LibraryBig => {
+                include_bytes!("../../../../third_party/lucide/icons/library-big.svg")
+            }
             Self::Link2 => include_bytes!("../../../../third_party/lucide/icons/link-2.svg"),
             Self::Loader => include_bytes!("../../../../third_party/lucide/icons/loader.svg"),
             Self::LoaderCircle => {
@@ -324,6 +363,9 @@ impl SvgIcon {
                 include_bytes!("../../../../third_party/lucide/icons/panel-right-open.svg")
             }
             Self::Pencil => include_bytes!("../../../../third_party/lucide/icons/pencil.svg"),
+            Self::PersonStanding => {
+                include_bytes!("../../../../third_party/lucide/icons/person-standing.svg")
+            }
             Self::Package => include_bytes!("../../../../third_party/lucide/icons/package.svg"),
             Self::Pin => include_bytes!("../../../../third_party/lucide/icons/pin.svg"),
             Self::PinOff => include_bytes!("../../../../third_party/lucide/icons/pin-off.svg"),
@@ -350,6 +392,9 @@ impl SvgIcon {
             Self::SlidersVertical => {
                 include_bytes!("../../../../third_party/lucide/icons/sliders-vertical.svg")
             }
+            Self::Share => include_bytes!("../../../../third_party/lucide/icons/share-2.svg"),
+            Self::User => include_bytes!("../../../../third_party/lucide/icons/user.svg"),
+            Self::Users => include_bytes!("../../../../third_party/lucide/icons/users.svg"),
             Self::Shrink => include_bytes!("../../../../third_party/lucide/icons/shrink.svg"),
             Self::CircleAlert => {
                 include_bytes!("../../../../third_party/lucide/icons/circle-alert.svg")
@@ -368,6 +413,7 @@ impl SvgIcon {
             Self::SquarePlus => {
                 include_bytes!("../../../../third_party/lucide/icons/square-plus.svg")
             }
+            Self::SquarePen => include_bytes!("../../../../third_party/lucide/icons/square-pen.svg"),
             Self::SquareStack => {
                 include_bytes!("../../../../third_party/lucide/icons/square-stack.svg")
             }
@@ -385,6 +431,7 @@ impl SvgIcon {
             }
             Self::Terminal => include_bytes!("../../../../third_party/lucide/icons/terminal.svg"),
             Self::Trash2 => include_bytes!("../../../../third_party/lucide/icons/trash-2.svg"),
+            Self::Command => include_bytes!("../../../../third_party/lucide/icons/command.svg"),
             Self::ALargeSmall => {
                 include_bytes!("../../../../third_party/lucide/icons/a-large-small.svg")
             }
@@ -411,12 +458,22 @@ impl SvgIcon {
             Self::Timer => include_bytes!("../../../../third_party/lucide/icons/timer.svg"),
             Self::Type => include_bytes!("../../../../third_party/lucide/icons/type.svg"),
             Self::Laptop => include_bytes!("../../../../third_party/lucide/icons/laptop.svg"),
+            Self::LaptopOff => include_bytes!("../../../../assets/ui/laptop-off.svg"),
+            Self::ServerOff => {
+                include_bytes!("../../../../third_party/lucide/icons/server-off.svg")
+            }
             Self::KeyRound => include_bytes!("../../../../third_party/lucide/icons/key-round.svg"),
             Self::LogOut => include_bytes!("../../../../third_party/lucide/icons/log-out.svg"),
             Self::Monitor => include_bytes!("../../../../third_party/lucide/icons/monitor.svg"),
+            Self::Mic => include_bytes!("../../../../third_party/lucide/icons/mic.svg"),
+            Self::Camera => include_bytes!("../../../../third_party/lucide/icons/camera.svg"),
             Self::Apple => include_bytes!("../../../../third_party/simple-icons/icons/apple.svg"),
             Self::Network => include_bytes!("../../../../third_party/lucide/icons/network.svg"),
+            Self::HardDrive => {
+                include_bytes!("../../../../third_party/lucide/icons/hard-drive.svg")
+            }
             Self::MuxServer => include_bytes!("../../../../assets/ui/mux-server.svg"),
+            Self::ProjectAdd => include_bytes!("../../../../assets/ui/project-add.svg"),
             Self::QrCode => include_bytes!("../../../../third_party/lucide/icons/qr-code.svg"),
             Self::Smartphone => {
                 include_bytes!("../../../../third_party/lucide/icons/smartphone.svg")
@@ -880,10 +937,20 @@ mod tests {
             SvgIcon::BellRing,
             SvgIcon::Braces,
             SvgIcon::Server,
+            SvgIcon::ServerOff,
+            SvgIcon::LaptopOff,
+            SvgIcon::Share,
+            SvgIcon::User,
+            SvgIcon::Users,
             SvgIcon::MuxServer,
             SvgIcon::ExternalLink,
             SvgIcon::ChevronDown,
             SvgIcon::ChevronRight,
+            SvgIcon::ChevronUp,
+            SvgIcon::CornerDownLeft,
+            SvgIcon::ArrowBigUp,
+            SvgIcon::ArrowRightToLine,
+            SvgIcon::Option,
             SvgIcon::ChevronsUpDown,
             SvgIcon::Cloud,
             SvgIcon::CodeXml,
@@ -892,6 +959,7 @@ mod tests {
             SvgIcon::Folder,
             SvgIcon::FolderOpen,
             SvgIcon::FolderPlus,
+            SvgIcon::ProjectAdd,
             SvgIcon::FolderTree,
             SvgIcon::Globe,
             SvgIcon::Info,
@@ -905,6 +973,7 @@ mod tests {
             SvgIcon::Minimize2,
             SvgIcon::NotebookTabs,
             SvgIcon::Palette,
+            SvgIcon::PersonStanding,
             SvgIcon::PanelLeft,
             SvgIcon::PanelLeftClose,
             SvgIcon::PanelLeftOpen,
@@ -933,11 +1002,19 @@ mod tests {
             SvgIcon::SplitVertical,
             SvgIcon::Terminal,
             SvgIcon::Trash2,
+            SvgIcon::Command,
             SvgIcon::X,
             // Remote Hosts' Tailscale group: the tailnet and its machines.
             SvgIcon::Apple,
             SvgIcon::Monitor,
             SvgIcon::Network,
+            // Settings › General's permissions.
+            SvgIcon::Mic,
+            SvgIcon::Camera,
+            // The kinds of machine a remote host can be shown as.
+            SvgIcon::Laptop,
+            SvgIcon::HardDrive,
+            SvgIcon::Package,
             // What a plugin's panel is shown by in the selector.
             SvgIcon::Activity,
             SvgIcon::Bug,

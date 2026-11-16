@@ -50,7 +50,8 @@ struct Opt {
 
     /// Take over from the mux server already running on this socket:
     /// its panes, windows and clients continue under this binary, and
-    /// the running server exits. The running server must support it.
+    /// the running server exits. The running server must support it, and
+    /// does not hand over to an older release.
     #[arg(long = "takeover")]
     takeover: bool,
 
@@ -102,6 +103,30 @@ fn main() {
     #[cfg(target_os = "macos")]
     if let Some(watch) = wezterm_mux_server_impl::hold::requested() {
         wezterm_mux_server_impl::hold::run(&watch, env_bootstrap::setup_logger);
+    }
+    // The GUI asking what macOS lets the programs in panes do: answer with
+    // the identity a server has, which the launcher's is not, and exit.
+    #[cfg(target_os = "macos")]
+    {
+        use wezterm_mux_server_impl::privacy;
+        match privacy::requested() {
+            Some(privacy::Request::TakeIdentity) => {
+                let err = match std::env::current_exe() {
+                    Ok(exe) => daemonize::exec_as_own_tcc_identity(
+                        exe.as_os_str(),
+                        &[privacy::REPORT_AS_SELF_OPTION.into()],
+                    ),
+                    Err(err) => err,
+                };
+                eprintln!("privacy report: could not take the server's identity: {err:#}");
+                std::process::exit(1);
+            }
+            Some(privacy::Request::Report) => {
+                privacy::print_report();
+                std::process::exit(0);
+            }
+            None => {}
+        }
     }
     thinkterm_import_herdr::register().expect("register built-in session importer");
     if let Some(result) = thinkterm_import::maybe_run_helper() {
@@ -748,6 +773,7 @@ fn install_shutdown_signal_handler() -> anyhow::Result<()> {
                     log::error!("flushing ThinkTerm layouts before shutdown: {err:#}");
                 }
                 wezterm_mux_server_impl::thinkterm_layout::keep_pane_output();
+                wezterm_mux_server_impl::share::shut_down();
                 std::process::exit(0);
             })
             .detach();
@@ -1107,6 +1133,7 @@ mod windows_daemon {
                 log::error!("flushing ThinkTerm layouts before shutdown: {err:#}");
             }
             wezterm_mux_server_impl::thinkterm_layout::keep_pane_output();
+            wezterm_mux_server_impl::share::shut_down();
             std::process::exit(0);
         })
         .detach();

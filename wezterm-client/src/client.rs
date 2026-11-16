@@ -175,6 +175,9 @@ pub struct Client {
     /// restored first.
     connection_phase: Arc<AtomicU8>,
     resume_reconnect_tx: Sender<()>,
+    /// Set by `resume_reconnect` while the reconnect loop is waiting between
+    /// tries: the next try comes now, the outage counted from it.
+    retry_now: Arc<AtomicBool>,
     remote_server_id: Arc<RwLock<Option<String>>>,
     /// The distro id the server reported when we shook hands, if any.
     remote_os_release: Arc<RwLock<Option<String>>>,
@@ -189,9 +192,17 @@ pub struct Client {
     /// loop checks it after every dead session, surfaces it in a visible
     /// window, and stops.
     fatal_connection_error: Arc<Mutex<Option<String>>>,
+    connect_transport: Arc<Mutex<Option<ConnectTransport>>>,
+    plugin_way: Arc<Mutex<Option<crate::plugin_link::PluginWay>>>,
+    stored_password: Arc<Mutex<Option<String>>>,
 }
 
 impl Client {
+    /// Have the next connection attempt sign in with `password`.
+    pub fn set_stored_password(&self, password: Option<String>) {
+        *self.stored_password.lock().unwrap() = password;
+    }
+
     pub fn connection_phase(&self) -> ClientConnectionPhase {
         ClientConnectionPhase::from_u8(self.connection_phase.load(Ordering::Acquire))
     }
@@ -214,9 +225,13 @@ impl Client {
         self.connection_phase() == ClientConnectionPhase::Suspended
     }
 
-    /// Wake a parked reconnect loop for another round of retries.
+    /// Wake a parked reconnect loop for another round of retries, or have
+    /// one still trying try again now rather than at the end of its wait.
     pub fn resume_reconnect(&self) {
+        // Publish the token before waking the retry wait: a reader that
+        // honors the hint must also be able to consume this request.
         let _ = self.resume_reconnect_tx.try_send(());
+        self.retry_now.store(true, Ordering::Release);
     }
 
     pub fn remote_server_id(&self) -> Option<String> {
@@ -261,6 +276,7 @@ impl Client {
     /// Retire this client, including an initial attach waiting on an update
     /// decision. A replacement must get a new client and registration.
     pub(crate) fn close(&self) {
+        self.connect_transport.lock().unwrap().take();
         self.shutdown.close();
         self.sender.close();
         self.set_connection_phase(ClientConnectionPhase::Detached);
@@ -573,8 +589,26 @@ async fn process_unilateral_inner_async(
 /// Where a client without a domain of its own -- the CLI -- sends what the
 /// server pushes, once it has asked to hear it, and which of the pushes it
 /// wants. See `tap_unilateral_pdus`.
-static UNILATERAL_TAP: std::sync::Mutex<Option<(Sender<Pdu>, fn(&Pdu) -> bool)>> =
-    std::sync::Mutex::new(None);
+static UNILATERAL_TAP: std::sync::Mutex<Option<UnilateralSink>> = std::sync::Mutex::new(None);
+
+enum UnilateralSink {
+    Channel(Sender<Pdu>, fn(&Pdu) -> bool),
+    Share(crate::share_queue::Sender),
+}
+
+impl UnilateralSink {
+    fn send(&self, pdu: Pdu) -> anyhow::Result<()> {
+        match self {
+            Self::Channel(tap, wanted) => {
+                if wanted(&pdu) && tap.try_send(pdu).is_err() {
+                    log::warn!("dropping a server push nobody is reading");
+                }
+                Ok(())
+            }
+            Self::Share(tap) => tap.send(pdu),
+        }
+    }
+}
 
 /// Hand every PDU the server pushes to a client without a local domain
 /// (the CLI's own connection) to the returned receiver, rather than drop
@@ -588,8 +622,45 @@ pub fn tap_unilateral_pdus(capacity: usize) -> Receiver<Pdu> {
 /// however many, cannot crowd them out.
 pub fn tap_unilateral_pdus_where(capacity: usize, wanted: fn(&Pdu) -> bool) -> Receiver<Pdu> {
     let (tx, rx) = smol::channel::bounded(capacity);
-    *UNILATERAL_TAP.lock().unwrap() = Some((tx, wanted));
+    *UNILATERAL_TAP.lock().unwrap() = Some(UnilateralSink::Channel(tx, wanted));
     rx
+}
+
+/// Share viewers may skip intermediate screen updates, but must always learn
+/// the current control state and why their watch ended.
+pub fn tap_share_updates() -> ShareUpdateTap {
+    let (sender, receiver) = crate::share_queue::channel();
+    *UNILATERAL_TAP.lock().unwrap() = Some(UnilateralSink::Share(sender));
+    ShareUpdateTap { receiver }
+}
+
+pub struct ShareUpdateTap {
+    receiver: crate::share_queue::Receiver,
+}
+
+impl ShareUpdateTap {
+    pub async fn recv(&self) -> Result<crate::share_queue::Update, smol::channel::RecvError> {
+        self.receiver.recv().await
+    }
+
+    pub fn try_recv(&self) -> Result<crate::share_queue::Update, smol::channel::TryRecvError> {
+        self.receiver.try_recv()
+    }
+
+    fn release(&self, installed: &mut Option<UnilateralSink>) {
+        self.receiver.close();
+        if installed.as_ref().is_some_and(
+            |tap| matches!(tap, UnilateralSink::Share(tap) if tap.same_channel(&self.receiver)),
+        ) {
+            *installed = None;
+        }
+    }
+}
+
+impl Drop for ShareUpdateTap {
+    fn drop(&mut self) {
+        self.release(&mut UNILATERAL_TAP.lock().unwrap());
+    }
 }
 
 fn process_unilateral(
@@ -603,11 +674,8 @@ fn process_unilateral(
         None => {
             // No panes to update here. A caller that asked for the
             // server's pushes gets them; anyone else ignores them.
-            if let Some((tap, wanted)) = UNILATERAL_TAP.lock().unwrap().as_ref() {
-                if wanted(&decoded.pdu) && tap.try_send(decoded.pdu).is_err() {
-                    log::warn!("dropping a server push nobody is reading");
-                }
-                return Ok(());
+            if let Some(tap) = UNILATERAL_TAP.lock().unwrap().as_ref() {
+                return tap.send(decoded.pdu);
             }
             log::trace!(
                 "client doesn't have a real local domain, \
@@ -880,6 +948,30 @@ fn process_unilateral(
             .detach();
             return Ok(());
         }
+        Pdu::PageChanged(codec::PageChanged { pane_id, page }) => {
+            let pane_id = *pane_id;
+            let page = page.clone();
+            promise::spawn::spawn_into_main_thread(async move {
+                let mux = Mux::try_get().ok_or_else(|| anyhow!("no more mux"))?;
+                let client_domain = mux
+                    .get_domain(local_domain_id)
+                    .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
+                let client_domain =
+                    client_domain
+                        .downcast_ref::<ClientDomain>()
+                        .ok_or_else(|| {
+                            anyhow!("domain {} is not a ClientDomain instance", local_domain_id)
+                        })?;
+                if client_domain.connection_generation() != Some(connection_generation) {
+                    return Ok(());
+                }
+
+                client_domain.process_remote_page_change(pane_id, page);
+                anyhow::Result::<()>::Ok(())
+            })
+            .detach();
+            return Ok(());
+        }
         Pdu::TabResized(_) | Pdu::TabAddedToWindow(_) => {
             log::trace!("resync due to {:?}", decoded.pdu);
             promise::spawn::spawn_into_main_thread(async move {
@@ -938,6 +1030,16 @@ fn is_auth_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
             .downcast_ref::<mux::ssh::AuthCancelledError>()
+            .is_some()
+    })
+}
+
+/// Did the server turn down the password kept for the host, with nobody
+/// asked for another? The next attempt would send the same one.
+fn is_stored_password_refused(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<mux::ssh::StoredPasswordRefused>()
             .is_some()
     })
 }
@@ -1073,6 +1175,7 @@ async fn client_thread_registered(
     };
 
     let mut stream = reconnectable.take_stream().unwrap();
+    let incoming_payload_limit = reconnectable.incoming_payload_limit;
 
     // Application-level keepalive: a transport that died without an RST
     // (VPN egress rotation, sleepy NAT) otherwise hangs silently until the
@@ -1182,16 +1285,31 @@ async fn client_thread_registered(
                 };
                 let read = with_progress(&bytes, IO_STALL_LIMIT, async {
                     if registration.is_complete() {
-                        return Pdu::decode_async(&mut counted, Some(next_serial))
-                            .await
-                            .map(Some);
+                        return match incoming_payload_limit {
+                            Some(limit) => {
+                                Pdu::decode_async_bounded(&mut counted, Some(next_serial), limit)
+                                    .await
+                            }
+                            None => Pdu::decode_async(&mut counted, Some(next_serial)).await,
+                        }
+                        .map(Some);
                     }
-                    let deferred = DeferredPdu::read_async(
-                        &mut counted,
-                        Some(next_serial),
-                        REGISTRATION_BYTES.saturating_sub(deferred_bytes),
-                    )
-                    .await?;
+                    let push_budget = REGISTRATION_BYTES.saturating_sub(deferred_bytes);
+                    let deferred = match incoming_payload_limit {
+                        Some(limit) => {
+                            DeferredPdu::read_async_bounded(
+                                &mut counted,
+                                Some(next_serial),
+                                push_budget,
+                                limit,
+                            )
+                            .await?
+                        }
+                        None => {
+                            DeferredPdu::read_async(&mut counted, Some(next_serial), push_budget)
+                                .await?
+                        }
+                    };
                     if !deferred.is_push() {
                         return deferred.decode().map(Some);
                     }
@@ -1509,11 +1627,210 @@ struct Reconnectable {
     config: ClientDomainConfig,
     stream: Option<Box<dyn AsyncReadAndWrite>>,
     tls_creds: Option<GetTlsCredsResponse>,
+    incoming_payload_limit: Option<usize>,
+    connect_transport: Arc<Mutex<Option<ConnectTransport>>>,
+    /// How a second connection to the server this one reaches is opened,
+    /// for plugin frames alone (`plugin_link`): as of the last connect, and
+    /// none where there is no way to open one.
+    plugin_way: Arc<Mutex<Option<crate::plugin_link::PluginWay>>>,
+    /// The password kept for an ssh host, as of now: the host can be given
+    /// another while this is between tries, and the next try is to use it.
+    stored_password: Arc<Mutex<Option<String>>>,
+}
+
+struct ConnectTransport {
+    session: wezterm_ssh::Session,
+    live: Arc<AtomicBool>,
+    command: String,
+    source: String,
+}
+
+impl std::fmt::Debug for ConnectTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConnectTransport(..)")
+    }
+}
+
+impl Drop for ConnectTransport {
+    fn drop(&mut self) {
+        self.live.store(false, Ordering::Release);
+    }
+}
+
+/// A channel opener obtained only from the authenticated, currently attached
+/// Connect transport. It cannot be reconstructed from a PDU or configuration.
+#[derive(Clone)]
+pub struct VerifiedConnectSession {
+    session: wezterm_ssh::Session,
+    live: std::sync::Weak<AtomicBool>,
+    command: String,
+    source: String,
+}
+
+impl VerifiedConnectSession {
+    pub fn is_alive(&self) -> bool {
+        self.live
+            .upgrade()
+            .is_some_and(|live| live.load(Ordering::Acquire))
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub async fn open_reverse_channel(&self) -> anyhow::Result<Box<dyn AsyncReadAndWrite>> {
+        anyhow::ensure!(self.is_alive(), "Connect session is no longer available");
+        let exec = self
+            .session
+            .exec(&self.command, None)
+            .or(async {
+                smol::Timer::after(Duration::from_secs(5)).await;
+                bail!("opening the Connect reverse channel timed out")
+            })
+            .await?;
+        anyhow::ensure!(self.is_alive(), "Connect session is no longer available");
+        let mut stderr = Async::new(SshStream {
+            stdin: exec.stderr.try_clone()?,
+            stdout: exec.stderr,
+        })?;
+        // Each direction on the descriptor it uses: `Async` makes that one
+        // nonblocking and waits on it. A write that blocks here would pass
+        // every deadline and hold the output guard, which Revoke needs.
+        let reader = Async::new(SshStream {
+            stdin: exec.stdout.try_clone()?,
+            stdout: exec.stdout,
+        })?;
+        let writer = Async::new(SshStream {
+            stdin: exec.stdin.try_clone()?,
+            stdout: exec.stdin,
+        })?;
+        let (stop, stopped) = bounded::<()>(1);
+        let state = Arc::new(ReverseChannelState {
+            failed: AtomicBool::new(false),
+            wake: futures::task::AtomicWaker::new(),
+        });
+        let worker_state = Arc::clone(&state);
+        smol::spawn(async move {
+            let result: std::io::Result<()> = async {
+                let mut remaining = 4096;
+                let mut buffer = [0; 512];
+                loop {
+                    let count = stderr.read(&mut buffer).await?;
+                    if count == 0 {
+                        return Ok(());
+                    }
+                    if count > remaining {
+                        return Err(std::io::ErrorKind::InvalidData.into());
+                    }
+                    remaining -= count;
+                }
+            }
+            .or(async {
+                let _ = stopped.recv().await;
+                Ok(())
+            })
+            .await;
+            if result.is_err() {
+                worker_state.failed.store(true, Ordering::Release);
+                worker_state.wake.wake();
+            }
+        })
+        .detach();
+        Ok(Box::new(ReverseSshStream {
+            reader,
+            writer,
+            child: Box::new(exec.child),
+            stop,
+            state,
+        }))
+    }
+}
+
+struct ReverseChannelState {
+    failed: AtomicBool,
+    wake: futures::task::AtomicWaker,
+}
+
+struct ReverseSshStream {
+    reader: Async<SshStream>,
+    writer: Async<SshStream>,
+    child: Box<wezterm_ssh::SshChildProcess>,
+    stop: Sender<()>,
+    state: Arc<ReverseChannelState>,
+}
+
+impl std::fmt::Debug for ReverseSshStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReverseSshStream(..)")
+    }
+}
+
+impl AsyncRead for ReverseSshStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.state.wake.register(cx.waker());
+        if self.state.failed.load(Ordering::Acquire) {
+            return std::task::Poll::Ready(Err(std::io::ErrorKind::InvalidData.into()));
+        }
+        std::pin::Pin::new(&mut self.reader).poll_read(cx, buffer)
+    }
+}
+
+impl AsyncWrite for ReverseSshStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.state.wake.register(cx.waker());
+        if self.state.failed.load(Ordering::Acquire) {
+            return std::task::Poll::Ready(Err(std::io::ErrorKind::InvalidData.into()));
+        }
+        std::pin::Pin::new(&mut self.writer).poll_write(cx, buffer)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.writer).poll_flush(cx)
+    }
+    fn poll_close(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.writer).poll_close(cx)
+    }
+}
+
+#[async_trait(?Send)]
+impl AsyncReadAndWrite for ReverseSshStream {
+    async fn wait_for_readable(&self) -> anyhow::Result<()> {
+        Ok(self.reader.readable().await?)
+    }
+}
+
+impl Drop for ReverseSshStream {
+    fn drop(&mut self) {
+        self.stop.close();
+        let _ = portable_pty::ChildKiller::kill(self.child.as_mut());
+    }
 }
 
 struct SshStream {
     stdin: FileDescriptor,
     stdout: FileDescriptor,
+}
+
+/// What a program reads and what it writes, as the one stream of a
+/// connection carried through it.
+pub(crate) fn paired_stream(
+    stdin: FileDescriptor,
+    stdout: FileDescriptor,
+) -> anyhow::Result<Box<dyn AsyncReadAndWrite>> {
+    Ok(Box::new(Async::new(SshStream { stdin, stdout })?))
 }
 
 unsafe impl async_io::IoSafe for SshStream {}
@@ -1569,11 +1886,23 @@ impl Write for SshStream {
 
 impl Reconnectable {
     fn new(config: ClientDomainConfig, stream: Option<Box<dyn AsyncReadAndWrite>>) -> Self {
+        let stored_password = match &config {
+            ClientDomainConfig::Ssh(ssh) => ssh.stored_password.clone(),
+            ClientDomainConfig::Unix(_) | ClientDomainConfig::Tls(_) => None,
+        };
         Self {
+            stored_password: Arc::new(Mutex::new(stored_password)),
             config,
             stream,
             tls_creds: None,
+            incoming_payload_limit: None,
+            connect_transport: Arc::new(Mutex::new(None)),
+            plugin_way: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn stored_password(&self) -> Option<String> {
+        self.stored_password.lock().unwrap().clone()
     }
 
     fn tls_creds_path(&self) -> anyhow::Result<PathBuf> {
@@ -1717,9 +2046,23 @@ impl Reconnectable {
         no_auto_start: bool,
     ) -> anyhow::Result<()> {
         let ssh_config = mux::ssh::ssh_domain_to_ssh_config(&ssh_dom)?;
+        let reverse_source = ssh_config
+            .get("user")
+            .zip(ssh_config.get("hostname"))
+            .map(|(user, host)| {
+                format!(
+                    "{}@{}:{}",
+                    user,
+                    host,
+                    ssh_config.get("port").map(String::as_str).unwrap_or("22")
+                )
+            })
+            .filter(|source| {
+                source.len() <= 256
+                    && thinkterm_reverse_access::protocol::display_text(source, 256) == *source
+            });
 
-        let sess =
-            ssh_connect_with_ui_and_password(ssh_config, ui, ssh_dom.stored_password.clone())?;
+        let sess = ssh_connect_with_ui_and_password(ssh_config, ui, self.stored_password())?;
         // A host with no mux binary would answer the proxy only with
         // "command not found" and a closed stream. Asked first, that case is
         // told apart, and the attach can offer to install ThinkTerm. Only the
@@ -1773,11 +2116,35 @@ impl Reconnectable {
             _ => {}
         });
 
-        let stream: Box<dyn AsyncReadAndWrite> = Box::new(Async::new(SshStream {
-            stdin: exec.stdin,
-            stdout: exec.stdout,
-        })?);
-        self.stream.replace(stream);
+        self.stream.replace(paired_stream(exec.stdin, exec.stdout)?);
+        // Another channel of this session reaches the same server: the one
+        // just reached, so it is never started for it.
+        *self.plugin_way.lock().unwrap() = Some(crate::plugin_link::PluginWay::Ssh {
+            session: sess.clone(),
+            command: match ssh_dom.override_proxy_command.clone() {
+                Some(command) => command,
+                None => Self::remote_mux_command(
+                    &ssh_dom.remote_wezterm_path,
+                    "cli --prefer-mux --no-auto-start proxy",
+                ),
+            },
+        });
+        if ssh_dom.override_proxy_command.is_none()
+            && sess
+                .authentication_info()
+                .is_some_and(|info| info.is_verified_password_only())
+            && reverse_source.is_some()
+        {
+            *self.connect_transport.lock().unwrap() = Some(ConnectTransport {
+                session: sess,
+                live: Arc::new(AtomicBool::new(true)),
+                command: Self::remote_mux_command(
+                    &ssh_dom.remote_wezterm_path,
+                    "cli --prefer-mux --no-auto-start connect-reverse-proxy",
+                ),
+                source: reverse_source.unwrap(),
+            });
+        }
         Ok(())
     }
 
@@ -1842,6 +2209,11 @@ impl Reconnectable {
         stream.set_write_timeout(Some(unix_dom.write_timeout))?;
         let stream: Box<dyn AsyncReadAndWrite> = Box::new(Async::new(stream)?);
         self.stream.replace(stream);
+        *self.plugin_way.lock().unwrap() = Some(match target {
+            UnixTarget::Socket(path) => crate::plugin_link::PluginWay::Unix { path },
+            // Another run of the command reaches the same server.
+            UnixTarget::Proxy(argv) => crate::plugin_link::PluginWay::Command { argv },
+        });
         Ok(())
     }
 
@@ -1852,15 +2224,6 @@ impl Reconnectable {
         ui: &mut ConnectionUI,
     ) -> anyhow::Result<()> {
         openssl::init();
-
-        let remote_address = &tls_client.remote_address;
-
-        let remote_host_name = remote_address.split(':').next().ok_or_else(|| {
-            anyhow!(
-                "expected mux_server_remote_address to have the form 'host:port', but have {}",
-                remote_address
-            )
-        })?;
 
         let network = match tls_client.ssh_parameters().transpose()? {
             Some(params) => {
@@ -1876,7 +2239,7 @@ impl Reconnectable {
         // we can connect using those same credentials and avoid running through
         // the SSH authentication flow.
         if let Some(Ok(_)) = tls_client.ssh_parameters() {
-            match self.try_connect(&tls_client, ui, &remote_address, remote_host_name, network) {
+            match self.try_connect(&tls_client, ui, network) {
                 Ok(stream) => {
                     self.stream.replace(stream);
                     return Ok(());
@@ -1980,7 +2343,7 @@ impl Reconnectable {
 
         let cloned_ui = ui.clone();
         let stream = cloned_ui.run_and_log_error({
-            || self.try_connect(&tls_client, ui, &remote_address, remote_host_name, network)
+            || self.try_connect(&tls_client, ui, network)
         })?;
         self.stream.replace(stream);
         Ok(())
@@ -1990,116 +2353,149 @@ impl Reconnectable {
         &mut self,
         tls_client: &TlsDomainClient,
         ui: &mut ConnectionUI,
-        remote_address: &str,
-        remote_host_name: &str,
         network: wezterm_ssh::Network,
     ) -> anyhow::Result<Box<dyn AsyncReadAndWrite>> {
-        let mut connector = SslConnector::builder(SslMethod::tls())?;
-
-        let cert_file = match tls_client.pem_cert.clone() {
-            Some(cert) => cert,
-            None => self.tls_creds_cert_path()?,
+        let way = TlsWay {
+            client: tls_client.clone(),
+            creds_cert: self.tls_creds_cert_path().ok(),
+            creds_ca: self.tls_creds_ca_path().ok(),
+            network,
         };
-
-        connector
-            .set_certificate_file(&cert_file, SslFiletype::PEM)
-            .context(format!(
-                "set_certificate_file to {} for TLS client",
-                cert_file.display()
-            ))?;
-
-        if let Some(chain_file) = tls_client.pem_ca.as_ref() {
-            connector
-                .set_certificate_chain_file(&chain_file)
-                .context(format!(
-                    "set_certificate_chain_file to {} for TLS client",
-                    chain_file.display()
-                ))?;
-        }
-
-        let key_file = match tls_client.pem_private_key.clone() {
-            Some(key) => key,
-            None => self.tls_creds_cert_path()?,
-        };
-        connector
-            .set_private_key_file(&key_file, SslFiletype::PEM)
-            .context(format!(
-                "set_private_key_file to {} for TLS client",
-                key_file.display()
-            ))?;
-
-        fn load_cert(name: &Path) -> anyhow::Result<X509> {
-            let cert_bytes = std::fs::read(name)?;
-            log::trace!("loaded {}", name.display());
-            Ok(X509::from_pem(&cert_bytes)?)
-        }
-        for name in &tls_client.pem_root_certs {
-            if name.is_dir() {
-                for entry in std::fs::read_dir(name)? {
-                    if let Ok(cert) = load_cert(&entry?.path()) {
-                        connector.cert_store_mut().add_cert(cert).ok();
-                    }
-                }
-            } else {
-                connector.cert_store_mut().add_cert(load_cert(name)?)?;
-            }
-        }
-
-        if let Ok(ca_path) = self.tls_creds_ca_path() {
-            if ca_path.exists() {
-                connector.cert_store_mut().add_cert(load_cert(&ca_path)?)?;
-            }
-        }
-
-        let connector = connector.build();
-        let connector = connector
-            .configure()?
-            .verify_hostname(!tls_client.accept_invalid_hostnames);
-
-        ui.output_str(&format!("Connecting to {} using TLS\n", remote_address));
-        // A machine the SSH that bootstrapped the domain reached another way
-        // than the OS network -- through an embedded tailnet -- is reached
-        // that way here too.
-        let (host, port) = split_host_port(remote_address).context("invalid TLS remote address")?;
-        let registered = wezterm_ssh::dial_registered(network, host, port, None);
-        let stream = match registered {
-            Some(dialed) => {
-                let stream = TcpStream::from(
-                    dialed.with_context(|| format!("connecting to {}", remote_address))?,
-                );
-                // Not TCP underneath, and so no delay to turn off.
-                let _ = stream.set_nodelay(true);
-                stream
-            }
-            None => {
-                let stream = TcpStream::connect(remote_address)
-                    .with_context(|| format!("connecting to {}", remote_address))?;
-                stream.set_nodelay(true)?;
-                stream
-            }
-        };
-        stream.set_write_timeout(Some(tls_client.write_timeout))?;
-        stream.set_read_timeout(Some(tls_client.read_timeout))?;
-
-        let stream = Box::new(Async::new(AsyncSslStream::new(
-            connector
-                .connect(
-                    tls_client
-                        .expected_cn
-                        .as_deref()
-                        .unwrap_or(remote_host_name),
-                    stream,
-                )
-                .with_context(|| {
-                    format!(
-                        "SslConnector for {} with host name {}",
-                        remote_address, remote_host_name,
-                    )
-                })?,
-        ))?);
-        ui.output_str("TLS Connected!\n");
+        let stream = tls_stream(&way, &mut |said| ui.output_str(said))?;
+        // Another connection made the same way reaches the same server.
+        *self.plugin_way.lock().unwrap() = Some(crate::plugin_link::PluginWay::Tls(way));
         Ok(stream)
     }
+}
+
+/// What a TLS connection to a domain's server is made from, as of the last
+/// one made: the domain's settings, where the credentials fetched over SSH
+/// are kept for it, and the network it is on.
+#[derive(Clone, Debug)]
+pub struct TlsWay {
+    pub(crate) client: TlsDomainClient,
+    pub(crate) creds_cert: Option<PathBuf>,
+    pub(crate) creds_ca: Option<PathBuf>,
+    pub(crate) network: wezterm_ssh::Network,
+}
+
+/// A TLS connection made by `way`, telling `said` how far it got.
+pub(crate) fn tls_stream(
+    way: &TlsWay,
+    said: &mut dyn FnMut(&str),
+) -> anyhow::Result<Box<dyn AsyncReadAndWrite>> {
+    let tls_client = &way.client;
+    let remote_address = &tls_client.remote_address;
+    let remote_host_name = remote_address.split(':').next().unwrap_or(remote_address);
+    let fetched = || {
+        way.creds_cert
+            .clone()
+            .ok_or_else(|| anyhow!("no place for the TLS credentials of {remote_address}"))
+    };
+    let mut connector = SslConnector::builder(SslMethod::tls())?;
+
+    let cert_file = match tls_client.pem_cert.clone() {
+        Some(cert) => cert,
+        None => fetched()?,
+    };
+
+    connector
+        .set_certificate_file(&cert_file, SslFiletype::PEM)
+        .context(format!(
+            "set_certificate_file to {} for TLS client",
+            cert_file.display()
+        ))?;
+
+    if let Some(chain_file) = tls_client.pem_ca.as_ref() {
+        connector
+            .set_certificate_chain_file(&chain_file)
+            .context(format!(
+                "set_certificate_chain_file to {} for TLS client",
+                chain_file.display()
+            ))?;
+    }
+
+    let key_file = match tls_client.pem_private_key.clone() {
+        Some(key) => key,
+        None => fetched()?,
+    };
+    connector
+        .set_private_key_file(&key_file, SslFiletype::PEM)
+        .context(format!(
+            "set_private_key_file to {} for TLS client",
+            key_file.display()
+        ))?;
+
+    fn load_cert(name: &Path) -> anyhow::Result<X509> {
+        let cert_bytes = std::fs::read(name)?;
+        log::trace!("loaded {}", name.display());
+        Ok(X509::from_pem(&cert_bytes)?)
+    }
+    for name in &tls_client.pem_root_certs {
+        if name.is_dir() {
+            for entry in std::fs::read_dir(name)? {
+                if let Ok(cert) = load_cert(&entry?.path()) {
+                    connector.cert_store_mut().add_cert(cert).ok();
+                }
+            }
+        } else {
+            connector.cert_store_mut().add_cert(load_cert(name)?)?;
+        }
+    }
+
+    if let Some(ca_path) = way.creds_ca.as_ref() {
+        if ca_path.exists() {
+            connector.cert_store_mut().add_cert(load_cert(ca_path)?)?;
+        }
+    }
+
+    let connector = connector.build();
+    let connector = connector
+        .configure()?
+        .verify_hostname(!tls_client.accept_invalid_hostnames);
+
+    said(&format!("Connecting to {} using TLS\n", remote_address));
+    // A machine the SSH that bootstrapped the domain reached another way
+    // than the OS network -- through an embedded tailnet -- is reached
+    // that way here too.
+    let (host, port) = split_host_port(remote_address).context("invalid TLS remote address")?;
+    let registered = wezterm_ssh::dial_registered(way.network, host, port, None);
+    let stream = match registered {
+        Some(dialed) => {
+            let stream =
+                TcpStream::from(dialed.with_context(|| format!("connecting to {}", remote_address))?);
+            // Not TCP underneath, and so no delay to turn off.
+            let _ = stream.set_nodelay(true);
+            stream
+        }
+        None => {
+            let stream = TcpStream::connect(remote_address)
+                .with_context(|| format!("connecting to {}", remote_address))?;
+            stream.set_nodelay(true)?;
+            stream
+        }
+    };
+    stream.set_write_timeout(Some(tls_client.write_timeout))?;
+    stream.set_read_timeout(Some(tls_client.read_timeout))?;
+
+    let stream = Box::new(Async::new(AsyncSslStream::new(
+        connector
+            .connect(
+                tls_client
+                    .expected_cn
+                    .as_deref()
+                    .unwrap_or(remote_host_name),
+                stream,
+            )
+            .with_context(|| {
+                format!(
+                    "SslConnector for {} with host name {}",
+                    remote_address, remote_host_name,
+                )
+            })?,
+    ))?);
+    said("TLS Connected!\n");
+    Ok(stream)
 }
 
 /// `host:port` or `[v6]:port`, as `remote_address` spells it.
@@ -2114,6 +2510,9 @@ fn split_host_port(address: &str) -> Option<(&str, u16)> {
 
 impl Client {
     fn new(local_domain_id: Option<DomainId>, mut reconnectable: Reconnectable) -> Self {
+        let connect_transport = Arc::clone(&reconnectable.connect_transport);
+        let plugin_way = Arc::clone(&reconnectable.plugin_way);
+        let stored_password = Arc::clone(&reconnectable.stored_password);
         let client_domain_config = reconnectable.config.clone();
         let is_reconnectable = reconnectable.reconnectable();
         let is_local = reconnectable.is_local();
@@ -2128,6 +2527,8 @@ impl Client {
         let connection_phase = Arc::new(AtomicU8::new(ClientConnectionPhase::Registering as u8));
         let reader_connection_phase = Arc::clone(&connection_phase);
         let (resume_reconnect_tx, resume_reconnect_rx) = bounded::<()>(1);
+        let retry_now = Arc::new(AtomicBool::new(false));
+        let reader_retry_now = Arc::clone(&retry_now);
         let remote_server_id = Arc::new(RwLock::new(None));
         let remote_os_release = Arc::new(RwLock::new(None));
         let connection_generation = Arc::new(AtomicU64::new(0));
@@ -2231,16 +2632,29 @@ impl Client {
                     })
                     .detach();
                 }
-                if let Err(e) = client_thread(
+                let connection_result = client_thread(
                     &mut reconnectable,
                     local_domain_id,
                     generation,
                     &mut receiver,
                     &shutdown_rx,
                     &abort_rx,
-                ) {
+                );
+                reconnectable.connect_transport.lock().unwrap().take();
+                if let Err(e) = connection_result {
                     *reader_abort.lock().unwrap() = None;
-                    log::warn!(
+                    // A client let go of on purpose ends so: nothing to warn
+                    // of, however often a command asks and lets go.
+                    let let_go = matches!(
+                        e.root_cause().downcast_ref::<NotReconnectableError>(),
+                        Some(NotReconnectableError::ClientWasDestroyed)
+                    );
+                    log::log!(
+                        if let_go {
+                            log::Level::Debug
+                        } else {
+                            log::Level::Warn
+                        },
                         "mux connection generation {generation} ended in {:?}: {e:#}",
                         ClientConnectionPhase::from_u8(
                             reader_connection_phase.load(Ordering::Acquire)
@@ -2293,6 +2707,8 @@ impl Client {
                     reader_connection_phase
                         .store(ClientConnectionPhase::Reconnecting as u8, Ordering::Release);
                     crate::domain::wake_thinkterm_frontend();
+                    // A Reconnect asked for while connected is not for this.
+                    take_reconnect_request(&reader_retry_now, &resume_reconnect_rx);
 
                     let session_lasted = session_started.elapsed() >= SHORT_SESSION;
                     if session_lasted {
@@ -2387,9 +2803,10 @@ impl Client {
                         if suspend.is_some() {
                             // Parked below; no further attempt this round.
                         } else if ui
-                            .sleep_with_reason(
+                            .sleep_or_until(
                                 &format!("client disconnected {}; will reconnect", e),
                                 backoff,
+                                Arc::clone(&reader_retry_now),
                             )
                             .is_err()
                         {
@@ -2400,6 +2817,14 @@ impl Client {
                         } else {
                             if shutdown_rx.is_closed() {
                                 break 'client;
+                            }
+                            if take_reconnect_request(&reader_retry_now, &resume_reconnect_rx) {
+                                // Asked for now, by Reconnect in the sidebar:
+                                // a fresh round, as after a parked loop resumes.
+                                log::info!("retrying now, as asked");
+                                *outage_started = std::time::Instant::now();
+                                backoff = BASE_INTERVAL;
+                                short_sessions = 0;
                             }
                             let initial = false;
                             // Normally a reconnect must not auto-start a
@@ -2443,6 +2868,12 @@ impl Client {
                                         // We asked and they declined; another
                                         // attempt would only ask again.
                                         suspend = Some("authentication was declined".to_string());
+                                    } else if is_stored_password_refused(&err) {
+                                        // Sending it again changes nothing
+                                        // but the server's count of failed
+                                        // sign-ins from this address.
+                                        suspend =
+                                            Some("the stored password was refused".to_string());
                                     }
                                 }
                             }
@@ -2464,6 +2895,8 @@ impl Client {
                                 async { resume_reconnect_rx.recv().await.map_err(|_| ()) },
                             )) {
                                 Ok(()) => {
+                                    // The Reconnect that woke it is answered.
+                                    reader_retry_now.store(false, Ordering::Release);
                                     reader_connection_phase.store(
                                         ClientConnectionPhase::Reconnecting as u8,
                                         Ordering::Release,
@@ -2553,11 +2986,40 @@ impl Client {
             client_domain_config,
             connection_phase,
             resume_reconnect_tx,
+            retry_now,
             remote_server_id,
             remote_os_release,
             connection_generation,
             fatal_connection_error,
+            connect_transport,
+            plugin_way,
+            stored_password,
         }
+    }
+
+    /// How a connection for plugin frames alone is opened to the server
+    /// this client is connected to (`plugin_link::PluginLink::open`); none
+    /// while it is not connected, or where no second way is known.
+    pub fn plugin_way(&self) -> Option<crate::plugin_link::PluginWay> {
+        if self.connection_phase() != ClientConnectionPhase::Ready {
+            return None;
+        }
+        self.plugin_way.lock().ok()?.clone()
+    }
+
+    pub fn verified_connect_session(&self) -> Option<VerifiedConnectSession> {
+        if self.connection_phase() != ClientConnectionPhase::Ready || self.local_domain_id.is_none()
+        {
+            return None;
+        }
+        let transport = self.connect_transport.lock().ok()?;
+        let transport = transport.as_ref()?;
+        Some(VerifiedConnectSession {
+            session: transport.session.clone(),
+            live: Arc::downgrade(&transport.live),
+            command: transport.command.clone(),
+            source: transport.source.clone(),
+        })
     }
 
     /// Mark the connection as failed in a way no amount of retrying can fix.
@@ -2782,6 +3244,37 @@ impl Client {
         Ok(Self::new(local_domain_id, reconnectable))
     }
 
+    /// A client on a socket the caller has connected to `unix_dom`'s
+    /// server, for one it does not reconnect to: a server it only asks
+    /// things of, or watches until it is gone.
+    pub fn new_unix_stream(unix_dom: &UnixDomain, stream: UnixStream) -> anyhow::Result<Self> {
+        Self::new_unix_stream_with_limit(unix_dom, stream, None)
+    }
+
+    /// A socket owned by another account gets a limit before even the
+    /// version handshake is read; ordinary mux connections keep theirs.
+    pub fn new_unix_stream_bounded(
+        unix_dom: &UnixDomain,
+        stream: UnixStream,
+        payload_limit: usize,
+    ) -> anyhow::Result<Self> {
+        Self::new_unix_stream_with_limit(unix_dom, stream, Some(payload_limit))
+    }
+
+    fn new_unix_stream_with_limit(
+        unix_dom: &UnixDomain,
+        stream: UnixStream,
+        payload_limit: Option<usize>,
+    ) -> anyhow::Result<Self> {
+        stream.set_read_timeout(Some(unix_dom.read_timeout))?;
+        stream.set_write_timeout(Some(unix_dom.write_timeout))?;
+        let stream: Box<dyn AsyncReadAndWrite> = Box::new(Async::new(stream)?);
+        let mut reconnectable =
+            Reconnectable::new(ClientDomainConfig::Unix(unix_dom.clone()), Some(stream));
+        reconnectable.incoming_payload_limit = payload_limit;
+        Ok(Self::new(None, reconnectable))
+    }
+
     pub fn new_tls(
         local_domain_id: DomainId,
         tls_client: &TlsDomainClient,
@@ -2903,6 +3396,8 @@ impl Client {
     rpc!(spawn_v2, SpawnV2, SpawnResponse);
     rpc!(split_pane, SplitPane, SpawnResponse);
     rpc!(spawn_pane_in_stack, SpawnPaneInStack, SpawnResponse);
+    rpc!(spawn_page, SpawnPage, SpawnPageResponse);
+    rpc!(change_page, ChangePage, UnitResponse);
     rpc!(activate_pane_in_stack, ActivatePaneInStack, UnitResponse);
     rpc!(move_pane_to_stack, MovePaneToStack, UnitResponse);
     rpc!(swap_panes, SwapPanes, UnitResponse);
@@ -2980,10 +3475,32 @@ impl Client {
         GetPaneRenderableDimensionsResponse
     );
     rpc!(get_codec_version, GetCodecVersion, GetCodecVersionResponse);
+    rpc!(
+        get_connect_endpoint,
+        GetConnectEndpoint,
+        GetConnectEndpointResponse
+    );
     rpc!(get_tls_creds, GetTlsCreds = (), GetTlsCredsResponse);
     rpc!(web_token_mint, WebTokenMint, WebTokenMintResponse);
     rpc!(web_token_list, WebTokenList = (), WebTokenListResponse);
     rpc!(web_token_revoke, WebTokenRevoke, WebTokenRevokeResponse);
+    rpc!(share_start, ShareStart, ShareListResponse);
+    rpc!(share_list, ShareList = (), ShareListResponse);
+    rpc!(share_stop, ShareStop, UnitResponse);
+    rpc!(share_kick, ShareKick, UnitResponse);
+    rpc!(share_grant, ShareGrant, UnitResponse);
+    rpc!(share_revoke, ShareRevoke, UnitResponse);
+    rpc!(share_deny, ShareDeny, UnitResponse);
+    rpc!(
+        share_candidates,
+        ShareCandidates = (),
+        ShareCandidatesResponse
+    );
+    rpc!(share_incoming, ShareIncoming = (), ShareIncomingResponse);
+    rpc!(share_discover, ShareDiscover = (), ShareDiscoverResponse);
+    rpc!(share_join, ShareJoin, ShareJoinResponse);
+    rpc!(share_request_control, ShareRequestControl, UnitResponse);
+    rpc!(share_release_control, ShareReleaseControl, UnitResponse);
     rpc!(
         get_web_server_status,
         GetWebServerStatus = (),
@@ -3022,6 +3539,14 @@ impl Client {
     rpc!(subscribe_events, SubscribeEvents, UnitResponse);
 }
 
+// The flag only interrupts the sleep; the queued token owns the request.
+// Clear the hint first so a concurrently queued request can wake the next
+// wait. An answered request must not later wake a suspended retry loop.
+fn take_reconnect_request(retry_now: &AtomicBool, resume: &Receiver<()>) -> bool {
+    retry_now.store(false, Ordering::Release);
+    resume.try_recv().is_ok()
+}
+
 /// The outage clock to carry into the next reconnect round, given how the
 /// session that just ended fared. `None` means no outage is in progress.
 fn outage_clock_after_session(
@@ -3039,9 +3564,98 @@ fn outage_clock_after_session(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_auth_cancelled, outage_clock_after_session, split_host_port, Reconnectable};
+    use super::{
+        is_auth_cancelled, is_stored_password_refused, outage_clock_after_session, split_host_port,
+        Reconnectable,
+    };
     use crate::domain::ClientDomainConfig;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn immediate_reconnect_consumes_the_request_before_a_later_suspension() {
+        use super::{take_reconnect_request, AtomicBool, Ordering};
+        let (sender, receiver) = smol::channel::bounded(1);
+        let hint = AtomicBool::new(false);
+        sender.try_send(()).unwrap();
+        hint.store(true, Ordering::Release);
+        assert!(take_reconnect_request(&hint, &receiver));
+        assert!(!hint.load(Ordering::Acquire));
+        // Neither give-up nor a declined prompt may wake on the old click.
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(smol::channel::TryRecvError::Empty)
+        ));
+        assert!(!take_reconnect_request(&hint, &receiver));
+        // A new click still wakes a parked loop.
+        sender.try_send(()).unwrap();
+        hint.store(true, Ordering::Release);
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn reconnect_tokens_are_authoritative_even_when_the_hint_arrives_late() {
+        use super::{take_reconnect_request, AtomicBool, Ordering};
+        let (sender, receiver) = smol::channel::bounded(1);
+        let hint = AtomicBool::new(false);
+        // The reader can run between publication of the token and hint.
+        sender.try_send(()).unwrap();
+        assert!(take_reconnect_request(&hint, &receiver));
+        hint.store(true, Ordering::Release);
+        assert!(!take_reconnect_request(&hint, &receiver));
+        assert!(!hint.load(Ordering::Acquire));
+        sender.try_send(()).unwrap();
+        assert!(take_reconnect_request(&hint, &receiver));
+    }
+
+    #[test]
+    fn releasing_a_share_tap_drops_payloads_without_removing_its_replacement() {
+        use super::{ShareUpdateTap, UnilateralSink};
+        use codec::{Pdu, ShareStateChanged};
+
+        for replaced in [false, true] {
+            let (sender, receiver) = crate::share_queue::channel();
+            sender
+                .send(Pdu::ShareStateChanged(ShareStateChanged {
+                    share_id: 1,
+                    controlling: true,
+                    requested: false,
+                    controller: None,
+                    ended: None,
+                }))
+                .unwrap();
+            let (replacement, next) = crate::share_queue::channel();
+            let mut installed = Some(UnilateralSink::Share(if replaced {
+                replacement
+            } else {
+                sender
+            }));
+            let tap = ShareUpdateTap { receiver };
+            tap.release(&mut installed);
+            assert!(matches!(
+                tap.try_recv(),
+                Err(smol::channel::TryRecvError::Closed)
+            ));
+            if replaced {
+                installed
+                    .as_ref()
+                    .unwrap()
+                    .send(Pdu::ShareStateChanged(ShareStateChanged {
+                        share_id: 1,
+                        controlling: false,
+                        requested: false,
+                        controller: None,
+                        ended: Some("stopped".into()),
+                    }))
+                    .unwrap();
+                assert!(matches!(
+                    next.try_recv(),
+                    Ok(crate::share_queue::Update::Ended(reason)) if reason == "stopped"
+                ));
+            } else {
+                assert!(installed.is_none());
+            }
+        }
+    }
 
     #[test]
     fn a_tls_address_splits_into_host_and_port() {
@@ -3089,6 +3703,33 @@ mod tests {
     }
 
     #[test]
+    fn a_password_given_later_is_the_one_the_next_sign_in_uses() {
+        let reconnectable = Reconnectable::new(
+            ClientDomainConfig::Ssh(config::SshDomain {
+                stored_password: Some("example-old".to_string()),
+                ..Default::default()
+            }),
+            None,
+        );
+        assert_eq!(
+            reconnectable.stored_password().as_deref(),
+            Some("example-old")
+        );
+        // What `Client::set_stored_password` does, from the other end.
+        *reconnectable.stored_password.lock().unwrap() = Some("example-new".to_string());
+        assert_eq!(
+            reconnectable.stored_password().as_deref(),
+            Some("example-new")
+        );
+
+        let no_password = Reconnectable::new(
+            ClientDomainConfig::Unix(config::UnixDomain::default()),
+            None,
+        );
+        assert_eq!(no_password.stored_password(), None);
+    }
+
+    #[test]
     fn only_the_local_session_host_reconnects_over_a_unix_socket() {
         let plain = Reconnectable::new(
             ClientDomainConfig::Unix(config::UnixDomain::default()),
@@ -3125,6 +3766,25 @@ mod tests {
     fn an_ordinary_failure_is_not_auth_cancellation() {
         let err = anyhow::anyhow!("Connecting to host within 10s: timed out");
         assert!(!is_auth_cancelled(&err));
+    }
+
+    #[test]
+    fn a_refused_stored_password_survives_being_wrapped_in_context() {
+        // The reconnect loop parks on this too, rather than send the same
+        // password again.
+        let err = anyhow::Error::new(mux::ssh::StoredPasswordRefused(
+            "password auth status: Denied".to_string(),
+        ))
+        .context("ssh_connect_with_ui_and_password")
+        .context("reconnecting");
+        assert!(is_stored_password_refused(&err));
+        assert!(!is_auth_cancelled(&err));
+    }
+
+    #[test]
+    fn a_refusal_without_the_marker_is_an_ordinary_failure() {
+        let err = anyhow::anyhow!("Error: password auth status: Denied");
+        assert!(!is_stored_password_refused(&err));
     }
 
     #[test]
@@ -3268,6 +3928,112 @@ mod connection_regression_tests {
             panic!("connection test timed out")
         })
         .await
+    }
+
+    #[test]
+    fn a_bounded_connection_limits_replies_and_pushes_before_and_after_registration() {
+        block_on(async {
+            for registered in [false, true] {
+                for push in [false, true] {
+                    for link in [codec::Link::SameMachine, codec::Link::Network] {
+                        let (mut connection, mut peer) = pair();
+                        connection.incoming_payload_limit = Some(1024);
+                        let (sender, mut receiver) = unbounded();
+                        if registered {
+                            sender
+                                .try_send(ReaderMessage::RegistrationComplete {
+                                    connection_generation: 1,
+                                })
+                                .unwrap();
+                        }
+                        let (promise, _reply) = bounded(1);
+                        sender
+                            .try_send(ReaderMessage::SendPdu {
+                                pdu: Pdu::Ping(Ping {}),
+                                promise,
+                                registration_required: false,
+                            })
+                            .unwrap();
+                        let result = within(smol::future::or(
+                            client_thread_async(&mut connection, None, 1, &mut receiver),
+                            async {
+                                let request = Pdu::decode_async(&mut peer, None).await.unwrap();
+                                Pdu::WindowTitleChanged(WindowTitleChanged {
+                                    window_id: 0,
+                                    title: "x".repeat(8192),
+                                })
+                                .encode_async_over(
+                                    &mut peer,
+                                    if push { 0 } else { request.serial },
+                                    link,
+                                )
+                                .await
+                                .unwrap();
+                                std::future::pending().await
+                            },
+                        ))
+                        .await;
+                        assert!(
+                            format!("{:#}", result.unwrap_err())
+                                .contains("more than this connection takes"),
+                            "registered={}, push={}, link={:?}",
+                            registered,
+                            push,
+                            link
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn bounded_clients_keep_small_replies_and_ordinary_clients_keep_larger_ones() {
+        block_on(async {
+            for registered in [false, true] {
+                for (limit, bytes) in [(Some(1024), 200), (None, 8192)] {
+                    for link in [codec::Link::SameMachine, codec::Link::Network] {
+                        let (mut connection, mut peer) = pair();
+                        assert_eq!(connection.incoming_payload_limit, None);
+                        connection.incoming_payload_limit = limit;
+                        let (sender, mut receiver) = unbounded();
+                        if registered {
+                            sender
+                                .try_send(ReaderMessage::RegistrationComplete {
+                                    connection_generation: 1,
+                                })
+                                .unwrap();
+                        }
+                        let (promise, reply) = bounded(1);
+                        sender
+                            .try_send(ReaderMessage::SendPdu {
+                                pdu: Pdu::Ping(Ping {}),
+                                promise,
+                                registration_required: false,
+                            })
+                            .unwrap();
+                        let reader = async {
+                            let result =
+                                client_thread_async(&mut connection, None, 1, &mut receiver).await;
+                            panic!("connection ended: {:?}", result);
+                        };
+                        let server = async {
+                            let request = Pdu::decode_async(&mut peer, None).await.unwrap();
+                            let response = Pdu::WindowTitleChanged(WindowTitleChanged {
+                                window_id: 0,
+                                title: "x".repeat(bytes),
+                            });
+                            response
+                                .encode_async_over(&mut peer, request.serial, link)
+                                .await
+                                .unwrap();
+                            assert_eq!(reply.recv().await.unwrap().unwrap(), response);
+                        };
+                        within(smol::future::or(reader, server)).await;
+                    }
+                }
+            }
+        });
     }
 
     #[test]

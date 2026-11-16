@@ -6,9 +6,10 @@ use crate::termwindow::space_swipe::{SidebarSpaceSwipeFinish, SidebarSpaceSwipeU
 use crate::termwindow::ui::platform_chrome::WindowTabChromeParams;
 use crate::termwindow::ui::sidebar::SpaceConnectionState;
 use crate::termwindow::ui::tokens::{
-    PANE_NAV_INSET, PANE_NAV_TAB_GAP, TAB_MIN_WIDTH, TAB_ROW_START_PADDING, TAB_TARGET_WIDTH,
-    TAB_VERTICAL_PADDING, WINDOW_TAB_ACTION_RESERVED_WIDTH, WINDOW_TAB_GAP,
-    WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP, WINDOW_TAB_TOP_SPACER,
+    MACOS_THREAD_WINDOW_TAB_START, PANE_NAV_INSET, PANE_NAV_TAB_GAP, TAB_MIN_WIDTH,
+    TAB_ROW_START_PADDING, TAB_TARGET_WIDTH, TAB_VERTICAL_PADDING,
+    WINDOW_TAB_ACTION_RESERVED_WIDTH, WINDOW_TAB_GAP, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE,
+    WINDOW_TAB_LEADING_ACTION_GAP, WINDOW_TAB_TOP_SPACER,
 };
 use crate::termwindow::{
     pane_drop_action, pane_drop_zone, zone_split_request, GuiWin, MouseCapture, PaneDropKind,
@@ -51,7 +52,7 @@ const TAB_WHEEL_DIRECTION_LOCK_MS: u64 = 140;
 /// submenu of their own.
 const NEW_TAB_MENU_HOSTS_INLINE: usize = 6;
 
-/// The update capsule floats over the terminal's corner: a wheel turned over
+/// The update notice's buttons float over the terminal's corner: a wheel turned over
 /// it scrolls the terminal underneath.
 fn update_capsule_wheel_passthrough(event: &MouseEvent, item: &UIItem) -> bool {
     matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_))
@@ -130,7 +131,7 @@ fn tr_with_name(id: &'static str, name: &str) -> String {
 /// into one submenu instead: the name is said once, on the parent, and the
 /// children say only what they do. A local Space has a single action, so it
 /// stays flat — a submenu holding one item is just an extra click.
-fn space_destructive_menu_items(
+pub(crate) fn space_destructive_menu_items(
     space: &crate::workspace_threads::SpaceView,
     offer_remote_kill: bool,
 ) -> Vec<ContextMenuItem> {
@@ -171,6 +172,84 @@ fn space_destructive_menu_items(
         ContextMenuIcon::Delete,
         children,
     )]
+}
+
+/// A server's row in the one-row-per-server Space menu: a server with one
+/// Space switches to it from the row itself; one with several opens them,
+/// and a new one, in a submenu. `icon` is the one picked for the host.
+fn server_menu_row(
+    label: String,
+    domain: &str,
+    icon: ContextMenuIcon,
+    spaces: &[&crate::workspace_threads::SpaceView],
+) -> ContextMenuItem {
+    if let [space] = spaces {
+        let item = ContextMenuItem::item_with_icon(
+            label,
+            icon,
+            KeyAssignment::SwitchSpace(space.id.to_string()),
+        );
+        return if space.is_occupied_by_other_window {
+            item.disabled()
+        } else {
+            item
+        };
+    }
+    let mut children: Vec<ContextMenuItem> = spaces
+        .iter()
+        .map(|space| {
+            let item = ContextMenuItem::item_with_icon(
+                if space.is_occupied_by_other_window {
+                    tr_with_name("menu-space-occupied", &space.name)
+                } else {
+                    space.name.clone()
+                },
+                ContextMenuIcon::Stack,
+                KeyAssignment::SwitchSpace(space.id.to_string()),
+            );
+            if space.is_occupied_by_other_window {
+                item.disabled()
+            } else {
+                item
+            }
+        })
+        .collect();
+    children.push(ContextMenuItem::Separator);
+    children.push(ContextMenuItem::item_with_icon(
+        crate::i18n::tr("menu-new-space-here"),
+        ContextMenuIcon::New,
+        KeyAssignment::CreateSpaceOnDomain(domain.to_string()),
+    ));
+    ContextMenuItem::submenu_with_icon(label, icon, children)
+}
+
+/// "New Space on Server": one row per server, (label, mux domain, icon),
+/// each making a Space there.
+fn new_space_on_server_menu(servers: Vec<(String, String, ContextMenuIcon)>) -> ContextMenuItem {
+    ContextMenuItem::submenu_with_icon(
+        crate::i18n::tr("menu-new-space-on-server"),
+        ContextMenuIcon::Server,
+        servers
+            .into_iter()
+            .map(|(label, domain, icon)| {
+                ContextMenuItem::item_with_icon(
+                    label,
+                    icon,
+                    KeyAssignment::CreateSpaceOnDomain(domain),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Servers folded to one row each, connected ones first, then those on
+/// their way, then the rest; in their own order within each.
+fn order_servers_by_connection<T>(servers: &mut [(T, SpaceConnectionState)]) {
+    servers.sort_by_key(|(_, state)| match state {
+        SpaceConnectionState::Connected => 0,
+        SpaceConnectionState::Connecting | SpaceConnectionState::Reconnecting => 1,
+        SpaceConnectionState::Disconnected => 2,
+    });
 }
 
 fn note_drag_scroll_delta(
@@ -405,7 +484,7 @@ impl super::TermWindow {
             .unwrap_or_else(|| f32::from(amount))
     }
 
-    fn sidebar_vertical_scroll_delta(&self, event: &MouseEvent) -> Option<f32> {
+    pub(crate) fn sidebar_vertical_scroll_delta(&self, event: &MouseEvent) -> Option<f32> {
         if !matches!(event.kind, WMEK::VertWheel(_)) {
             return None;
         }
@@ -422,7 +501,7 @@ impl super::TermWindow {
         }
     }
 
-    fn sidebar_horizontal_scroll_delta(&self, event: &MouseEvent) -> Option<f32> {
+    pub(crate) fn sidebar_horizontal_scroll_delta(&self, event: &MouseEvent) -> Option<f32> {
         if !matches!(event.kind, WMEK::HorzWheel(_)) {
             return None;
         }
@@ -500,6 +579,7 @@ impl super::TermWindow {
     pub(crate) fn window_tab_chrome_params(&self) -> WindowTabChromeParams {
         WindowTabChromeParams {
             workspace_sidebar_width: self.workspace_sidebar_width(),
+            has_workspace_sidebar: self.dedicated_thread.is_none(),
             window_state: self.window_state,
             window_decorations: self.config.window_decorations,
             integrated_title_button_alignment: self.config.integrated_title_button_alignment,
@@ -569,7 +649,7 @@ impl super::TermWindow {
             1
         } else {
             2
-        };
+        } + usize::from(self.window_tab_reveal.shows_pin());
         let window_button_count = if self.right_sidebar_width() == 0
             && self
                 .window_tab_chrome_params()
@@ -593,12 +673,51 @@ impl super::TermWindow {
         )
     }
 
-    pub(super) fn pane_nav_tab_left_inset(&self, pane_left: usize) -> usize {
-        if pane_left == 0 && self.workspace_sidebar_width() > 0 {
+    pub(super) fn pane_nav_tab_left_inset(&self, pos: &PositionedPane) -> usize {
+        // A window tab row out of the layout leaves the traffic lights and
+        // the sidebar button beside them over the top-left pane's bar, whose
+        // tabs then start where the row's do, or nearer the lights in a
+        // thread's own window, which has no button. Brought down, the row
+        // takes them back and pushes the bar below them: its tabs go back to
+        // the edge as the row comes. Off macOS the bar holds the sidebar button
+        // itself (see `pane_bar_sidebar_toggle_share`), and makes way for it
+        // the same way.
+        let edge = self.ui_px(PANE_NAV_INSET) as f32;
+        if pos.left == 0
+            && pos.top == 0
+            && cfg!(target_os = "macos")
+            && !self.window_state.contains(WindowState::FULL_SCREEN)
+            && self.workspace_sidebar_width() == 0
+            && !self.window_tab_reveal.in_layout()
+        {
+            let clear = if self.dedicated_thread.is_some() {
+                self.ui_px(MACOS_THREAD_WINDOW_TAB_START) as f32
+            } else {
+                self.window_tab_left_padding_pixels().ceil()
+                    + self.ui_px(TAB_ROW_START_PADDING) as f32
+            };
+            let away = 1.0 - self.window_tab_reveal.shown();
+            return (edge + (clear - edge).max(0.0) * away).round() as usize;
+        }
+        let share = self.pane_bar_sidebar_toggle_share(pos);
+        if share > 0.0 {
+            let clear = self.pane_bar_sidebar_toggle_clear(pos);
+            return (edge + (clear - edge).max(0.0) * share).round() as usize;
+        }
+        if pos.left == 0 && self.workspace_sidebar_width() > 0 {
             self.ui_px(TAB_ROW_START_PADDING)
         } else {
             self.ui_px(PANE_NAV_INSET)
         }
+    }
+
+    /// Where `pos`'s tabs start past the sidebar's toggle, once the row is
+    /// all the way away and its bar holds that.
+    pub(super) fn pane_bar_sidebar_toggle_clear(&self, pos: &PositionedPane) -> f32 {
+        let (_, _, button_size) =
+            self.pane_nav_button_metrics(self.pane_nav_bar_height_for_pane(pos));
+        self.window_tab_leading_action_start_pixels().ceil()
+            + (button_size + self.ui_px(TAB_ROW_START_PADDING)) as f32
     }
 
     pub(super) fn window_tab_viewport_width(&self) -> f32 {
@@ -879,7 +998,11 @@ impl super::TermWindow {
             }
         }
 
-        let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
+        let tab_bar_height = if self.window_tab_row_in_place() {
+            self.tab_bar_pixel_height().unwrap_or(0.)
+        } else {
+            0.
+        };
         let tab_bar_y = border.top.get() as f32;
         if event.coords.x >= self.tab_bar_left_edge() as isize
             && (event.coords.x as f32) < self.terminal_viewport_right()
@@ -961,6 +1084,7 @@ impl super::TermWindow {
         // out; one open while it is away keeps it from revealing.
         let overlay_open = self.menu_or_overlay_open();
         let eligible = crate::native_settings::workspace_sidebar_hover_reveal_enabled()
+            && self.dedicated_thread.is_none()
             && self.workspace_sidebar_collapsed
             && !self.content_view_foreground()
             && !self.content_view_transition_running()
@@ -1047,6 +1171,16 @@ impl super::TermWindow {
         event: &MouseEvent,
         context: &dyn WindowOps,
     ) -> bool {
+        // Over the Library, a wheel or a trackpad moves along its cards, never
+        // to another Space -- but for the swipe that is bringing it out, which
+        // goes on as it began.
+        if self.library_presented() && !self.workspace_sidebar_swipe.is_active() {
+            let sideways = self.sidebar_horizontal_scroll_delta(event);
+            let down = self.sidebar_vertical_scroll_delta(event);
+            if let Some(handled) = self.scroll_library(event, sideways, down, context) {
+                return handled;
+            }
+        }
         #[cfg(target_os = "macos")]
         if let Some(handled) = self.mouse_wheel_workspace_sidebar_space_swipe(event, context) {
             return handled;
@@ -1064,6 +1198,13 @@ impl super::TermWindow {
             || y >= rect.y.saturating_add(rect.height) as isize
         {
             return false;
+        }
+        // On its way, the panel is not where its list is laid out: the wheel
+        // moves nothing under the pointer.
+        if matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_))
+            && self.sidebar_panel_moving(crate::termwindow::sidebar_slide::Side::Left)
+        {
+            return true;
         }
 
         let delta = match event.kind {
@@ -1144,9 +1285,12 @@ impl super::TermWindow {
             return None;
         }
 
-        // Docked, or hover-revealed and fully arrived: a panel still sliding
-        // out must not host a second animation.
-        let panel_ready_for_swipe = !self.workspace_sidebar_collapsed
+        // Docked and done sliding, or hover-revealed and fully arrived: a
+        // panel still on its way must not host a second animation.
+        let panel_ready_for_swipe = (!self.workspace_sidebar_collapsed
+            && !self
+                .sidebar_slides
+                .sliding(crate::termwindow::sidebar_slide::Side::Left))
             || self
                 .workspace_sidebar_hover
                 .is_fully_presented(Instant::now());
@@ -1189,7 +1333,11 @@ impl super::TermWindow {
                 && self.workspace_sidebar_swipe.is_active()
             {
                 // A fresh gesture supersedes any unfinished/settling visual
-                // from the preceding gesture.
+                // from the preceding gesture -- and lets go of a Library the
+                // preceding one never finished bringing out.
+                if self.workspace_sidebar_swipe.library_pull().is_some() {
+                    self.let_go_library(0.0, context);
+                }
                 self.workspace_sidebar_swipe.cancel_immediately();
                 self.clear_workspace_space_swipe_frame_transition();
             }
@@ -1223,7 +1371,14 @@ impl super::TermWindow {
             let update = self.workspace_sidebar_swipe.update(delta_x, delta_y, now);
             match update {
                 SidebarSpaceSwipeUpdate::Pending => {}
-                SidebarSpaceSwipeUpdate::Horizontal => context.invalidate(),
+                SidebarSpaceSwipeUpdate::Horizontal => {
+                    // On past the first Space: the Library comes out with
+                    // the finger.
+                    if let Some(pull) = self.workspace_sidebar_swipe.library_pull() {
+                        self.hold_library(true, pull, context);
+                    }
+                    context.invalidate();
+                }
                 SidebarSpaceSwipeUpdate::Vertical(delta_y) => {
                     self.clear_workspace_space_swipe_frame_transition();
                     self.scroll_workspace_sidebar_by(-delta_y, context);
@@ -1236,6 +1391,11 @@ impl super::TermWindow {
                 self.finish_workspace_sidebar_space_swipe(now, context);
             }
             ScrollPhase::Cancelled => {
+                // Taken over, not ended: the Library it was bringing out is
+                // let go of where it is.
+                if self.workspace_sidebar_swipe.library_pull().is_some() {
+                    self.let_go_library(0.0, context);
+                }
                 self.workspace_sidebar_swipe.cancel_immediately();
                 self.clear_workspace_space_swipe_frame_transition();
                 context.invalidate();
@@ -1287,6 +1447,14 @@ impl super::TermWindow {
             SidebarSpaceSwipeFinish::FlushVertical(delta_y) => {
                 self.clear_workspace_space_swipe_frame_transition();
                 self.scroll_workspace_sidebar_by(-delta_y, context);
+                true
+            }
+            SidebarSpaceSwipeFinish::Library { velocity } => {
+                // On past the first Space the Library came out with the
+                // finger: on out, or back, as it lets go.
+                self.clear_workspace_space_swipe_frame_transition();
+                self.let_go_library(velocity, context);
+                context.invalidate();
                 true
             }
             SidebarSpaceSwipeFinish::None => {
@@ -1438,6 +1606,20 @@ impl super::TermWindow {
     }
 
     fn mouse_wheel_right_sidebar(&mut self, event: &MouseEvent, context: &dyn WindowOps) -> bool {
+        // On its way, the panel is not where what it shows is laid out: the
+        // wheel moves nothing under the pointer.
+        if matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_))
+            && self.sidebar_panel_moving(crate::termwindow::sidebar_slide::Side::Right)
+            && self.right_sidebar_rect().is_some_and(|rect| {
+                let (x, y) = (event.coords.x, event.coords.y);
+                x >= rect.x as isize
+                    && x < rect.x.saturating_add(rect.width) as isize
+                    && y >= rect.y as isize
+                    && y < rect.y.saturating_add(rect.height) as isize
+            })
+        {
+            return true;
+        }
         if self.right_sidebar_mode == super::RightSidebarMode::Chat {
             if let Some(rect) = self.right_sidebar_file_preview_rect() {
                 let x = event.coords.x;
@@ -1622,11 +1804,19 @@ impl super::TermWindow {
                     }
                 }
             }
+            UIItemType::PluginPage(pane_id) => {
+                if self.plugin_page_pointer_left(pane_id) {
+                    if let Some(window) = self.window.as_ref() {
+                        window.invalidate();
+                    }
+                }
+            }
             UIItemType::CloseTab(_)
             | UIItemType::PaneNav { .. }
             | UIItemType::ProjectNew
             | UIItemType::SpaceMenu
             | UIItemType::SpaceReconnect
+            | UIItemType::SharedWithMe(_)
             | UIItemType::ProjectToggleThreads(_)
             | UIItemType::ThreadRefGroupToggle { .. }
             | UIItemType::ThreadRefGroupNewThread(_)
@@ -1650,7 +1840,11 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarSshHosts
             | UIItemType::WorkspaceSidebarLiveOverview
             | UIItemType::WorkspaceSidebarNotifications
+            | UIItemType::WorkspaceSidebarJump
+            | UIItemType::Library(_)
             | UIItemType::RightSidebarToggle
+            | UIItemType::WindowTabsPin
+            | UIItemType::WindowTabsTravelling
             | UIItemType::RightSidebarMode(_)
             | UIItemType::RightSidebarBackground
             | UIItemType::RightSidebarResize
@@ -1702,11 +1896,23 @@ impl super::TermWindow {
             | UIItemType::RightSidebarFileCopyText
             | UIItemType::RightSidebarRemoteFileConnect
             | UIItemType::RightSidebarRemoteFileRefresh
+            | UIItemType::RightSidebarRemoteFileUpload
             | UIItemType::RightSidebarRemoteFileRow(_)
             | UIItemType::RightSidebarRemoteFileBack
             | UIItemType::RightSidebarRemoteFileCopyText
             | UIItemType::RightSidebarRemoteTransfer(_)
+            | UIItemType::TransferCardCancel(_)
+            | UIItemType::TransferCardDismiss(_)
+            | UIItemType::FinishedNoticeDismiss(_)
+            | UIItemType::TransferCardRetry(_)
+            | UIItemType::TransferCardOpen(_)
+            | UIItemType::TransferCardOpenDownloads(_)
+            | UIItemType::TransferCardCopyPath(_)
+            | UIItemType::TransferCardBackground
+            | UIItemType::DynamicStatusReveal(..)
+            | UIItemType::DynamicStatusShowAll
             | UIItemType::ContextMenuBackdrop
+            | UIItemType::SharePanel
             | UIItemType::ContextMenuItem(_)
             | UIItemType::CommandPalette
             | UIItemType::AboveScrollThumb(_)
@@ -1801,6 +2007,7 @@ impl super::TermWindow {
             | UIItemType::ProjectNew
             | UIItemType::SpaceMenu
             | UIItemType::SpaceReconnect
+            | UIItemType::SharedWithMe(_)
             | UIItemType::ProjectToggleThreads(_)
             | UIItemType::ThreadRefGroupToggle { .. }
             | UIItemType::ThreadRefGroupNewThread(_)
@@ -1824,7 +2031,11 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarSshHosts
             | UIItemType::WorkspaceSidebarLiveOverview
             | UIItemType::WorkspaceSidebarNotifications
+            | UIItemType::WorkspaceSidebarJump
+            | UIItemType::Library(_)
             | UIItemType::RightSidebarToggle
+            | UIItemType::WindowTabsPin
+            | UIItemType::WindowTabsTravelling
             | UIItemType::RightSidebarMode(_)
             | UIItemType::RightSidebarBackground
             | UIItemType::RightSidebarResize
@@ -1835,6 +2046,7 @@ impl super::TermWindow {
             | UIItemType::RightSidebarAgent(_)
             | UIItemType::RightSidebarPluginPanel
             | UIItemType::RightSidebarPluginExtended
+            | UIItemType::PluginPage(_)
             | UIItemType::RightSidebarPluginExtendedClose
             | UIItemType::RightSidebarPluginConnect(_)
             | UIItemType::RightSidebarSnippetNew
@@ -1878,11 +2090,23 @@ impl super::TermWindow {
             | UIItemType::RightSidebarFileCopyText
             | UIItemType::RightSidebarRemoteFileConnect
             | UIItemType::RightSidebarRemoteFileRefresh
+            | UIItemType::RightSidebarRemoteFileUpload
             | UIItemType::RightSidebarRemoteFileRow(_)
             | UIItemType::RightSidebarRemoteFileBack
             | UIItemType::RightSidebarRemoteFileCopyText
             | UIItemType::RightSidebarRemoteTransfer(_)
+            | UIItemType::TransferCardCancel(_)
+            | UIItemType::TransferCardDismiss(_)
+            | UIItemType::FinishedNoticeDismiss(_)
+            | UIItemType::TransferCardRetry(_)
+            | UIItemType::TransferCardOpen(_)
+            | UIItemType::TransferCardOpenDownloads(_)
+            | UIItemType::TransferCardCopyPath(_)
+            | UIItemType::TransferCardBackground
+            | UIItemType::DynamicStatusReveal(..)
+            | UIItemType::DynamicStatusShowAll
             | UIItemType::ContextMenuBackdrop
+            | UIItemType::SharePanel
             | UIItemType::ContextMenuItem(_)
             | UIItemType::CommandPalette
             | UIItemType::AboveScrollThumb(_)
@@ -1983,6 +2207,9 @@ impl super::TermWindow {
 
     pub fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         log::trace!("{:?}", event);
+        if matches!(event.kind, WMEK::Press(_)) {
+            self.interrupt_thread_numbers(false);
+        }
         // A move that does not reach the terminal -- the tab bar, a sidebar
         // -- leaves no cell behind: coming back is coming into a pane.
         let pointer_cell_before = if matches!(event.kind, WMEK::Move) {
@@ -2043,7 +2270,8 @@ impl super::TermWindow {
         }
 
         // Hit-test first. Tab bar, sidebars, menus and OS chrome stay usable
-        // without silently taking a terminal away from another device.
+        // without silently taking a terminal away from another device, a
+        // pane bar's blank standing in for the title bar among them.
         let area = self.content_view_area();
         let point_is_in_terminal_area = !self.content_view_foreground()
             && (event.coords.x as f32) >= area.min_x()
@@ -2058,7 +2286,7 @@ impl super::TermWindow {
                     | UIItemType::ScrollThumb(_)
                     | UIItemType::BelowScrollThumb(_)
                     | UIItemType::Split(_)
-            )
+            ) && !self.pane_bar_blank_is_title_bar(&item)
         });
         let terminal_surface = point_is_in_terminal_area
             && (self.resolve_ui_item(&event).is_none() || terminal_ui_item);
@@ -2109,6 +2337,15 @@ impl super::TermWindow {
                 self.cancel_remote_divider_resizes_except(None);
                 context.invalidate();
             }
+            // Chrome stays usable over a terminal held up here: the top edge
+            // still brings the window tab row down -- the way to another tab
+            // -- as the side edges do their sidebars where they may.
+            if self.command_palette.is_none() {
+                self.current_mouse_event.replace(event.clone());
+                self.update_workspace_sidebar_hover(context);
+                self.update_right_sidebar_hover(context);
+                self.update_window_tab_reveal(context);
+            }
             return;
         }
         if terminal_surface && takeover_gesture {
@@ -2119,11 +2356,13 @@ impl super::TermWindow {
         }
 
         self.current_mouse_event.replace(event.clone());
-        // Not while the command palette's scrim covers the window: the
-        // hover-reveal machinery would slide the sidebar out underneath it.
-        if self.command_palette.is_none() {
+        // Not while the command palette's scrim covers the window, or a share
+        // panel is open: the hover-reveal machinery would slide the sidebar
+        // out underneath it.
+        if self.command_palette.is_none() && !self.share_panel_open() {
             self.update_workspace_sidebar_hover(context);
             self.update_right_sidebar_hover(context);
+            self.update_window_tab_reveal(context);
         }
 
         if self.consume_context_menu_suppressed_release(&event) {
@@ -2131,23 +2370,28 @@ impl super::TermWindow {
             return;
         }
 
-        // The command palette owns all pointer traffic while open. Dispatched
-        // before the pane-dependent context-menu branch so it also works when
-        // there is no active pane (content view foreground).
+        // The command palette owns all pointer traffic while open.
         if self.mouse_event_command_palette(&event, context) {
             self.release_pointer_ownership(&event);
             return;
         }
+        // A pane's share panel likewise, while it is open.
+        if self.mouse_event_share_panel(&event, context) {
+            self.release_pointer_ownership(&event);
+            return;
+        }
 
-        if let Some(pane) = pane.as_ref() {
-            if self.mouse_event_context_menu(&event, pane, context) {
-                self.release_pointer_ownership(&event);
-                return;
-            }
-        } else if matches!(
-            self.current_mouse_capture,
-            Some(MouseCapture::TerminalPane(_))
-        ) {
+        // Not only over a terminal: a menu also opens over a page with none.
+        if self.mouse_event_context_menu(&event, context) {
+            self.release_pointer_ownership(&event);
+            return;
+        }
+        if pane.is_none()
+            && matches!(
+                self.current_mouse_capture,
+                Some(MouseCapture::TerminalPane(_))
+            )
+        {
             self.current_mouse_capture = None;
         }
 
@@ -2241,6 +2485,12 @@ impl super::TermWindow {
                         item.item_type == UIItemType::WorkspaceSidebarResize
                     }) {
                         self.persist_workspace_sidebar_width();
+                    }
+                    if completed_drag.as_ref().is_some_and(|(item, _)| {
+                        item.item_type
+                            == UIItemType::Library(crate::termwindow::ui::library::LibraryItem::Edge)
+                    }) {
+                        self.release_library_edge();
                     }
                     if completed_drag.as_ref().is_some_and(|(item, _)| {
                         item.item_type == UIItemType::RightSidebarResize
@@ -2374,7 +2624,9 @@ impl super::TermWindow {
                             self.update_sidebar_row_drag_target(event.coords);
                         }
                         if let Some(state) = self.sidebar_row_drag.take() {
-                            if state.active {
+                            if state.tear_off.as_ref().is_some_and(|off| off.is_out()) {
+                                self.drop_thread_out_of_sidebar(state, event.screen_coords);
+                            } else if state.active {
                                 self.drop_sidebar_row_drag(state, context);
                             } else {
                                 // Never crossed the drag threshold: this was
@@ -2394,11 +2646,7 @@ impl super::TermWindow {
                                         }
                                     }
                                     super::SidebarRowKind::Thread { thread_id, .. } => {
-                                        if !self.open_remote_workspace_thread_without_connecting(
-                                            &thread_id, context,
-                                        ) {
-                                            self.activate_workspace_thread(thread_id, context);
-                                        }
+                                        self.pick_sidebar_thread(thread_id, context);
                                     }
                                 }
                             }
@@ -2645,6 +2893,7 @@ impl super::TermWindow {
         // The machine reads `Away` now: cancels an Arming, starts a grace.
         self.update_workspace_sidebar_hover(context);
         self.update_right_sidebar_hover(context);
+        self.update_window_tab_reveal(context);
         self.update_title();
         if !preserve_cursor {
             context.set_cursor(Some(MouseCursor::Arrow));
@@ -3004,6 +3253,9 @@ impl super::TermWindow {
             UIItemType::WorkspaceSidebarResize => {
                 self.drag_workspace_sidebar_resize(item, start_event, event, context);
             }
+            UIItemType::Library(crate::termwindow::ui::library::LibraryItem::Edge) => {
+                self.drag_library_edge(item, start_event, event, context);
+            }
             UIItemType::RightSidebarResize => {
                 self.drag_right_sidebar_resize(item, start_event, event, context);
             }
@@ -3063,6 +3315,7 @@ impl super::TermWindow {
                 self.drag_workspace_sidebar_scroll_thumb(item, start_event, event, context);
             }
             UIItemType::ContextMenuBackdrop
+            | UIItemType::SharePanel
             | UIItemType::ContextMenuItem(_)
             | UIItemType::CommandPalette => {}
             UIItemType::PaneNav { .. } => {
@@ -3208,15 +3461,18 @@ impl super::TermWindow {
         draggable: bool,
         event: MouseEvent,
     ) {
+        self.sidebar_row_landing = None;
         self.sidebar_row_drag = Some(super::SidebarRowDragState {
             kind,
             title,
+            grip: super::DragGrip::of(&item, event.coords),
             start: event.coords,
             current: event.coords,
             active: false,
             draggable,
             autoscroll_scheduled: false,
             target: None,
+            tear_off: None,
         });
         self.dragging.replace((item, event));
     }
@@ -3229,8 +3485,12 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         let mut dragging_active = false;
+        // A pinned row has no place to move to, but comes out like any other.
+        let out_of_sidebar = !self.pointer_over_workspace_sidebar(event.coords);
         if let Some(state) = self.sidebar_row_drag.as_mut() {
-            if state.draggable && !state.active {
+            let tears_off =
+                out_of_sidebar && matches!(state.kind, super::SidebarRowKind::Thread { .. });
+            if (state.draggable || tears_off) && !state.active {
                 let dx = event.coords.x - state.start.x;
                 let dy = event.coords.y - state.start.y;
                 // ~5px of travel turns the pending click into a drag
@@ -3242,7 +3502,14 @@ impl super::TermWindow {
             dragging_active = state.active;
         }
         if dragging_active {
-            self.autoscroll_sidebar_for_row_drag(event.coords.y);
+            let torn_off = self
+                .sidebar_row_drag
+                .as_ref()
+                .and_then(|state| state.tear_off.as_ref())
+                .is_some_and(|tear_off| tear_off.is_out());
+            if !torn_off {
+                self.autoscroll_sidebar_for_row_drag(event.coords.y);
+            }
             self.update_sidebar_row_drag_target(event.coords);
             context.set_cursor(Some(MouseCursor::Hand));
             context.invalidate();
@@ -3320,8 +3587,9 @@ impl super::TermWindow {
 
     /// Recompute which gap the drag would drop into. The candidate rows are
     /// this frame's rendered rects: same-Space Project rows for a project
-    /// drag, the same project's (unpinned) thread rows for a thread drag —
-    /// the pinned section and other projects' threads are not targets.
+    /// drag, the same project's (unpinned) thread rows for a thread drag,
+    /// the same group's for a reference — the pinned section and other
+    /// projects' threads are not targets.
     fn update_sidebar_row_drag_target(&mut self, coords: ::window::Point) {
         let Some(kind) = self
             .sidebar_row_drag
@@ -3330,11 +3598,11 @@ impl super::TermWindow {
         else {
             return;
         };
-        let sidebar_x_ok = self
-            .ui_items
-            .iter()
-            .find(|candidate| candidate.item_type == UIItemType::WorkspaceSidebarBackground)
-            .is_some_and(|bg| coords.x >= bg.x as isize && coords.x < (bg.x + bg.width) as isize);
+        let sidebar_x_ok = self.pointer_over_workspace_sidebar(coords);
+        if let super::SidebarRowKind::Thread { thread_id, .. } = &kind {
+            self.aim_thread_tear_off(thread_id, !sidebar_x_ok);
+            self.move_thread_card_window();
+        }
         let rows: Vec<(String, isize, isize)> = match &kind {
             super::SidebarRowKind::Project(_) | super::SidebarRowKind::RefGroup(_) => {
                 folder_block_extents(&self.ui_items, &self.active_space_id)
@@ -3343,13 +3611,7 @@ impl super::TermWindow {
                 thread_id,
                 project_id,
             } => {
-                // A dragged reference row reorders within the Space's ref
-                // list, not within the origin project's threads.
-                let siblings = if self.sidebar_row_is_thread_ref(thread_id) {
-                    crate::workspace_threads::space_thread_refs(&self.active_space_id)
-                } else {
-                    crate::workspace_threads::unpinned_thread_ids(project_id)
-                };
+                let siblings = self.sidebar_thread_siblings(thread_id, project_id);
                 self.ui_items
                     .iter()
                     .filter_map(|candidate| match &candidate.item_type {
@@ -3366,9 +3628,10 @@ impl super::TermWindow {
         // A thread pointer that leaves its own list's vertical extent (plus
         // one row of slack) is not aiming at any of its gaps: dropping there
         // cancels instead of snapping to the nearest end, which is what
-        // keeps a thread dragged onto ANOTHER project a no-op. A project
-        // has no foreign list to stray into — the whole sidebar is its drop
-        // zone, so anywhere below the last block simply means "the end".
+        // keeps a thread dragged onto ANOTHER project, or a reference onto
+        // another group, a no-op. A project has no foreign list to stray
+        // into — the whole sidebar is its drop zone, so anywhere below the
+        // last block simply means "the end".
         let within_span = match &kind {
             super::SidebarRowKind::Project(_) | super::SidebarRowKind::RefGroup(_) => {
                 !rows.is_empty()
@@ -3380,8 +3643,12 @@ impl super::TermWindow {
                 })
             }
         };
-        let target = if sidebar_x_ok && within_span {
-            sidebar_insert_position(&rows, coords.y).map(|(before, line_y)| {
+        let can_move = self
+            .sidebar_row_drag
+            .as_ref()
+            .is_some_and(|state| state.draggable);
+        let target = if sidebar_x_ok && within_span && can_move {
+            sidebar_insert_position(&rows, coords.y).map(|before| {
                 // The rendered rows are only the VISIBLE ones: "after the
                 // last visible row" is the end of the viewport, not of the
                 // list. Anchor to the next logical sibling instead, so a
@@ -3394,26 +3661,40 @@ impl super::TermWindow {
                     super::SidebarRowKind::Thread {
                         thread_id,
                         project_id,
-                    } => {
-                        if self.sidebar_row_is_thread_ref(thread_id) {
-                            crate::workspace_threads::space_thread_refs(&self.active_space_id)
-                        } else {
-                            crate::workspace_threads::unpinned_thread_ids(project_id)
-                        }
-                    }
+                    } => self.sidebar_thread_siblings(thread_id, project_id),
                 };
                 let before = clamp_end_anchor_to_next_logical_sibling(
                     before,
                     rows.last().map(|(id, _, _)| id.as_str()),
                     &logical,
                 );
-                super::SidebarInsertTarget { before, line_y }
+                super::SidebarInsertTarget { before }
             })
         } else {
             None
         };
         if let Some(state) = self.sidebar_row_drag.as_mut() {
-            state.target = target;
+            if state.target != target {
+                state.target = target;
+                self.aim_sidebar_make_way();
+            }
+        }
+    }
+
+    fn pointer_over_workspace_sidebar(&self, coords: ::window::Point) -> bool {
+        self.ui_items
+            .iter()
+            .find(|candidate| candidate.item_type == UIItemType::WorkspaceSidebarBackground)
+            .is_some_and(|bg| coords.x >= bg.x as isize && coords.x < (bg.x + bg.width) as isize)
+    }
+
+    /// What a dragged thread row moves among, in order. A dragged reference
+    /// reorders within its group, not within the origin project's threads.
+    fn sidebar_thread_siblings(&self, thread_id: &str, project_id: &str) -> Vec<String> {
+        if self.sidebar_row_is_thread_ref(thread_id) {
+            crate::workspace_threads::space_thread_refs_from(&self.active_space_id, project_id)
+        } else {
+            crate::workspace_threads::unpinned_thread_ids(project_id)
         }
     }
 
@@ -3422,10 +3703,25 @@ impl super::TermWindow {
         state: super::SidebarRowDragState,
         context: &dyn WindowOps,
     ) {
-        let Some(target) = state.target else {
-            return;
+        self.sidebar_row_landing = Some(super::DragLanding::new(
+            state.kind.clone(),
+            state.title.clone(),
+            state.grip,
+            state.current,
+            (self.dimensions.pixel_width, self.dimensions.pixel_height),
+            Instant::now(),
+        ));
+        let moved = self.move_sidebar_row(&state);
+        self.sidebar_make_way.finish(moved);
+        context.invalidate();
+    }
+
+    /// Reorder the list as the drag asks. Returns whether it changed.
+    fn move_sidebar_row(&mut self, state: &super::SidebarRowDragState) -> bool {
+        let Some(target) = state.target.as_ref() else {
+            return false;
         };
-        let changed = match &state.kind {
+        match &state.kind {
             super::SidebarRowKind::Project(project_id) => {
                 let space_id = self.active_space_id.clone();
                 // Local Spaces order projects and ref groups in one merged
@@ -3470,9 +3766,6 @@ impl super::TermWindow {
                     )
                 }
             }
-        };
-        if changed {
-            context.invalidate();
         }
     }
 
@@ -3498,9 +3791,11 @@ impl super::TermWindow {
             return;
         }
         let title = self.pane_nav_tab_title(pane_id, &pane.get_title());
+        self.pane_tab_landing = None;
         self.pane_tab_drag = Some(PaneTabDragState {
             pane_id,
             title,
+            grip: super::DragGrip::of(&item, event.coords),
             start: event.coords,
             current: event.coords,
             active: false,
@@ -3635,6 +3930,16 @@ impl super::TermWindow {
     }
 
     fn drop_pane_tab_drag(&mut self, state: PaneTabDragState) {
+        // Back to its place, or, once the move below goes through, on to
+        // the new one.
+        self.pane_tab_landing = Some(super::DragLanding::new(
+            state.pane_id,
+            state.title.clone(),
+            state.grip,
+            state.current,
+            (self.dimensions.pixel_width, self.dimensions.pixel_height),
+            Instant::now(),
+        ));
         let Some(target) = state.target else {
             return;
         };
@@ -3960,6 +4265,12 @@ impl super::TermWindow {
                 }
                 context.set_cursor(Some(MouseCursor::Arrow));
             }
+            UIItemType::SharedWithMe(index) => {
+                if let WMEK::Press(MousePress::Left) = event.kind {
+                    self.watch_shared_pane(index);
+                }
+                context.set_cursor(Some(MouseCursor::Hand));
+            }
             UIItemType::ProjectToggleThreads(project_id) => {
                 self.mouse_event_project_toggle_threads(project_id, event, context);
             }
@@ -4036,6 +4347,15 @@ impl super::TermWindow {
             UIItemType::RightSidebarToggle => {
                 self.mouse_event_right_sidebar_toggle(event, context);
             }
+            UIItemType::WindowTabsPin => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.toggle_window_tabs_pinned();
+                }
+            }
+            UIItemType::WindowTabsTravelling => {
+                context.set_cursor(Some(MouseCursor::Arrow));
+            }
             UIItemType::RightSidebarMode(mode) => {
                 self.mouse_event_right_sidebar_mode(mode, event, context);
             }
@@ -4111,6 +4431,9 @@ impl super::TermWindow {
             UIItemType::RightSidebarPluginExtended => {
                 self.mouse_event_plugin_panel(event, context, true);
             }
+            UIItemType::PluginPage(pane_id) => {
+                self.mouse_event_plugin_page(pane_id, event, context);
+            }
             UIItemType::RightSidebarPluginExtendedClose => {
                 context.set_cursor(Some(MouseCursor::Hand));
                 if event.kind == WMEK::Press(MousePress::Left) {
@@ -4148,11 +4471,24 @@ impl super::TermWindow {
             }
             UIItemType::RightSidebarRemoteFileConnect
             | UIItemType::RightSidebarRemoteFileRefresh
+            | UIItemType::RightSidebarRemoteFileUpload
             | UIItemType::RightSidebarRemoteFileRow(_)
             | UIItemType::RightSidebarRemoteFileBack
             | UIItemType::RightSidebarRemoteFileCopyText
             | UIItemType::RightSidebarRemoteTransfer(_) => {
                 self.mouse_event_right_sidebar_remote_file(item.clone(), event, context);
+            }
+            UIItemType::TransferCardCancel(_)
+            | UIItemType::TransferCardDismiss(_)
+            | UIItemType::FinishedNoticeDismiss(_)
+            | UIItemType::TransferCardRetry(_)
+            | UIItemType::TransferCardOpen(_)
+            | UIItemType::TransferCardOpenDownloads(_)
+            | UIItemType::TransferCardCopyPath(_)
+            | UIItemType::TransferCardBackground
+            | UIItemType::DynamicStatusReveal(..)
+            | UIItemType::DynamicStatusShowAll => {
+                self.mouse_event_transfer_card(item.clone(), event, context);
             }
             UIItemType::UpdateCapsule => self.mouse_event_update_capsule(false, event, context),
             UIItemType::UpdateCapsuleDismiss => {
@@ -4191,7 +4527,18 @@ impl super::TermWindow {
             UIItemType::WorkspaceSidebarNotifications => {
                 self.mouse_event_workspace_sidebar_notifications(item.clone(), event, context);
             }
-            UIItemType::ContextMenuBackdrop | UIItemType::CommandPalette => {
+            UIItemType::WorkspaceSidebarJump => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.activate_sidebar_jump();
+                }
+            }
+            UIItemType::Library(ref which) => {
+                self.mouse_event_library(item.clone(), which.clone(), event, context);
+            }
+            UIItemType::ContextMenuBackdrop
+            | UIItemType::SharePanel
+            | UIItemType::CommandPalette => {
                 context.set_cursor(Some(MouseCursor::Arrow));
             }
             UIItemType::ContextMenuItem(_) => {
@@ -4541,6 +4888,12 @@ impl super::TermWindow {
                 }
                 context.set_cursor(Some(MouseCursor::Arrow));
             }
+            UIItemType::SharedWithMe(index) => {
+                if let WMEK::Press(MousePress::Left) = event.kind {
+                    self.watch_shared_pane(index);
+                }
+                context.set_cursor(Some(MouseCursor::Hand));
+            }
             UIItemType::ProjectToggleThreads(project_id) => {
                 self.mouse_event_project_toggle_threads(project_id, event, context);
             }
@@ -4614,6 +4967,18 @@ impl super::TermWindow {
             UIItemType::WorkspaceSidebarResize => {
                 self.mouse_event_workspace_sidebar_resize(item, event, context);
             }
+            UIItemType::TransferCardCancel(_)
+            | UIItemType::TransferCardDismiss(_)
+            | UIItemType::FinishedNoticeDismiss(_)
+            | UIItemType::TransferCardRetry(_)
+            | UIItemType::TransferCardOpen(_)
+            | UIItemType::TransferCardOpenDownloads(_)
+            | UIItemType::TransferCardCopyPath(_)
+            | UIItemType::TransferCardBackground
+            | UIItemType::DynamicStatusReveal(..)
+            | UIItemType::DynamicStatusShowAll => {
+                self.mouse_event_transfer_card(item.clone(), event, context);
+            }
             UIItemType::UpdateCapsule => self.mouse_event_update_capsule(false, event, context),
             UIItemType::UpdateCapsuleDismiss => {
                 self.mouse_event_update_capsule(true, event, context)
@@ -4645,8 +5010,26 @@ impl super::TermWindow {
             UIItemType::WorkspaceSidebarNotifications => {
                 self.mouse_event_workspace_sidebar_notifications(item.clone(), event, context);
             }
+            UIItemType::WorkspaceSidebarJump => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.activate_sidebar_jump();
+                }
+            }
+            UIItemType::Library(ref which) => {
+                self.mouse_event_library(item.clone(), which.clone(), event, context);
+            }
             UIItemType::RightSidebarToggle => {
                 self.mouse_event_right_sidebar_toggle(event, context);
+            }
+            UIItemType::WindowTabsPin => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.toggle_window_tabs_pinned();
+                }
+            }
+            UIItemType::WindowTabsTravelling => {
+                context.set_cursor(Some(MouseCursor::Arrow));
             }
             UIItemType::RightSidebarMode(mode) => {
                 self.mouse_event_right_sidebar_mode(mode, event, context);
@@ -4723,6 +5106,9 @@ impl super::TermWindow {
             UIItemType::RightSidebarPluginExtended => {
                 self.mouse_event_plugin_panel(event, context, true);
             }
+            UIItemType::PluginPage(pane_id) => {
+                self.mouse_event_plugin_page(pane_id, event, context);
+            }
             UIItemType::RightSidebarPluginExtendedClose => {
                 context.set_cursor(Some(MouseCursor::Hand));
                 if event.kind == WMEK::Press(MousePress::Left) {
@@ -4760,6 +5146,7 @@ impl super::TermWindow {
             }
             UIItemType::RightSidebarRemoteFileConnect
             | UIItemType::RightSidebarRemoteFileRefresh
+            | UIItemType::RightSidebarRemoteFileUpload
             | UIItemType::RightSidebarRemoteFileRow(_)
             | UIItemType::RightSidebarRemoteFileBack
             | UIItemType::RightSidebarRemoteFileCopyText
@@ -4772,7 +5159,9 @@ impl super::TermWindow {
                     self.request_close_content_view_by_id(id);
                 }
             }
-            UIItemType::ContextMenuBackdrop | UIItemType::CommandPalette => {
+            UIItemType::ContextMenuBackdrop
+            | UIItemType::SharePanel
+            | UIItemType::CommandPalette => {
                 context.set_cursor(Some(MouseCursor::Arrow));
             }
             UIItemType::ContextMenuItem(_) => {
@@ -5344,32 +5733,43 @@ impl super::TermWindow {
     ) {
         context.set_cursor(Some(MouseCursor::Hand));
         if event.kind == WMEK::Press(MousePress::Left) {
-            let previous_width = self.right_sidebar_width();
-            let previous_mode = self.right_sidebar_mode;
-            if previous_mode == super::RightSidebarMode::Tasks
-                && mode != super::RightSidebarMode::Tasks
-            {
-                self.clear_right_sidebar_text_focus();
-            }
-            self.right_sidebar_mode = mode;
-            if self.right_sidebar_mode == super::RightSidebarMode::Tasks {
-                self.right_sidebar_note_memory_release_token =
-                    self.right_sidebar_note_memory_release_token.wrapping_add(1);
-            } else if previous_mode == super::RightSidebarMode::Tasks {
-                self.schedule_right_sidebar_note_memory_release();
-            }
-            // Leaving the file view (e.g. switching to Snippets/Tasks) makes the
-            // file index idle; schedule it for release. Entering it refreshes +
-            // (re)starts the periodic re-scan.
-            if self.right_sidebar_file_view_active() {
-                self.kick_right_sidebar_file_rescan_cycle();
-                self.request_right_sidebar_remote_files_connect(false);
-            } else {
-                self.schedule_right_sidebar_file_memory_release();
-                self.release_right_sidebar_remote_files_if_hidden();
-            }
-            self.invalidate_or_reflow_right_sidebar(previous_width, context);
+            self.set_right_sidebar_mode(mode, context);
         }
+    }
+
+    /// Show `mode` in the right sidebar: the text it had focus in let go,
+    /// the memory of the one left released and of the one shown kept, and
+    /// the terminal laid out again if the panel's width changed.
+    pub(crate) fn set_right_sidebar_mode(
+        &mut self,
+        mode: super::RightSidebarMode,
+        context: &dyn WindowOps,
+    ) {
+        let previous_width = self.right_sidebar_width();
+        let previous_mode = self.right_sidebar_mode;
+        if previous_mode == super::RightSidebarMode::Tasks
+            && mode != super::RightSidebarMode::Tasks
+        {
+            self.clear_right_sidebar_text_focus();
+        }
+        self.right_sidebar_mode = mode;
+        if self.right_sidebar_mode == super::RightSidebarMode::Tasks {
+            self.right_sidebar_note_memory_release_token =
+                self.right_sidebar_note_memory_release_token.wrapping_add(1);
+        } else if previous_mode == super::RightSidebarMode::Tasks {
+            self.schedule_right_sidebar_note_memory_release();
+        }
+        // Leaving the file view (e.g. switching to Snippets/Tasks) makes the
+        // file index idle; schedule it for release. Entering it refreshes +
+        // (re)starts the periodic re-scan.
+        if self.right_sidebar_file_view_active() {
+            self.kick_right_sidebar_file_rescan_cycle();
+            self.request_right_sidebar_remote_files_connect(false);
+        } else {
+            self.schedule_right_sidebar_file_memory_release();
+            self.release_right_sidebar_remote_files_if_hidden();
+        }
+        self.invalidate_or_reflow_right_sidebar(previous_width, context);
     }
 
     pub fn mouse_event_right_sidebar_snippet(
@@ -5608,6 +6008,9 @@ impl super::TermWindow {
             UIItemType::RightSidebarRemoteFileRefresh => {
                 self.refresh_right_sidebar_remote_files();
             }
+            UIItemType::RightSidebarRemoteFileUpload => {
+                self.begin_remote_upload_picker(event.coords);
+            }
             UIItemType::RightSidebarRemoteFileRow(ref path) => {
                 if self.is_renaming_sidebar_remote_file(path) {
                     let double_click = self
@@ -5663,6 +6066,44 @@ impl super::TermWindow {
         self.invalidate_or_reflow_right_sidebar(previous_width, context);
     }
 
+    fn mouse_event_transfer_card(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if item.item_type == UIItemType::TransferCardBackground {
+            // The card's empty surface is still part of the card: keep the
+            // click here instead of letting it select a file underneath.
+            context.set_cursor(Some(MouseCursor::Arrow));
+            return;
+        }
+        context.set_cursor(Some(MouseCursor::Hand));
+        if event.kind != WMEK::Press(MousePress::Left) {
+            return;
+        }
+        match item.item_type {
+            UIItemType::TransferCardCancel(id) => self.cancel_transfer(id),
+            UIItemType::TransferCardDismiss(id) => self.dismiss_transfer_toast(id),
+            UIItemType::FinishedNoticeDismiss(pane_id) => self.dismiss_finished_notice(pane_id),
+            UIItemType::TransferCardRetry(id) => {
+                self.retry_transfer_from_card(id, event.coords)
+            }
+            UIItemType::TransferCardOpen(id) => self.open_download_toast(id),
+            UIItemType::TransferCardOpenDownloads(id) => {
+                self.open_download_toast_folder(id)
+            }
+            UIItemType::TransferCardCopyPath(id) => self.copy_transfer_path(id),
+            UIItemType::DynamicStatusReveal(pane_id, true) => self.reveal_pane(pane_id),
+            UIItemType::DynamicStatusReveal(pane_id, false) => {
+                self.reveal_pane_elsewhere(pane_id, context, None);
+            }
+            UIItemType::DynamicStatusShowAll => self.show_status_from_dynamic_status(context),
+            _ => return,
+        }
+        context.invalidate();
+    }
+
     fn mouse_event_update_capsule(
         &mut self,
         dismiss: bool,
@@ -5691,7 +6132,7 @@ impl super::TermWindow {
     ) {
         context.set_cursor(Some(MouseCursor::Hand));
         if event.kind == WMEK::Press(MousePress::Left) {
-            // The gear carries the dismissed update capsule's dot: the click
+            // The gear carries the dismissed update notice's dot: the click
             // goes where the capsule would have led.
             if crate::termwindow::render::update_capsule::gear_dot().is_some() {
                 crate::settings_window::show_update_page_from(
@@ -5884,9 +6325,16 @@ impl super::TermWindow {
                     return;
                 };
                 // Reference rows reorder the local reference list, so the
-                // origin thread's pinned state is irrelevant there.
-                let draggable = self.sidebar_row_is_thread_ref(&thread_id)
-                    || !crate::workspace_threads::thread_is_pinned(&thread_id);
+                // origin thread's pinned state is irrelevant there. A server
+                // folder row has no reference to move, so it stays put.
+                let draggable = if self.sidebar_row_is_thread_ref(&thread_id) {
+                    crate::workspace_threads::thread_ref_is_explicit(
+                        &self.active_space_id,
+                        &thread_id,
+                    )
+                } else {
+                    !crate::workspace_threads::thread_is_pinned(&thread_id)
+                };
                 let title = crate::workspace_threads::thread_name(&thread_id)
                     .unwrap_or_else(|| thread_id.clone());
                 self.arm_sidebar_row_drag(
@@ -6210,7 +6658,7 @@ impl super::TermWindow {
         self.begin_context_menu_application_actions();
         let spaces = crate::workspace_threads::spaces_for_window(self.space_owner_id);
 
-        let space_item = |space: &crate::workspace_threads::SpaceView| {
+        let space_item = |space: &crate::workspace_threads::SpaceView, icon: Option<ContextMenuIcon>| {
             let label = if space.is_occupied_by_other_window {
                 tr_with_name("menu-space-occupied", &space.name)
             } else {
@@ -6221,7 +6669,7 @@ impl super::TermWindow {
                 if space.is_default {
                     ContextMenuIcon::Home
                 } else {
-                    ContextMenuIcon::Stack
+                    icon.unwrap_or(ContextMenuIcon::Stack)
                 },
                 KeyAssignment::SwitchSpace(space.id.to_string()),
             )
@@ -6234,25 +6682,63 @@ impl super::TermWindow {
 
         let mut items = vec![];
         for space in spaces.iter().filter(|space| space.domain.is_none()) {
-            items.push(space_item(space));
+            items.push(space_item(space, None));
+        }
+        // While servers show as folders their Spaces are not listed: they
+        // live in a local Space's sidebar. One opened from its folder stays
+        // listed while it is open, so the menu still says where the window
+        // is.
+        if let Some(space) = spaces
+            .iter()
+            .find(|space| space.shown_as_folders && space.is_active)
+        {
+            items.push(
+                ContextMenuItem::item_with_icon(
+                    space.name.clone(),
+                    crate::ssh_hosts::host_menu_icon(
+                        space
+                            .domain
+                            .as_deref()
+                            .and_then(crate::ssh_hosts::connect_domain_icon),
+                    ),
+                    KeyAssignment::SwitchSpace(space.id.to_string()),
+                )
+                .checked(true),
+            );
         }
 
-        // Keep the servers in the order their Spaces appear rather than
-        // sorting: that order is the user's.
-        let mut domains: Vec<&str> = vec![];
-        for domain in spaces.iter().filter_map(|space| space.domain.as_deref()) {
-            if !domains.contains(&domain) {
-                domains.push(domain);
+        // Keep the servers in the order their Spaces appear: that order is
+        // the user's.
+        let mut domains: Vec<(&str, SpaceConnectionState)> = vec![];
+        for space in spaces.iter().filter(|space| !space.shown_as_folders) {
+            let Some(domain) = space.domain.as_deref() else {
+                continue;
+            };
+            if !domains.iter().any(|(known, _)| *known == domain) {
+                domains.push((domain, self.space_connection_state(&space.id)));
             }
         }
 
-        for domain in domains {
-            items.push(ContextMenuItem::Separator);
-            let state = spaces
+        // Folded to one row each, servers sit together; the one the window
+        // is on stays spelled out, so moving between its Spaces is one click.
+        // Those connected come first there: they are the ones in use.
+        let one_row = crate::native_settings::space_menu_one_row_per_server();
+        if one_row {
+            order_servers_by_connection(&mut domains);
+        }
+        let mut last_was_row = false;
+        for (domain, state) in domains.iter().copied() {
+            let here: Vec<&crate::workspace_threads::SpaceView> = spaces
                 .iter()
-                .find(|space| space.domain.as_deref() == Some(domain))
-                .map(|space| self.space_connection_state(&space.id))
-                .unwrap_or(SpaceConnectionState::Connected);
+                .filter(|space| space.domain.as_deref() == Some(domain))
+                .collect();
+            let collapsed = one_row && !here.iter().any(|space| space.is_active);
+            if !(collapsed && last_was_row) {
+                items.push(ContextMenuItem::Separator);
+            }
+            last_was_row = collapsed;
+            let icon =
+                crate::ssh_hosts::host_menu_icon(crate::ssh_hosts::connect_domain_icon(domain));
             // The host's own name: one on the embedded tailnet is connected
             // under its address.
             let name = crate::ssh_hosts::connect_domain_label(domain);
@@ -6271,16 +6757,18 @@ impl super::TermWindow {
                     tr_with_name("menu-space-server-group-offline", &name)
                 }
             };
+            if collapsed {
+                items.push(server_menu_row(header, domain, icon, &here));
+                continue;
+            }
             // A server is a heading, not something to switch to. Saying that
             // with a section header rather than a disabled row is what makes it
             // *look* like a heading: the platform styles it as a caption and
             // never highlights it under the pointer.
             items.push(ContextMenuItem::section_header(header));
-            for space in spaces
-                .iter()
-                .filter(|space| space.domain.as_deref() == Some(domain))
-            {
-                items.push(space_item(space));
+            // A heading has no icon, so the server's Spaces carry it.
+            for space in here.iter().copied() {
+                items.push(space_item(space, Some(icon)));
             }
             items.push(ContextMenuItem::item_with_icon(
                 crate::i18n::tr("menu-new-space-here"),
@@ -6306,6 +6794,24 @@ impl super::TermWindow {
             ContextMenuIcon::New,
             KeyAssignment::CreateSpace,
         ));
+        // A server folded to a single row has no "New Space Here" of its
+        // own; they all gather here, one per server.
+        if one_row && !domains.is_empty() {
+            items.push(new_space_on_server_menu(
+                domains
+                    .iter()
+                    .map(|(domain, _)| {
+                        (
+                            crate::ssh_hosts::connect_domain_label(domain),
+                            domain.to_string(),
+                            crate::ssh_hosts::host_menu_icon(
+                                crate::ssh_hosts::connect_domain_icon(domain),
+                            ),
+                        )
+                    })
+                    .collect(),
+            ));
+        }
         items.push(ContextMenuItem::item_with_icon(
             spaces
                 .iter()
@@ -6586,6 +7092,25 @@ impl super::TermWindow {
             crate::workspace_threads::thread_connection_state(&thread_id, &live_workspaces);
         let mut items = vec![];
 
+        let in_own_window = front_end().thread_is_in_own_window(&thread_id);
+        items.push(self.context_menu_application_item_with_icon(
+            crate::i18n::tr(if in_own_window {
+                "thread-window-go-to"
+            } else {
+                "menu-open-thread-in-window"
+            }),
+            ContextMenuIcon::Window,
+            if in_own_window {
+                crate::termwindow::ContextMenuApplicationAction::GoToThreadWindow(thread_id.clone())
+            } else {
+                crate::termwindow::ContextMenuApplicationAction::OpenThreadInOwnWindow(
+                    thread_id.clone(),
+                )
+            },
+            true,
+        ));
+        items.push(ContextMenuItem::Separator);
+
         if let Some(connection) = connection.as_ref() {
             let remote_host_exists = connection.is_remote
                 && crate::ssh_hosts::host_spec(
@@ -6653,41 +7178,45 @@ impl super::TermWindow {
         // holding it).
         if is_thread_ref {
             items.push(ContextMenuItem::Separator);
-            let remove_item = self.context_menu_application_item_with_icon(
-                crate::i18n::tr("menu-remove-thread-ref"),
-                ContextMenuIcon::Close,
-                crate::termwindow::ContextMenuApplicationAction::RemoveThreadFromCollection {
-                    collection_space_id: active_space.clone(),
-                    thread_id: thread_id.clone(),
-                },
-                true,
-            );
-            items.push(remove_item);
-            // Move the REFERENCE elsewhere: gone from this Space's list,
-            // added to the target's. ref_host_candidates already excludes
-            // the origin and every Space holding it — this one included.
-            let move_targets: Vec<ContextMenuItem> =
-                crate::workspace_threads::ref_host_candidates(&thread_id)
-                    .into_iter()
-                    .map(|(space_id, name)| {
-                        self.context_menu_application_item_with_icon(
-                            name,
-                            ContextMenuIcon::ExternalLink,
-                            crate::termwindow::ContextMenuApplicationAction::MoveThreadRefToSpace {
-                                from_space_id: active_space.clone(),
-                                space_id,
-                                thread_id: thread_id.clone(),
-                            },
-                            true,
-                        )
-                    })
-                    .collect();
-            if !move_targets.is_empty() {
-                items.push(ContextMenuItem::submenu_with_icon(
-                    crate::i18n::tr("menu-move-to-space"),
-                    ContextMenuIcon::ExternalLink,
-                    move_targets,
-                ));
+            // A server folder row has no reference of its own to remove or
+            // move: it shows for as long as its server shows here.
+            if crate::workspace_threads::thread_ref_is_explicit(&active_space, &thread_id) {
+                let remove_item = self.context_menu_application_item_with_icon(
+                    crate::i18n::tr("menu-remove-thread-ref"),
+                    ContextMenuIcon::Close,
+                    crate::termwindow::ContextMenuApplicationAction::RemoveThreadFromCollection {
+                        collection_space_id: active_space.clone(),
+                        thread_id: thread_id.clone(),
+                    },
+                    true,
+                );
+                items.push(remove_item);
+                // Move the REFERENCE elsewhere: gone from this Space's list,
+                // added to the target's. ref_host_candidates already excludes
+                // the origin and every Space holding it — this one included.
+                let move_targets: Vec<ContextMenuItem> =
+                    crate::workspace_threads::ref_host_candidates(&thread_id)
+                        .into_iter()
+                        .map(|(space_id, name)| {
+                            self.context_menu_application_item_with_icon(
+                                name,
+                                ContextMenuIcon::ExternalLink,
+                                crate::termwindow::ContextMenuApplicationAction::MoveThreadRefToSpace {
+                                    from_space_id: active_space.clone(),
+                                    space_id,
+                                    thread_id: thread_id.clone(),
+                                },
+                                true,
+                            )
+                        })
+                        .collect();
+                if !move_targets.is_empty() {
+                    items.push(ContextMenuItem::submenu_with_icon(
+                        crate::i18n::tr("menu-move-to-space"),
+                        ContextMenuIcon::ExternalLink,
+                        move_targets,
+                    ));
+                }
             }
             if let Some(origin_space) = crate::workspace_threads::thread_space_id(&thread_id) {
                 let origin_item = self.context_menu_application_item_with_icon(
@@ -6795,11 +7324,77 @@ impl super::TermWindow {
             }
         };
         // Reference it before activating: the activation gate only lets this
-        // window open threads its Space owns or references.
-        crate::workspace_threads::add_thread_ref(&self.active_space_id, &thread_id);
+        // window open threads its Space owns or references. A server folder
+        // shows its new thread without one.
+        if !crate::workspace_threads::thread_ref_exists(&self.active_space_id, &thread_id) {
+            crate::workspace_threads::add_thread_ref(&self.active_space_id, &thread_id);
+        }
         if !self.open_remote_workspace_thread_without_connecting(&thread_id, context) {
             self.activate_workspace_thread(thread_id, context);
         }
+    }
+
+    /// While servers show as folders, connecting the server `domain_name`
+    /// leaves this window in its Space: the server's folders show here from
+    /// now on, and its thread opens in place -- through the connection page,
+    /// as any folder thread of a server not yet connected does. Returns
+    /// false to have the caller connect the usual way, into the server's own
+    /// Space: always when servers keep Spaces of their own; when this window
+    /// is on a server's own Space, which shows no folders; and while this
+    /// device has not heard from the server yet -- the first connect seeds
+    /// the Space it invents on the server (`connect_domain_into_space`), and
+    /// only that way falls back to plain ssh when the host has no ThinkTerm.
+    /// Its folders land here either way.
+    pub(crate) fn connect_server_into_folder(
+        &mut self,
+        domain_name: &str,
+        context: &dyn WindowOps,
+    ) -> bool {
+        if !crate::native_settings::servers_as_folders() {
+            return false;
+        }
+        let known = crate::workspace_threads::known_mux_domain_space(domain_name);
+        if known.is_some() {
+            // The plan may have added a row here the server has not seen,
+            // which its next tree would take away again.
+            crate::workspace_threads::reconcile_remote_subtree(domain_name);
+        }
+        let plan = known
+            .clone()
+            .unwrap_or_else(|| crate::workspace_threads::ensure_mux_domain_space(domain_name));
+        let moved =
+            crate::workspace_threads::place_server_folder(&plan.space_id, &self.active_space_id);
+        if moved {
+            // The folders left another Space: a window there showing one of
+            // the server's threads lets it go.
+            for gui_window in crate::frontend::front_end().gui_windows() {
+                gui_window
+                    .window
+                    .notify(TermWindowNotif::Apply(Box::new(|term_window| {
+                        term_window.leave_server_folder_content_if_hidden();
+                    })));
+            }
+        }
+        if known.is_none()
+            || !crate::workspace_threads::thread_ref_exists(&self.active_space_id, &plan.thread_id)
+        {
+            return false;
+        }
+        if moved {
+            // Once those windows have let go: one still showing the thread
+            // would be handed it, and focused, and then let it go.
+            if let Some(window) = self.window.clone() {
+                let thread_id = plan.thread_id;
+                window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    if let Some(window) = term_window.window.clone() {
+                        term_window.activate_workspace_thread(thread_id, &window);
+                    }
+                })));
+                return true;
+            }
+        }
+        self.activate_workspace_thread(plan.thread_id, context);
+        true
     }
 
     pub(crate) fn create_workspace_thread(&mut self, project_id: &str, context: &dyn WindowOps) {
@@ -6854,6 +7449,9 @@ impl super::TermWindow {
             let name = crate::ssh_hosts::connect_name_after_rename(
                 &crate::ssh_hosts::connect_domain_name(&spec),
             );
+            if self.connect_server_into_folder(&name, context) {
+                return true;
+            }
             // These hosts used to skip OS detection entirely: the branch
             // returned before anything read `detect_os`, and both detection
             // call sites downcast to `RemoteSshDomain`, which a mux client
@@ -7240,13 +7838,23 @@ impl super::TermWindow {
                 != Some(self.active_space_id.as_str())
     }
 
-    fn activate_workspace_thread_impl(
+    pub(super) fn activate_workspace_thread_impl(
         &mut self,
         thread_id: String,
         context: &dyn WindowOps,
         orphan_candidate_window_id: Option<MuxWindowId>,
         workspaces_to_kill_after_adopt: Vec<String>,
     ) {
+        if self.dedicated_thread.is_some() {
+            if self.dedicated_thread.as_deref() != Some(thread_id.as_str()) {
+                self.hand_on_assignment(KeyAssignment::ActivateWorkspaceThread {
+                    space_id: self.active_space_id.clone(),
+                    thread_id,
+                });
+            }
+            return;
+        }
+        self.forget_thread_bound_for_own_window_unless(&thread_id);
         let thread_home_space = crate::workspace_threads::thread_space_id(&thread_id);
         let in_this_space = thread_home_space.as_deref() == Some(self.active_space_id.as_str());
         // A window may activate any thread its Space references: the
@@ -7317,6 +7925,18 @@ impl super::TermWindow {
                         if let Some(other) =
                             crate::frontend::front_end().gui_window_for_mux_window(target)
                         {
+                            // What this window showed is being ended, and
+                            // the thread it was to go on to is in a window of
+                            // its own.
+                            if !workspaces_to_kill_after_adopt.is_empty()
+                                && front_end().thread_is_in_own_window(&plan.thread_id)
+                            {
+                                self.show_thread_elsewhere_page(plan.thread_id.clone());
+                            }
+                            kill_workspace_windows(
+                                &workspaces_to_kill_after_adopt,
+                                Some(&plan.workspace_name),
+                            );
                             let workspace = plan.workspace_name.clone();
                             let project_path = plan.project_path.clone();
                             let project_id = plan.project_id.clone();
@@ -7397,14 +8017,38 @@ impl super::TermWindow {
                 .get_domain_by_name(domain_name)
                 .map_or(false, |d| d.state() == mux::domain::DomainState::Attached);
             if !attached {
-                // Attach on demand (auth prompts go through the ConnectionUI),
-                // then re-run this activation once the domain is live.
+                // Attach on demand (auth prompts go through the ConnectionUI,
+                // on a page of the Space's own), then open the thread once
+                // the domain is live.
                 let Some(window) = self.window.clone() else {
                     context.invalidate();
                     return;
                 };
                 let domain_name = domain_name.to_string();
-                let mux_window_id = self.mux_window_id;
+                let Some(page_window_id) = self.show_space_connection_page(
+                    &domain_name,
+                    thread_id,
+                    orphan_candidate_window_id,
+                    workspaces_to_kill_after_adopt,
+                ) else {
+                    // The Space's page is connecting already.
+                    context.invalidate();
+                    return;
+                };
+                // The page's window is empty until the ConnectionUI's tab
+                // lands in it; nothing may prune it before then.
+                let page_activity = mux::activity::Activity::new();
+                // Open while it holds the page; empty before the tab lands,
+                // and again once the person closed it.
+                let mut page_seen = false;
+                let page_is_open = move || match Mux::get().get_window(page_window_id) {
+                    Some(page) if !page.is_empty() => {
+                        page_seen = true;
+                        true
+                    }
+                    Some(_) => !page_seen,
+                    None => false,
+                };
                 // Bridge the frames between this switch and the retry engine
                 // raising its own in-flight flag: without it the sidebar
                 // paints "Disconnected — Reconnect" for the gap.
@@ -7423,24 +8067,27 @@ impl super::TermWindow {
                         };
                         let ui = mux::connui::ConnectionUI::with_params(
                             mux::connui::ConnectionUIParams {
-                                window_id: Some(mux_window_id),
+                                window_id: Some(page_window_id),
                                 ..Default::default()
                             },
                         );
+                        // No primary window: none of the server's windows
+                        // belongs in the page's.
                         let outcome = crate::attach_domain_with_retry(
                             domain,
-                            Some(mux_window_id),
+                            None,
                             ui,
-                            move || Mux::get().get_window(mux_window_id).is_some(),
+                            page_is_open,
                             Some(std::time::Duration::from_secs(60)),
                         )
                         .await?;
                         anyhow::Ok(matches!(outcome, crate::AttachRetryOutcome::Attached))
                     }
                     .await;
+                    drop(page_activity);
                     let cleanup_name = domain_name.clone();
                     match result {
-                        // Cancelled (the hosting window went away mid-retry)
+                        // Cancelled (the page was closed or left mid-retry)
                         // leaves nothing to activate.
                         Ok(false) => {}
                         Ok(true) => {
@@ -7448,27 +8095,14 @@ impl super::TermWindow {
                                 .get_domain_by_name(&domain_name)
                                 .map(|domain| domain.domain_id());
                             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                                // Switching into a cold mux-domain Space is as
-                                // explicit an open as the Connect button, so it
-                                // gets the same one-shot claim. Armed only: the
-                                // retried activation releases it when its tab
-                                // is on screen, and the paint path consumes it
-                                // once that tab's gate is claimable.
-                                if let Some(domain_id) = domain_id {
-                                    term_window.note_remote_open_intent(domain_id);
-                                }
-                                if let Some(win) = term_window.window.clone() {
-                                    term_window.activate_workspace_thread_impl(
-                                        thread_id,
-                                        &win,
-                                        orphan_candidate_window_id,
-                                        workspaces_to_kill_after_adopt,
-                                    );
-                                }
+                                term_window.open_connected_space_page(page_window_id, domain_id);
                             })));
                         }
                         Err(err) => {
                             log::error!("attaching {domain_name} for thread switch: {err:#}");
+                            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                                term_window.note_space_connection_page_gave_up(page_window_id);
+                            })));
                         }
                     }
                     window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
@@ -7738,6 +8372,7 @@ impl super::TermWindow {
 
         if let Err(err) = result {
             log::error!("failed to materialize ThinkTerm thread: {err:#}");
+            self.thread_bound_for_own_window_failed(&thread_id);
             // Nothing landed, so there is nothing for the first-open claim
             // to take; leaving it armed would claim the next tab shown.
             self.remote_open_intent = None;
@@ -8223,6 +8858,19 @@ impl super::TermWindow {
             _ => {}
         }
 
+        // A title bar's blank offers the system its drag ahead of a press.
+        // Windows then takes the press for its own and never passes it on,
+        // so only the active pane's does: a press on another's has to reach
+        // us to pick that pane.
+        if event.kind == WMEK::Move
+            && self.pane_bar_blank_is_title_bar(&item)
+            && Mux::get()
+                .get_active_tab_for_window(self.mux_window_id)
+                .is_some_and(|tab| tab.get_active_idx() == pane_index)
+        {
+            context.set_window_drag_position(event.screen_coords);
+        }
+
         if event.kind == WMEK::Press(MousePress::Right) {
             if let PaneNavAction::Activate(target_pane_id) = action {
                 self.show_term_context_menu(
@@ -8241,6 +8889,8 @@ impl super::TermWindow {
         let mux = Mux::get();
 
         match action {
+            PaneNavAction::Share => self.toggle_share_panel(pane_id),
+            PaneNavAction::SharePill => self.press_share_pill(pane_id),
             PaneNavAction::Background => {
                 if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {
                     if tab
@@ -8252,7 +8902,12 @@ impl super::TermWindow {
                     }
                     tab.set_active_idx(pane_index);
                 }
-                if self.last_mouse_click.as_ref().map(|c| c.streak) == Some(2) {
+                // Along the top of a window whose tab row is away, the blank
+                // is the title bar's: it moves the window, and a double click
+                // zooms it rather than opening a tab.
+                if self.pane_bar_blank_is_title_bar(&item) {
+                    self.mouse_event_window_header_blank(event, context);
+                } else if self.last_mouse_click.as_ref().map(|c| c.streak) == Some(2) {
                     self.spawn_pane_nav_tab(pane_id, pane_index);
                 }
             }
@@ -8604,6 +9259,31 @@ impl super::TermWindow {
         if !launch_menu.is_empty() {
             items.push(ContextMenuItem::Separator);
             items.extend(launch_menu);
+        }
+        // The plugins of this machine that have a page: each opens in a tab
+        // of its own, as a shell does -- beside a pane this machine keeps,
+        // where its plugin is the one to draw it.
+        let pages: Vec<ContextMenuItem> = if self.plugin_pages_open_here() {
+            crate::plugins::pages()
+                .into_iter()
+                .map(|(id, name)| {
+                    self.context_menu_application_item_with_icon(
+                        name,
+                        ContextMenuIcon::Application,
+                        crate::termwindow::ContextMenuApplicationAction::OpenPluginPage(id),
+                        true,
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !pages.is_empty() {
+            items.push(ContextMenuItem::Separator);
+            items.push(ContextMenuItem::section_header(crate::i18n::tr(
+                "settings-section-plugins",
+            )));
+            items.extend(pages);
         }
         items.push(ContextMenuItem::Separator);
         items.push(ContextMenuItem::item(
@@ -10035,7 +10715,7 @@ fn kill_workspace_windows(workspaces: &[String], skip_workspace: Option<&str>) {
 
 /// A project's draggable extent is its whole BLOCK: the header row plus
 /// every thread row rendered under it (nothing when collapsed). Gaps then
-/// sit between whole workspaces, so "after X" paints below X's last thread
+/// sit between whole workspaces, so "after X" lands below X's last thread
 /// instead of between X's header and its threads. Relies on the sidebar
 /// pushing items in visual order: each Project row followed by its rows,
 /// with the cross-project pinned section preceding the first Project.
@@ -10092,20 +10772,20 @@ pub(crate) fn clamp_end_anchor_to_next_logical_sibling(
 }
 
 /// Which gap of a row list a pointer at `pointer_y` selects: insert before
-/// the returned id, or at the end when None. The second value is where the
-/// insert indicator line paints. Rows are (id, top, bottom) in render order;
-/// the upper half of a row aims before it, the lower half after it.
+/// the returned id, or at the end when None, and no gap at all without rows.
+/// Rows are (id, top, bottom) in render order; the upper half of a row aims
+/// before it, the lower half after it.
 pub(crate) fn sidebar_insert_position(
     rows: &[(String, isize, isize)],
     pointer_y: isize,
-) -> Option<(Option<String>, isize)> {
+) -> Option<Option<String>> {
     for (id, top, bottom) in rows {
         let mid = (top + bottom) / 2;
         if pointer_y < mid {
-            return Some((Some(id.clone()), *top));
+            return Some(Some(id.clone()));
         }
     }
-    rows.last().map(|(_, _, bottom)| (None, *bottom))
+    rows.last().map(|_| None)
 }
 
 #[cfg(test)]
@@ -10177,10 +10857,10 @@ mod sidebar_drag_tests {
                 ("beta".to_string(), 176, 196),
             ]
         );
-        // Below beta: the end, with the line under the last block.
+        // Below beta: the end.
         assert_eq!(
             sidebar_insert_position(&folder_block_extents(&items, "space-x"), 500),
-            Some((None, 196))
+            Some(None)
         );
     }
 
@@ -10218,20 +10898,20 @@ mod sidebar_drag_tests {
         // Above everything and in the first row's upper half: before "a".
         assert_eq!(
             sidebar_insert_position(&rows(), -10),
-            Some((Some("a".to_string()), 0))
+            Some(Some("a".to_string()))
         );
         assert_eq!(
             sidebar_insert_position(&rows(), 4),
-            Some((Some("a".to_string()), 0))
+            Some(Some("a".to_string()))
         );
         // Lower half of "a" aims after it = before "b".
         assert_eq!(
             sidebar_insert_position(&rows(), 15),
-            Some((Some("b".to_string()), 24))
+            Some(Some("b".to_string()))
         );
         // Lower half of the last row, and anywhere below: the end.
-        assert_eq!(sidebar_insert_position(&rows(), 60), Some((None, 68)));
-        assert_eq!(sidebar_insert_position(&rows(), 500), Some((None, 68)));
+        assert_eq!(sidebar_insert_position(&rows(), 60), Some(None));
+        assert_eq!(sidebar_insert_position(&rows(), 500), Some(None));
         // No rows: nowhere to drop.
         assert_eq!(sidebar_insert_position(&[], 10), None);
     }
@@ -10240,9 +10920,11 @@ mod sidebar_drag_tests {
 #[cfg(test)]
 mod space_menu_tests {
     use super::space_destructive_menu_items;
+    use crate::termwindow::ui::sidebar::SpaceConnectionState;
     use crate::workspace_threads::SpaceView;
     use config::keyassignment::KeyAssignment;
     use window::ContextMenuAction;
+    use window::ContextMenuIcon;
     use window::ContextMenuItem;
 
     fn space(is_remote: bool) -> SpaceView {
@@ -10255,6 +10937,7 @@ mod space_menu_tests {
             is_remote,
             domain: is_remote.then(|| "DO SYD X user".to_string()),
             is_domain_attached: false,
+            shown_as_folders: false,
         }
     }
 
@@ -10291,6 +10974,100 @@ mod space_menu_tests {
         assert_eq!(
             actions(&items),
             vec![KeyAssignment::DeleteSpace("s1".to_string())]
+        );
+    }
+
+    fn server_space(id: &str, occupied: bool) -> SpaceView {
+        SpaceView {
+            id: id.to_string(),
+            name: id.to_string(),
+            is_active: false,
+            is_occupied_by_other_window: occupied,
+            ..space(true)
+        }
+    }
+
+    fn action(item: &ContextMenuItem) -> KeyAssignment {
+        actions(std::slice::from_ref(item)).remove(0)
+    }
+
+    /// Folded to one row, a server with one Space is that Space: the row
+    /// switches straight to it, with nothing to open.
+    #[test]
+    fn a_server_with_one_space_switches_from_its_row() {
+        let only = server_space("s1", false);
+        let row = super::server_menu_row("devbox".to_string(), "devbox", ContextMenuIcon::Server, &[&only]);
+        assert!(submenu_of(&row).is_empty());
+        assert_eq!(action(&row), KeyAssignment::SwitchSpace("s1".to_string()));
+    }
+
+    /// Several Spaces open from the row, with a new one after them.
+    #[test]
+    fn a_server_with_several_spaces_opens_them_from_its_row() {
+        let (first, second) = (server_space("s1", false), server_space("s2", false));
+        let row = super::server_menu_row("devbox".to_string(), "devbox", ContextMenuIcon::Server, &[&first, &second]);
+        let children = submenu_of(&row);
+        assert_eq!(children.len(), 4);
+        assert!(matches!(children[2], ContextMenuItem::Separator));
+        assert_eq!(
+            [&children[0], &children[1], &children[3]].map(action),
+            [
+                KeyAssignment::SwitchSpace("s1".to_string()),
+                KeyAssignment::SwitchSpace("s2".to_string()),
+                KeyAssignment::CreateSpaceOnDomain("devbox".to_string()),
+            ]
+        );
+    }
+
+    /// A Space open in another window cannot be switched to from here, so
+    /// the row of a server that has only that one is greyed.
+    #[test]
+    fn a_server_whose_only_space_is_open_elsewhere_is_greyed() {
+        let only = server_space("s1", true);
+        let row = super::server_menu_row("devbox".to_string(), "devbox", ContextMenuIcon::Server, &[&only]);
+        assert!(matches!(row, ContextMenuItem::Item { enabled: false, .. }));
+    }
+
+    #[test]
+    fn new_space_on_server_offers_every_server() {
+        let menu = super::new_space_on_server_menu(vec![
+            (
+                "devbox".to_string(),
+                "devbox".to_string(),
+                ContextMenuIcon::Server,
+            ),
+            (
+                "server-b".to_string(),
+                "server-b".to_string(),
+                ContextMenuIcon::Cloud,
+            ),
+        ]);
+        assert_eq!(
+            actions(submenu_of(&menu)),
+            vec![
+                KeyAssignment::CreateSpaceOnDomain("devbox".to_string()),
+                KeyAssignment::CreateSpaceOnDomain("server-b".to_string()),
+            ]
+        );
+    }
+
+    /// Connected servers come first, then those on their way, then the
+    /// rest, each keeping the order it had.
+    #[test]
+    fn servers_folded_to_rows_put_connected_ones_first() {
+        use SpaceConnectionState::*;
+        let mut servers = vec![
+            ("a", Disconnected),
+            ("b", Connected),
+            ("c", Reconnecting),
+            ("d", Disconnected),
+            ("e", Connected),
+            ("f", Connecting),
+        ];
+        super::order_servers_by_connection(&mut servers);
+        assert_eq!(
+            servers.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            ["b", "e", "c", "f", "a", "d"]
         );
     }
 

@@ -1285,6 +1285,8 @@ impl super::TermWindow {
     }
 
     pub(crate) fn finish_remote_open(&mut self, domain_id: mux::domain::DomainId) {
+        // Got through: from here on the window is the Space's like any.
+        self.opened_to_connect = false;
         if let Some(intent) = self.remote_open_intent.as_mut() {
             if intent.domain_id == domain_id {
                 intent.ready = true;
@@ -1794,6 +1796,7 @@ impl super::TermWindow {
         }
 
         if active_pane.downcast_ref::<ClientPane>().is_none() {
+            self.refresh_pane_tree_slack(&tab);
             tab.resize(self.terminal_size);
             self.reapply_collapsed_panes_for_tab(tab_id);
             self.force_sync_active_mux_tab_pane_sizes();
@@ -2166,12 +2169,26 @@ impl super::TermWindow {
             return;
         };
         let space_id = self.space_id_for_layout_snapshot(window.get_workspace());
-        crate::workspace_threads::snapshot_active_space_thread_layout_with_font_scales(
-            &space_id,
-            window.get_workspace(),
-            self.mux_window_id,
-            |pane_id| self.persisted_font_scale_for_pane(pane_id),
-        );
+        self.snapshot_layout_under(&space_id, window.get_workspace());
+    }
+
+    fn snapshot_layout_under(&self, space_id: &str, workspace: &str) {
+        let pane_font_scale = |pane_id| self.persisted_font_scale_for_pane(pane_id);
+        if self.dedicated_thread.is_some() {
+            crate::workspace_threads::snapshot_own_window_thread_layout(
+                space_id,
+                workspace,
+                self.mux_window_id,
+                pane_font_scale,
+            );
+        } else {
+            crate::workspace_threads::snapshot_active_space_thread_layout_with_font_scales(
+                space_id,
+                workspace,
+                self.mux_window_id,
+                pane_font_scale,
+            );
+        }
     }
 
     /// The Space a layout snapshot should be recorded under. A window
@@ -2190,12 +2207,7 @@ impl super::TermWindow {
             return;
         };
         let space_id = self.space_id_for_layout_snapshot(window.get_workspace());
-        crate::workspace_threads::snapshot_active_space_thread_layout_with_font_scales(
-            &space_id,
-            window.get_workspace(),
-            self.mux_window_id,
-            |pane_id| self.persisted_font_scale_for_pane(pane_id),
-        );
+        self.snapshot_layout_under(&space_id, window.get_workspace());
     }
 
     fn apply_font_scales_to_mux_window_panes(
@@ -2289,7 +2301,7 @@ impl super::TermWindow {
         // Everything above and below the pane tree: the window tab row and
         // the terminal bar.
         let tab_bar_height = {
-            let (top, bottom) = self.pane_area_insets();
+            let (top, bottom) = self.pane_area_layout_insets();
             top + bottom
         };
 
@@ -2320,7 +2332,7 @@ impl super::TermWindow {
                 pixel_cell: self.render_metrics.cell_size.height as f32,
             };
             let padding_left = config.window_padding.left.evaluate_as_pixels(h_context) as usize
-                + self.workspace_sidebar_width();
+                + self.workspace_sidebar_sizing_width();
             let padding_top = config.window_padding.top.evaluate_as_pixels(v_context) as usize;
             let padding_bottom =
                 config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
@@ -2368,7 +2380,7 @@ impl super::TermWindow {
                 pixel_cell: self.render_metrics.cell_size.height as f32,
             };
             let padding_left = config.window_padding.left.evaluate_as_pixels(h_context) as usize
-                + self.workspace_sidebar_width();
+                + self.workspace_sidebar_sizing_width();
             let padding_top = config.window_padding.top.evaluate_as_pixels(v_context) as usize;
             let padding_bottom =
                 config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
@@ -2471,6 +2483,66 @@ impl super::TermWindow {
         })
     }
 
+    /// The window's room under the pane tree that no whole row of it fills:
+    /// what dividing the height between the paddings into rows left over,
+    /// less than a row. Blank under the last row otherwise, it is given to
+    /// the panes along the tree's bottom edge, where it adds up with what
+    /// their own nav bar left of their rect to one more row as often as not.
+    pub(crate) fn pane_tree_slack(&self) -> usize {
+        let cell_height = self.render_metrics.cell_size.height.max(1) as usize;
+        // As `resize_layout_for_dimensions` divides the window into rows.
+        let v_context = DimensionContext {
+            dpi: self.dimensions.dpi as f32,
+            pixel_max: self.terminal_size.pixel_height as f32,
+            pixel_cell: cell_height as f32,
+        };
+        let padding = self.config.window_padding.top.evaluate_as_pixels(v_context) as usize
+            + self.config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
+        let border = self.get_os_border();
+        let (top, bottom) = self.pane_area_layout_insets();
+        let room = self
+            .dimensions
+            .pixel_height
+            .saturating_sub(padding + (border.top + border.bottom).get() as usize)
+            .saturating_sub((top + bottom) as usize);
+        room.saturating_sub(self.terminal_size.pixel_height)
+            .min(cell_height - 1)
+    }
+
+    /// The room under the tree a pane may take: `pane_tree_slack` for one
+    /// along the bottom edge of a tree `tree_rows` rows high, none else.
+    pub(crate) fn pane_bottom_slack(&self, pos: &PositionedPane, tree_rows: usize) -> usize {
+        if pos.top + pos.height >= tree_rows {
+            self.pane_tree_slack()
+        } else {
+            0
+        }
+    }
+
+    /// Before `tab`'s tree is resized to `self.terminal_size`: bring the
+    /// room under it registered for its panes up to date. The mux gives it
+    /// to the ones along the bottom edge as it sizes them from the tree;
+    /// left as it was, a pane would be sized one way there and another by
+    /// the sync after it, every time the window's height crosses a row.
+    pub(crate) fn refresh_pane_tree_slack(&self, tab: &Arc<mux::tab::Tab>) {
+        let extra_height = self.pane_tree_slack();
+        for positioned in tab.iter_panes_ignoring_zoom() {
+            let members = self
+                .positioned_panes_for_stack(tab, &positioned)
+                .unwrap_or_else(|| vec![positioned]);
+            for pos in members {
+                let pane_id = pos.pane.pane_id();
+                let Some(mut metrics) = mux::pane::frontend_cell_metrics(pane_id) else {
+                    continue;
+                };
+                if metrics.extra_height != extra_height {
+                    metrics.extra_height = extra_height;
+                    mux::pane::set_frontend_cell_metrics(pane_id, Some(metrics));
+                }
+            }
+        }
+    }
+
     pub(crate) fn terminal_size_for_positioned_pane(
         &self,
         pos: &PositionedPane,
@@ -2482,8 +2554,9 @@ impl super::TermWindow {
             .pane_nav_bar_height()
             .min(pos.pixel_height.saturating_sub(cell_height));
         let pixel_width = pos.pixel_width.max(cell_width);
-        let pixel_height = pos
-            .pixel_height
+        // Along the tree's bottom edge, the room under it too.
+        let slack = self.pane_bottom_slack(pos, self.terminal_size.rows);
+        let pixel_height = (pos.pixel_height + slack)
             .saturating_sub(pane_nav_height)
             .max(cell_height);
         let cols = (pixel_width / cell_width).max(1);
@@ -2534,6 +2607,9 @@ impl super::TermWindow {
                     cell_width: render_metrics.cell_size.width.max(1) as usize,
                     cell_height: render_metrics.cell_size.height.max(1) as usize,
                     chrome_height: self.pane_nav_bar_height(),
+                    // For every pane: the mux knows which run along the
+                    // tree's bottom edge, as the tree changes too.
+                    extra_height: self.pane_tree_slack(),
                     dpi: self.dimensions.dpi as u32,
                 }),
             );
@@ -2646,6 +2722,7 @@ impl super::TermWindow {
             }
             Some(true) => {}
         }
+        self.refresh_pane_tree_slack(&tab);
         tab.resize(self.terminal_size);
         self.reapply_collapsed_panes_for_tab(tab.tab_id());
         self.force_sync_active_mux_tab_pane_sizes();
@@ -2682,6 +2759,7 @@ impl super::TermWindow {
             tab.get_size(),
             self.terminal_size
         );
+        self.refresh_pane_tree_slack(&tab);
         if !tab.resize(self.terminal_size) {
             return;
         }
@@ -3164,7 +3242,7 @@ impl super::TermWindow {
             dpi: size.dpi,
         };
 
-        let tab_bar_height = self.tab_bar_pixel_height()? as usize
+        let tab_bar_height = self.window_tab_row_layout_height() as usize
             + crate::termwindow::render::tab_bar::terminal_bar_height(
                 self.terminal_bar_kind,
                 &render_metrics,

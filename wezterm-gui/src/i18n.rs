@@ -5,8 +5,8 @@
 
 use crate::native_settings::{NativeLanguagePreference, ThinkTermNativeSettings};
 pub(crate) use thinkterm_i18n::{
-    current_locale, language_option_label, tr, tr_args, LanguageOption, LANGUAGE_OPTIONS,
-    SYSTEM_PREFERENCE,
+    current_locale, in_english, language_option_label, tr, tr_args, LanguageOption,
+    LANGUAGE_OPTIONS, SYSTEM_PREFERENCE,
 };
 
 fn legacy_preference(language: NativeLanguagePreference) -> &'static str {
@@ -42,7 +42,17 @@ pub(crate) fn install() {
 }
 
 pub(crate) fn activate_preference(preference: &str) -> &'static str {
-    thinkterm_i18n::activate_preference(preference, &system_locales())
+    let before = current_locale();
+    let locale = thinkterm_i18n::activate_preference(preference, &system_locales());
+    if locale != before {
+        // Windows repaint in the new language; the menu bar is built once
+        // and has to be told.
+        promise::spawn::spawn_into_main_thread(async {
+            crate::commands::CommandDef::recreate_menubar(&config::configuration());
+        })
+        .detach();
+    }
+    locale
 }
 
 pub(crate) fn activate_from_settings(settings: &ThinkTermNativeSettings) -> &'static str {
@@ -117,22 +127,36 @@ mod tests {
                     continue;
                 }
                 let text = std::fs::read_to_string(&path).expect("source readable");
-                for (idx, _) in text.match_indices("tr(") {
-                    // Covers tr and the *_tr helpers: all funnel through a
-                    // fluent key as the first argument. Anything else whose
-                    // name merely ends in "tr" (push_str, …) is skipped by
-                    // requiring the identifier to be tr or *_tr. The key
-                    // may sit on the next line, so whitespace between the
-                    // paren and the literal is skipped.
+                for (needle, idx) in ["tr(", "tr_args(", "named(", "counted("]
+                    .iter()
+                    .copied()
+                    .flat_map(|needle| {
+                        text.match_indices(needle)
+                            .map(move |(idx, _)| (needle, idx))
+                    })
+                {
+                    // Covers tr and the *_tr helpers, tr_args, and the
+                    // command name helpers: all funnel through a fluent key
+                    // as the first argument. Anything else whose name merely
+                    // ends in "tr" (push_str, …) is skipped by requiring the
+                    // identifier to be one of those. The key may sit on the
+                    // next line, so whitespace between the paren and the
+                    // literal is skipped.
+                    let name_end = idx + needle.len() - 1;
                     let ident_start = text[..idx]
                         .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                         .map(|p| p + 1)
                         .unwrap_or(0);
-                    let ident = &text[ident_start..idx + 2];
-                    if ident != "tr" && !ident.ends_with("_tr") {
+                    let ident = &text[ident_start..name_end];
+                    let wanted = if needle == "tr(" {
+                        ident == "tr" || ident.ends_with("_tr")
+                    } else {
+                        ident == &needle[..needle.len() - 1]
+                    };
+                    if !wanted {
                         continue;
                     }
-                    let after_paren = &text[idx + 3..];
+                    let after_paren = &text[name_end + 1..];
                     let literal = after_paren.trim_start();
                     let Some(literal) = literal.strip_prefix('"') else {
                         continue;

@@ -1,3 +1,4 @@
+use crate::authentication::{AuthenticationBackend, AuthenticationMethod, AuthenticationProgress};
 use crate::session::SessionEvent;
 use anyhow::Context;
 use smol::channel::{bounded, Sender};
@@ -26,9 +27,20 @@ impl AuthenticationEvent {
     }
 }
 
+/// The server asked, was answered and turned the answer down, and nothing
+/// else was left to offer it. The same answer would be turned down again.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct AnswerRefused(pub(crate) String);
+
 impl crate::sessioninner::SessionInner {
     #[cfg(feature = "ssh2")]
-    fn agent_auth(&mut self, sess: &ssh2::Session, user: &str) -> anyhow::Result<bool> {
+    fn agent_auth(
+        &mut self,
+        sess: &ssh2::Session,
+        user: &str,
+        progress: &mut AuthenticationProgress,
+    ) -> anyhow::Result<bool> {
         if let Some(only) = self.config.get("identitiesonly") {
             if only == "yes" {
                 log::trace!("Skipping agent auth because identitiesonly=yes");
@@ -45,7 +57,13 @@ impl crate::sessioninner::SessionInner {
         agent.list_identities()?;
         let identities = agent.identities()?;
         for identity in identities {
-            if agent.userauth(user, &identity).is_ok() {
+            let result = agent.userauth(user, &identity);
+            progress.observe_ssh2(
+                AuthenticationMethod::PublicKey,
+                result.is_ok(),
+                sess.authenticated(),
+            );
+            if result.is_ok() {
                 return Ok(true);
             }
         }
@@ -59,6 +77,7 @@ impl crate::sessioninner::SessionInner {
         sess: &ssh2::Session,
         user: &str,
         host: &str,
+        progress: &mut AuthenticationProgress,
     ) -> anyhow::Result<bool> {
         use std::path::{Path, PathBuf};
 
@@ -78,7 +97,13 @@ impl crate::sessioninner::SessionInner {
                 };
 
                 // We try with no passphrase first, in case the key is unencrypted
-                match sess.userauth_pubkey_file(user, pubkey, &file, None) {
+                let result = sess.userauth_pubkey_file(user, pubkey, &file, None);
+                progress.observe_ssh2(
+                    AuthenticationMethod::PublicKey,
+                    result.is_ok(),
+                    sess.authenticated(),
+                );
+                match result {
                     Ok(_) => {
                         log::info!("pubkey_file immediately ok for {}", file.display());
                         return Ok(true);
@@ -113,7 +138,14 @@ impl crate::sessioninner::SessionInner {
 
                         let passphrase = &answers[0];
 
-                        match sess.userauth_pubkey_file(user, pubkey, &file, Some(passphrase)) {
+                        let result =
+                            sess.userauth_pubkey_file(user, pubkey, &file, Some(passphrase));
+                        progress.observe_ssh2(
+                            AuthenticationMethod::PublicKey,
+                            result.is_ok(),
+                            sess.authenticated(),
+                        );
+                        match result {
                             Ok(_) => {
                                 return Ok(true);
                             }
@@ -129,9 +161,17 @@ impl crate::sessioninner::SessionInner {
     }
 
     #[cfg(feature = "libssh-rs")]
-    pub fn authenticate_libssh(&mut self, sess: &libssh_rs::Session) -> anyhow::Result<()> {
+    pub fn authenticate_libssh(
+        &mut self,
+        sess: &libssh_rs::Session,
+    ) -> anyhow::Result<AuthenticationProgress> {
         use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
         let tx = self.tx_event.clone();
+        let mut progress = AuthenticationProgress::new(AuthenticationBackend::LibSsh);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let callback_cancelled = Arc::clone(&cancelled);
 
         // Set the callback for pubkey auth
         sess.set_auth_callback(move |prompt, echo, _verify, identity| {
@@ -148,27 +188,45 @@ impl crate::sessioninner::SessionInner {
                 }],
                 reply,
             }))
-            .unwrap();
+            .map_err(|_| {
+                callback_cancelled.store(true, Ordering::Relaxed);
+                libssh_rs::Error::fatal("authentication prompt channel closed")
+            })?;
 
-            let mut answers = smol::block_on(answers.recv())
-                .context("waiting for authentication answers from user")
-                .unwrap();
-            Ok(answers.remove(0))
+            let answers = smol::block_on(answers.recv()).map_err(|_| {
+                callback_cancelled.store(true, Ordering::Relaxed);
+                libssh_rs::Error::fatal("authentication answer channel closed")
+            })?;
+            answers.into_iter().next().ok_or_else(|| {
+                callback_cancelled.store(true, Ordering::Relaxed);
+                libssh_rs::Error::fatal("user cancelled authentication")
+            })
         });
 
         use libssh_rs::{AuthMethods, AuthStatus};
-        match sess.userauth_none(None)? {
-            AuthStatus::Success => return Ok(()),
+        let status = sess.userauth_none(None)?;
+        progress.observe_libssh(AuthenticationMethod::None, status);
+        match status {
+            AuthStatus::Success => return Ok(progress),
             _ => {}
         }
 
+        // Set once the server has turned down what it was told in answer
+        // to its own prompts.
+        let mut answer_refused = false;
         loop {
             let auth_methods = sess.userauth_list(None)?;
             let mut status_by_method = HashMap::new();
 
             if auth_methods.contains(AuthMethods::PUBLIC_KEY) {
-                match sess.userauth_public_key_auto(None, None)? {
-                    AuthStatus::Success => return Ok(()),
+                let result = sess.userauth_public_key_auto(None, None);
+                if cancelled.load(Ordering::Relaxed) {
+                    anyhow::bail!("user cancelled authentication");
+                }
+                let status = result?;
+                progress.observe_libssh(AuthenticationMethod::PublicKey, status);
+                match status {
+                    AuthStatus::Success => return Ok(progress),
                     AuthStatus::Partial => continue,
                     status => {
                         status_by_method.insert(AuthMethods::PUBLIC_KEY, status);
@@ -177,9 +235,12 @@ impl crate::sessioninner::SessionInner {
             }
 
             if auth_methods.contains(AuthMethods::INTERACTIVE) {
+                let mut answered = false;
                 loop {
-                    match sess.userauth_keyboard_interactive(None, None)? {
-                        AuthStatus::Success => return Ok(()),
+                    let status = sess.userauth_keyboard_interactive(None, None)?;
+                    progress.observe_libssh(AuthenticationMethod::KeyboardInteractive, status);
+                    match status {
+                        AuthStatus::Success => return Ok(progress),
                         AuthStatus::Info => {
                             let info = sess.userauth_keyboard_interactive_info()?;
 
@@ -204,10 +265,12 @@ impl crate::sessioninner::SessionInner {
                                 .context("waiting for authentication answers from user")?;
 
                             sess.userauth_keyboard_interactive_set_answers(&answers)?;
+                            answered = true;
 
                             continue;
                         }
                         AuthStatus::Denied => {
+                            answer_refused |= answered;
                             break;
                         }
                         AuthStatus::Partial => continue,
@@ -230,25 +293,37 @@ impl crate::sessioninner::SessionInner {
                         }],
                         reply,
                     }))
-                    .unwrap();
+                    .context("sending Authenticate request to user")?;
 
-                let mut answers = smol::block_on(answers.recv())
-                    .context("waiting for authentication answers from user")
-                    .unwrap();
-                let pw = answers.remove(0);
+                let answers = smol::block_on(answers.recv())
+                    .context("waiting for authentication answers from user")?;
+                let pw = answers
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("user cancelled authentication"))?;
 
-                match sess.userauth_password(None, Some(&pw))? {
-                    AuthStatus::Success => return Ok(()),
+                let status = sess.userauth_password(None, Some(&pw))?;
+                progress.observe_libssh(AuthenticationMethod::Password, status);
+                match status {
+                    AuthStatus::Success => return Ok(progress),
                     AuthStatus::Partial => continue,
+                    AuthStatus::Denied => {
+                        return Err(
+                            AnswerRefused(format!("password auth status: {:?}", status)).into()
+                        );
+                    }
                     status => anyhow::bail!("password auth status: {:?}", status),
                 }
             }
 
-            anyhow::bail!(
+            let unhandled = format!(
                 "unhandled auth case; methods={:?}, status={:?}",
-                auth_methods,
-                status_by_method
+                auth_methods, status_by_method
             );
+            if answer_refused {
+                return Err(AnswerRefused(unhandled).into());
+            }
+            anyhow::bail!(unhandled);
         }
     }
 
@@ -258,12 +333,13 @@ impl crate::sessioninner::SessionInner {
         sess: &ssh2::Session,
         user: &str,
         host: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<AuthenticationProgress> {
         use std::collections::HashSet;
+        let mut progress = AuthenticationProgress::new(AuthenticationBackend::Ssh2);
 
         loop {
             if sess.authenticated() {
-                return Ok(());
+                return Ok(progress);
             }
 
             // Re-query the auth methods on each loop as a successful method
@@ -271,13 +347,17 @@ impl crate::sessioninner::SessionInner {
             // auth may then unlock 2fac)
             let methods: HashSet<&str> = sess.auth_methods(&user)?.split(',').collect();
             log::trace!("ssh auth methods: {:?}", methods);
+            if sess.authenticated() {
+                progress.observe_ssh2(AuthenticationMethod::None, true, true);
+                return Ok(progress);
+            }
 
             if !sess.authenticated() && methods.contains("publickey") {
-                if self.agent_auth(sess, user)? {
+                if self.agent_auth(sess, user, &mut progress)? {
                     continue;
                 }
 
-                if self.pubkey_auth(sess, user, host)? {
+                if self.pubkey_auth(sess, user, host, &mut progress)? {
                     continue;
                 }
             }
@@ -303,7 +383,13 @@ impl crate::sessioninner::SessionInner {
                     anyhow::bail!("user cancelled authentication");
                 }
 
-                if let Err(err) = sess.userauth_password(user, &answers[0]) {
+                let result = sess.userauth_password(user, &answers[0]);
+                progress.observe_ssh2(
+                    AuthenticationMethod::Password,
+                    result.is_ok(),
+                    sess.authenticated(),
+                );
+                if let Err(err) = result {
                     log::error!("while attempting password auth: {}", err);
                 }
             }
@@ -356,7 +442,13 @@ impl crate::sessioninner::SessionInner {
                     tx_event: &self.tx_event,
                 };
 
-                if let Err(err) = sess.userauth_keyboard_interactive(user, &mut helper) {
+                let result = sess.userauth_keyboard_interactive(user, &mut helper);
+                progress.observe_ssh2(
+                    AuthenticationMethod::KeyboardInteractive,
+                    result.is_ok(),
+                    sess.authenticated(),
+                );
+                if let Err(err) = result {
                     log::error!("while attempting keyboard-interactive auth: {}", err);
                 }
             }

@@ -40,6 +40,7 @@ mod bottom_quotes;
 mod bounded_file;
 mod colorease;
 mod commands;
+mod connect_access;
 mod customglyph;
 mod download;
 mod editor_projects;
@@ -59,6 +60,8 @@ mod overlay;
 mod page_poll;
 mod perf;
 mod plugins;
+#[cfg(target_os = "macos")]
+mod privacy_status;
 mod quad;
 mod renderer_choice;
 mod renderstate;
@@ -537,7 +540,8 @@ pub(crate) fn connect_domain_for_ssh_host_id(host_id: &str) -> anyhow::Result<Ar
 /// client keeps the address, user and password it was built with, so one
 /// registered earlier would go on with the old ones until a restart. Only a
 /// domain doing nothing is replaced; one that is attached, attaching or
-/// retrying keeps going as it is. So is one built the way the record has it
+/// retrying keeps going as it is, but for a new password, which its next
+/// sign-in uses. So is one built the way the record has it
 /// already: the mux keeps every domain it is given, so another would only
 /// show up beside it, in the command palette for one.
 pub(crate) fn refresh_connect_domain_for_ssh_host(spec: &crate::ssh_hosts::SshHostSpec) {
@@ -548,15 +552,28 @@ pub(crate) fn refresh_connect_domain_for_ssh_host(spec: &crate::ssh_hosts::SshHo
     let Some(client) = domain.downcast_ref::<ClientDomain>() else {
         return;
     };
+    let wanted = ssh_host_client_domain_config(spec, name.clone());
     if domain.state() != mux::domain::DomainState::Detached
         || client.is_attaching()
         || client.is_attach_retrying()
     {
+        // In use, the domain is left as it is, but for the password it
+        // signs in with: a reconnect that stopped because the server
+        // refused the old one would send that one again when asked to go
+        // on, and nothing short of a detach would get the new one to it.
+        let password_alone = client.ssh_domain_config().is_some_and(|mut built| {
+            let changed = built.stored_password != wanted.stored_password;
+            built.stored_password = wanted.stored_password.clone();
+            changed && crate::ssh_hosts::same_dialing(&built, &wanted)
+        });
+        if password_alone {
+            client.set_stored_password(wanted.stored_password);
+        }
         return;
     }
-    let current = client.ssh_domain_config().is_some_and(|built| {
-        crate::ssh_hosts::same_dialing(&built, &ssh_host_client_domain_config(spec, name.clone()))
-    });
+    let current = client
+        .ssh_domain_config()
+        .is_some_and(|built| crate::ssh_hosts::same_dialing(&built, &wanted));
     if !current {
         add_ssh_host_client_domain(spec, name);
     }
@@ -1379,12 +1396,80 @@ impl Publish {
     }
 }
 
+/// The socket this process serves `thinkterm cli` on, once it listens.
+static CLI_SOCKET: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Where `thinkterm cli` reaches this process: what the terminals it runs
+/// itself are given as `WEZTERM_UNIX_SOCKET`. None when it could not listen.
+pub(crate) fn cli_socket() -> Option<&'static std::path::Path> {
+    CLI_SOCKET.get().map(PathBuf::as_path)
+}
+
+fn client_domain_is_foreign(config: &wezterm_client::domain::ClientDomainConfig) -> bool {
+    !matches!(config, wezterm_client::domain::ClientDomainConfig::Unix(unix)
+        if unix.proxy_command.is_none())
+}
+
+#[cfg(test)]
+mod server_terminal_tests {
+    use super::client_domain_is_foreign;
+    use wezterm_client::domain::ClientDomainConfig;
+
+    #[test]
+    fn direct_unix_connections_are_local_even_without_the_managed_host_flag() {
+        let mut unix = config::UnixDomain::default();
+        unix.local_session_host = false;
+        assert!(!client_domain_is_foreign(&ClientDomainConfig::Unix(
+            unix.clone()
+        )));
+        unix.proxy_command = Some(vec!["proxy".to_string()]);
+        assert!(client_domain_is_foreign(&ClientDomainConfig::Unix(unix)));
+    }
+}
+
+/// What the server this process runs for the command line lets the programs
+/// that ask have of the servers' terminals the windows are connected to:
+/// as far as Settings › Agents & Status says.
+fn keep_servers_terminals() {
+    use crate::native_settings::NativeServerTerminals;
+    use wezterm_mux_server_impl::foreign_panes::{install, Policy, Reach};
+    install(Policy {
+        reach: || match crate::native_settings::server_terminals() {
+            NativeServerTerminals::Off => Reach::Off,
+            NativeServerTerminals::Read => Reach::Read,
+            NativeServerTerminals::Type => Reach::Type,
+        },
+        // A connection to a server -- to the session server there, or a
+        // plain SSH session; not the one this machine's own terminals are
+        // kept by.
+        foreign: |domain_id| {
+            !crate::local_sessions::is_host_domain_id(domain_id)
+                && mux::Mux::get().get_domain(domain_id).is_some_and(|domain| {
+                    domain
+                        .downcast_ref::<wezterm_client::domain::ClientDomain>()
+                        .is_some_and(|client| {
+                            client_domain_is_foreign(client.client_domain_config())
+                        })
+                        || domain.downcast_ref::<mux::ssh::RemoteSshDomain>().is_some()
+                })
+        },
+        machine: |domain_id| {
+            mux::Mux::get()
+                .get_domain(domain_id)
+                .map(|domain| crate::ssh_hosts::machine_label(domain.domain_name()))
+                .unwrap_or_else(|| format!("domain {domain_id}"))
+        },
+    });
+}
+
 fn spawn_mux_server(unix_socket_path: PathBuf, should_publish: bool) -> anyhow::Result<()> {
+    keep_servers_terminals();
     let mut listener =
         wezterm_mux_server_impl::local::LocalListener::with_domain(&config::UnixDomain {
             socket_path: Some(unix_socket_path.clone()),
             ..Default::default()
         })?;
+    let _ = CLI_SOCKET.set(unix_socket_path.clone());
     std::thread::spawn(move || {
         let name_holder;
         if should_publish {
@@ -1417,6 +1502,9 @@ fn setup_mux(
     mux::agent_status::set_process_preference(|| {
         crate::native_settings::agent_panel_enabled()
     });
+    // Likewise Dynamic Status and its tool switches govern which tools'
+    // screens this process reads; a server reads by its own.
+    mux::task_status::set_tool_preference(crate::native_settings::task_tool_enabled);
     // The user-facing shell choice reaches every local spawn from here.
     // A headless mux server installs nothing, so this preference can only
     // ever decide what *this* process spawns, never what a remote server
@@ -1479,6 +1567,8 @@ fn build_initial_mux(
 fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> anyhow::Result<()> {
     // Before anything reads the state: an import staged from Settings.
     crate::state_backup::enter_gui();
+    // The desktop's own machine keeps pane output unless told not to.
+    mux::kept_output::on_by_default();
     if let Some(cls) = opts.class.as_ref() {
         crate::set_window_class(cls);
     }

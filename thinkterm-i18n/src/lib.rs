@@ -8,6 +8,7 @@ use fluent_bundle::FluentResource;
 pub use fluent_bundle::{FluentArgs, FluentValue};
 use fluent_langneg::negotiate_languages;
 use fluent_langneg::NegotiationStrategy;
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -31,6 +32,7 @@ pub const LANGUAGE_OPTIONS: &[LanguageOption] = &[
     LanguageOption { preference: "ja-JP", native_name: "日本語" },
     LanguageOption { preference: "fr-FR", native_name: "Français" },
     LanguageOption { preference: "de-DE", native_name: "Deutsch" },
+    LanguageOption { preference: "ru-RU", native_name: "Русский" },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,11 +46,12 @@ const ZH_CN: Locale = Locale { code: "zh-CN", source: include_str!("../i18n/zh-C
 const JA_JP: Locale = Locale { code: "ja-JP", source: include_str!("../i18n/ja-JP.ftl") };
 const FR_FR: Locale = Locale { code: "fr-FR", source: include_str!("../i18n/fr-FR.ftl") };
 const DE_DE: Locale = Locale { code: "de-DE", source: include_str!("../i18n/de-DE.ftl") };
+const RU_RU: Locale = Locale { code: "ru-RU", source: include_str!("../i18n/ru-RU.ftl") };
 
 /// The one registry that drives negotiation, catalogue construction and
 /// the parity test. Adding a locale is a resource, one entry here, and one
 /// user-facing entry in `LANGUAGE_OPTIONS`.
-const SUPPORTED_LOCALES: &[Locale] = &[EN_US, ZH_CN, JA_JP, FR_FR, DE_DE];
+const SUPPORTED_LOCALES: &[Locale] = &[EN_US, ZH_CN, JA_JP, FR_FR, DE_DE, RU_RU];
 
 impl Locale {
     fn index(self) -> usize {
@@ -88,6 +91,10 @@ static CATALOGS: OnceLock<Catalogs> = OnceLock::new();
 static ACTIVE_LOCALE: OnceLock<AtomicUsize> = OnceLock::new();
 static INITIAL: OnceLock<fn() -> &'static str> = OnceLock::new();
 static REPORTED_ERRORS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+thread_local! {
+    static IN_ENGLISH: Cell<bool> = const { Cell::new(false) };
+}
 
 fn build_catalog(locale: Locale) -> Catalog {
     let language_id: LanguageIdentifier = locale
@@ -163,6 +170,9 @@ pub fn set_initial_resolver(resolver: fn() -> &'static str) {
 }
 
 fn active_locale() -> Locale {
+    if IN_ENGLISH.with(Cell::get) {
+        return EN_US;
+    }
     let index = ACTIVE_LOCALE
         .get_or_init(|| {
             let code = INITIAL.get().map(|resolve| resolve()).unwrap_or(EN_US.code);
@@ -183,6 +193,20 @@ pub fn activate_preference(preference: &str, system: &[String]) -> &'static str 
         .get_or_init(|| AtomicUsize::new(locale.index()))
         .store(locale.index(), Ordering::Release);
     locale.code
+}
+
+/// Runs `f` with this thread's lookups answering in en-US, whatever the
+/// active locale: how a client gets the English form of a name it shows
+/// translated, to keep something that must not change with the language.
+pub fn in_english<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            IN_ENGLISH.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(IN_ENGLISH.with(|flag| flag.replace(true)));
+    f()
 }
 
 fn format_for(locale: Locale, id: &str, args: Option<&FluentArgs<'_>>) -> Option<String> {
@@ -219,6 +243,15 @@ pub fn tr(id: &str) -> String {
 
 pub fn tr_args(id: &str, args: &FluentArgs<'_>) -> String {
     format(id, Some(args))
+}
+
+/// What `id` reads in each shipped locale that defines it: how a client
+/// finds what it named in another language, such as a menu to rename.
+pub fn tr_every_locale(id: &str) -> Vec<String> {
+    SUPPORTED_LOCALES
+        .iter()
+        .filter_map(|locale| format_for(*locale, id, None))
+        .collect()
 }
 
 /// Whether the en-US catalogue defines `id` (with a value).
@@ -301,6 +334,9 @@ mod tests {
         assert_eq!(negotiate(&one("fr-CA")), "fr-FR");
         assert_eq!(negotiate(&one("en-GB")), "en-US");
         assert_eq!(negotiate(&one("de-AT")), "de-DE");
+        assert_eq!(negotiate(&one("ru")), "ru-RU");
+        assert_eq!(negotiate(&one("ru-BY")), "ru-RU");
+        assert_eq!(resolve_preference("system", &one("ru-RU")), "ru-RU");
         assert_eq!(negotiate(&one("xx")), "en-US");
         assert_eq!(resolve_preference("system", &one("fr")), "fr-FR");
         assert_eq!(resolve_preference("ja-JP", &one("fr")), "ja-JP");
@@ -310,6 +346,54 @@ mod tests {
     fn every_language_option_is_a_shipped_locale() {
         for option in LANGUAGE_OPTIONS.iter().filter(|o| o.preference != SYSTEM_PREFERENCE) {
             assert!(Locale::from_code(option.preference).is_some(), "{}", option.preference);
+        }
+    }
+
+    #[test]
+    fn in_english_answers_in_en_us_and_then_restores() {
+        activate_preference("zh-CN", &[]);
+        let translated = tr("command-copy-to-clipboard");
+        assert_ne!(translated, "Copy to clipboard");
+        assert_eq!(in_english(|| tr("command-copy-to-clipboard")), "Copy to clipboard");
+        // A nested scope ending does not end the outer one.
+        assert_eq!(in_english(|| { in_english(|| ()); current_locale() }), "en-US");
+        assert_eq!(tr("command-copy-to-clipboard"), translated);
+        activate_preference("en-US", &[]);
+    }
+
+    #[test]
+    fn every_russian_message_formats_without_fallback() {
+        let variables: BTreeSet<_> = EN_US.source
+            .split('$')
+            .skip(1)
+            .map(|tail| tail.split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_').next().unwrap())
+            .collect();
+        let catalog = &catalogs().locales[RU_RU.index()];
+        for count in [0, 1, 2, 5, 11, 21, 22, 25, 101] {
+            let mut args = FluentArgs::new();
+            for variable in &variables {
+                args.set(*variable, count);
+            }
+            for id in message_ids(EN_US.source) {
+                let message = catalog.bundle.get_message(&id).expect("Russian key exists");
+                let mut errors = vec![];
+                let value = catalog.bundle.format_pattern(message.value().unwrap(), Some(&args), &mut errors);
+                assert!(errors.is_empty(), "{id} ({count}): {errors:?}");
+                assert!(!value.is_empty(), "{id} is empty");
+            }
+        }
+    }
+
+    #[test]
+    fn russian_agent_counts_use_russian_plural_forms() {
+        for (count, expected) in [
+            (0, "0 агентов"), (1, "1 агент"), (2, "2 агента"),
+            (5, "5 агентов"), (11, "11 агентов"), (21, "21 агент"),
+            (22, "22 агента"), (25, "25 агентов"), (101, "101 агент"),
+        ] {
+            let mut args = FluentArgs::new();
+            args.set("count", count);
+            assert_eq!(format_for(RU_RU, "hover-card-agents", Some(&args)).as_deref(), Some(expected));
         }
     }
 

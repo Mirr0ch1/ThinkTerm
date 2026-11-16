@@ -23,8 +23,8 @@ use std::sync::Arc;
 use wezterm_ssh::{Session, SessionEvent};
 
 pub use thinkterm_core::ssh_hosts::{
-    default_mosh_server_command, parse_other_addresses, ShellIntegrationFailure, SshHostEntry,
-    SshHostId, SshHostSource, SshHostSpec, SshNetwork, DEFAULT_MOSH_SERVER_COMMAND,
+    default_mosh_server_command, parse_other_addresses, HostIcon, ShellIntegrationFailure,
+    SshHostEntry, SshHostId, SshHostSource, SshHostSpec, SshNetwork, DEFAULT_MOSH_SERVER_COMMAND,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -616,7 +616,9 @@ async fn connect_mosh_bootstrap_session(spec: &SshHostSpec) -> Result<(Session, 
             SessionEvent::HostVerificationFailed(failed) => {
                 bail!("SSH host verification failed: {}", failed);
             }
-            SessionEvent::Error(err) => bail!("SSH error: {}", err),
+            SessionEvent::Error(err) | SessionEvent::AuthenticationRefused(err) => {
+                bail!("SSH error: {}", err)
+            }
             SessionEvent::Authenticated => return Ok((session, mosh_client_host)),
         }
     }
@@ -758,6 +760,72 @@ pub fn connect_domain_label(domain_name: &str) -> String {
         }
     }
     domain_name.to_string()
+}
+
+/// What a domain that is a connection to another machine is called where
+/// the command line names it (`--pane MACHINE/ID`): the label of the saved
+/// host it reaches -- over a session server there, or a plain SSH session --
+/// or, for one that is not saved, its own name.
+pub fn machine_label(domain_name: &str) -> String {
+    if let Ok(store) = host_store() {
+        let label = store
+            .hosts
+            .iter()
+            .map(|record| &record.spec)
+            .find(|spec| {
+                connect_domain_name(spec) == domain_name || ssh_domain_name(spec) == domain_name
+            })
+            .map(|spec| spec.label.trim().to_string())
+            .filter(|label| !label.is_empty());
+        if let Some(label) = label {
+            return label;
+        }
+    }
+    connect_domain_label(domain_name)
+}
+
+/// The icon picked for the host a ThinkTerm Connect domain belongs to,
+/// matched as `host_for_connect_domain` matches it. Only a host saved here
+/// has one.
+pub fn connect_domain_icon(domain_name: &str) -> Option<HostIcon> {
+    let store = host_store().ok()?;
+    let hosts = &store.hosts;
+    hosts
+        .iter()
+        .find(|record| connect_domain_name(&record.spec) == domain_name)
+        .or_else(|| hosts.iter().find(|record| record.id == domain_name))
+        .or_else(|| hosts.iter().find(|record| record.spec.label == domain_name))
+        .and_then(|record| record.spec.icon)
+}
+
+/// How a host with `icon` is drawn in a menu: the plain server when none
+/// was picked.
+pub fn host_menu_icon(icon: Option<HostIcon>) -> window::ContextMenuIcon {
+    use window::ContextMenuIcon;
+    match icon {
+        None | Some(HostIcon::Server) => ContextMenuIcon::Server,
+        Some(HostIcon::Cloud) => ContextMenuIcon::Cloud,
+        Some(HostIcon::Globe) => ContextMenuIcon::Globe,
+        Some(HostIcon::Laptop) => ContextMenuIcon::Laptop,
+        Some(HostIcon::MacMini) => ContextMenuIcon::MacMini,
+        Some(HostIcon::Desktop) => ContextMenuIcon::Desktop,
+        Some(HostIcon::Chip) => ContextMenuIcon::Chip,
+        Some(HostIcon::Container) => ContextMenuIcon::Container,
+    }
+}
+
+/// What `icon` is called where it is picked.
+pub fn host_icon_name(icon: HostIcon) -> String {
+    crate::i18n::tr(match icon {
+        HostIcon::Server => "ssh-icon-server",
+        HostIcon::Cloud => "ssh-icon-cloud",
+        HostIcon::Globe => "ssh-icon-globe",
+        HostIcon::Laptop => "ssh-icon-laptop",
+        HostIcon::MacMini => "ssh-icon-mac-mini",
+        HostIcon::Desktop => "ssh-icon-desktop",
+        HostIcon::Chip => "ssh-icon-chip",
+        HostIcon::Container => "ssh-icon-container",
+    })
 }
 
 fn label_for_connect_domain<'a>(
@@ -1053,6 +1121,7 @@ fn parse_system_ssh_config_str(content: &str) -> Vec<SshHostEntry> {
                 shell_integration_unsupported: None,
                 shell_integration_failure: None,
                 files_auto_connect: false,
+                icon: None,
             };
             out.push(SshHostEntry {
                 id: system_host_id(&alias),
@@ -1536,6 +1605,7 @@ Host prod *.internal
             shell_integration_unsupported: None,
             shell_integration_failure: None,
             files_auto_connect: false,
+            icon: None,
         }
     }
 

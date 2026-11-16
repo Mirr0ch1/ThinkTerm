@@ -73,9 +73,11 @@ pub fn save_to_downloads(orig_name: Option<String>, data: &[u8]) -> anyhow::Resu
         .with_context(|| format!("writing {} of data to {}", data.len(), name.display()))?;
 
     let url = format!("file://{}", name.display());
+    let mut args = fluent_bundle::FluentArgs::new();
+    args.set("path", name.display().to_string());
     wezterm_toast_notification::persistent_toast_notification_with_click_to_open_url(
-        "Download completed",
-        &format!("Downloaded {}", name.display()),
+        &crate::i18n::tr("download-completed"),
+        &crate::i18n::tr_args("download-completed-body", &args),
         &url,
     );
 

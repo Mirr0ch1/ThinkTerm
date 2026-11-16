@@ -17,9 +17,11 @@ mod kill_pane;
 mod list;
 mod list_clients;
 mod move_pane_to_new_tab;
+mod open_page;
 mod proxy;
 mod rename_workspace;
 mod restore_output;
+mod reverse;
 mod send_key;
 mod send_text;
 mod set_pane_label;
@@ -33,6 +35,8 @@ mod tls_creds;
 mod wait;
 mod web_server;
 mod web_token;
+mod share;
+mod share_watch;
 mod zoom_pane;
 
 #[derive(Debug, Parser, Clone, Copy)]
@@ -206,6 +210,9 @@ enum CliSubCommand {
     #[command(name = "proxy", about = "start rpc proxy pipe")]
     Proxy(proxy::ProxyCommand),
 
+    #[command(name = "connect-reverse-proxy", hide = true)]
+    ConnectReverseProxy(reverse::Proxy),
+
     #[command(name = "tlscreds", about = "obtain tls credentials")]
     TlsCreds(tls_creds::TlsCredsCommand),
 
@@ -213,6 +220,11 @@ enum CliSubCommand {
     /// server's web port
     #[command(name = "web-token", rename_all = "kebab")]
     WebToken(web_token::WebTokenCommand),
+
+    /// Your shared panes, and the panes other accounts on this machine share
+    /// with you. A pane is shared from the share button in ThinkTerm.
+    #[command(name = "share", rename_all = "kebab")]
+    Share(share::ShareCommand),
 
     /// Turn the browser listener on and off, and see where it is accepting
     #[command(name = "web-server", rename_all = "kebab")]
@@ -233,6 +245,11 @@ enum CliSubCommand {
 Outputs the pane-id for the newly created pane on success"
     )]
     SplitPane(split_pane::SplitPane),
+
+    /// Open a plugin's page in a tab of its own, or in a pane's place or
+    /// beside it. Outputs the pane-id of the page's pane on success
+    #[command(name = "open-page", rename_all = "kebab")]
+    OpenPage(open_page::OpenPage),
 
     #[command(
         name = "spawn",
@@ -338,7 +355,71 @@ Outputs the pane-id for the newly created pane on success"
     RestoreOutput(restore_output::RestoreOutputCommand),
 }
 
+/// The window class `thinkterm cli` was asked to find, for reaching the
+/// window this machine has open as well as the server it asks.
+static WINDOW_CLASS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Whether the window's Settings let the programs here reach the terminals
+/// of its servers at all, as its settings file says: unless they do, there
+/// is nothing to ask it about them.
+pub(crate) fn servers_terminals_reachable() -> bool {
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct Agents {
+        server_terminals: String,
+    }
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct Settings {
+        agents: Agents,
+    }
+    std::fs::read(config::native_settings_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Settings>(&bytes).ok())
+        .is_some_and(|settings| {
+            matches!(settings.agents.server_terminals.as_str(), "read" | "type")
+        })
+}
+
+/// How long the window is waited on for what its servers have: a window
+/// busy starting or reloading does not hold up what this machine has.
+const WINDOW_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `ask` of the window, given `WINDOW_WAIT` to answer; `None` past it.
+pub(crate) async fn within_window_wait<T>(
+    ask: impl std::future::Future<Output = Option<T>>,
+) -> Option<T> {
+    smol::future::or(ask, async {
+        smol::Timer::after(WINDOW_WAIT).await;
+        None
+    })
+    .await
+}
+
+/// The window this machine has open, which is connected to the servers whose
+/// panes the programs here may reach as far as its Settings say; `None`
+/// without one.
+pub(crate) async fn window_client() -> Option<Client> {
+    let class = WINDOW_CLASS
+        .get()
+        .map(String::as_str)
+        .unwrap_or(wezterm_gui_subcommands::DEFAULT_WINDOW_CLASS);
+    let socket_path = wezterm_client::discovery::resolve_gui_sock_path(class).ok()?;
+    let domain = config::UnixDomain {
+        socket_path: Some(socket_path),
+        no_serve_automatically: true,
+        ..Default::default()
+    };
+    let mut ui = mux::connui::ConnectionUI::new_headless();
+    let client = Client::new_unix_domain(None, &domain, true, &mut ui, true).ok()?;
+    client.verify_version_compat(&ui).await.ok()?;
+    Some(client)
+}
+
 async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()> {
+    if let Some(class) = &cli.class {
+        let _ = WINDOW_CLASS.set(class.clone());
+    }
     // The scheme table is compiled in; asking a server for it (or starting
     // one) would only get in the way.
     if let CliSubCommand::ColorSchemes(cmd) = &cli.sub {
@@ -353,6 +434,12 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
     if let CliSubCommand::RestoreOutput(cmd) = &cli.sub {
         return cmd.run();
     }
+    // Watching asks the servers of the accounts that share, not our own.
+    if let CliSubCommand::Share(cmd) = &cli.sub {
+        if cmd.is_viewer() {
+            return cmd.run_viewer().await;
+        }
+    }
 
     let mut ui = mux::connui::ConnectionUI::new_headless();
     let initial = true;
@@ -364,7 +451,7 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
     let prefer_mux = cli.prefer_mux
         || matches!(
             cli.sub,
-            CliSubCommand::WebServer(_) | CliSubCommand::WebToken(_)
+            CliSubCommand::WebServer(_) | CliSubCommand::WebToken(_) | CliSubCommand::Share(_)
         );
     // HTML takes its colours from the server's palette, which the server
     // sends unasked as the client registers: listened for before that.
@@ -412,10 +499,13 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::Events(cmd) => cmd.run(client).await,
         CliSubCommand::GetText(cmd) => cmd.run(client, palette_pushes).await,
         CliSubCommand::SpawnCommand(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
+        CliSubCommand::OpenPage(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
         CliSubCommand::Proxy(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
+        CliSubCommand::ConnectReverseProxy(cmd) => cmd.run(client).await,
         CliSubCommand::TlsCreds(cmd) => cmd.run(client).await,
         CliSubCommand::WebServer(cmd) => cmd.run(client).await,
         CliSubCommand::WebToken(cmd) => cmd.run(client).await,
+        CliSubCommand::Share(cmd) => cmd.run(client).await,
         CliSubCommand::ActivatePaneDirection(cmd) => cmd.run(client).await,
         CliSubCommand::GetPaneDirection(cmd) => cmd.run(client).await,
         CliSubCommand::KillPane(cmd) => cmd.run(client).await,

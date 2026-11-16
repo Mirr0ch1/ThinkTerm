@@ -305,14 +305,19 @@ fn check_payload_length(data_len: usize, len: u64, serial: u64, ident: u64) -> a
 async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
     r: &mut R,
     max_serial: Option<u64>,
+    payload_limit: Option<usize>,
 ) -> anyhow::Result<Decoded> {
-    decode_raw_async_limited(r, max_serial, None).await
+    decode_raw_async_limited(r, max_serial, None, payload_limit).await
 }
 
+/// `payload_limit` is for a peer trusted with little: a payload past it is
+/// refused before it is read, and a compressed one is inflated here, to no
+/// more than it either.
 async fn decode_raw_async_limited<R: Unpin + AsyncRead + std::fmt::Debug>(
     r: &mut R,
     max_serial: Option<u64>,
     push_budget: Option<usize>,
+    payload_limit: Option<usize>,
 ) -> anyhow::Result<Decoded> {
     let len = read_u64_async(r)
         .await
@@ -355,6 +360,15 @@ async fn decode_raw_async_limited<R: Unpin + AsyncRead + std::fmt::Debug>(
         };
 
     check_payload_length(data_len, len, serial, ident)?;
+    if let Some(limit) = payload_limit {
+        if data_len > limit {
+            return Err(CorruptResponse(format!(
+                "a payload of {data_len} bytes is more than this connection takes \
+                 ({limit} bytes)"
+            ))
+            .into());
+        }
+    }
     if serial == 0 && ident != 1 {
         if let Some(budget) = push_budget {
             anyhow::ensure!(data_len <= budget, "registration push exceeds byte budget");
@@ -378,6 +392,10 @@ async fn decode_raw_async_limited<R: Unpin + AsyncRead + std::fmt::Debug>(
         })?;
         data.push(piece);
     }
+    let (data, is_compressed) = match payload_limit {
+        Some(limit) if is_compressed => (inflate_within(&data, limit)?, false),
+        _ => (data, is_compressed),
+    };
     Ok(Decoded {
         ident,
         serial,
@@ -450,6 +468,32 @@ pub struct DecodedPdu {
 /// If the serialized size is larger than this, then we'll consider compressing it
 #[cfg(not(target_family = "wasm"))]
 const COMPRESS_THRESH: usize = 32;
+
+/// A compressed payload from a peer held to `limit`, inflated: no more
+/// than `limit` bytes of it, or none, so what it inflates to is held to the
+/// limit as an uncompressed one is.
+fn inflate_within(data: &Payload, limit: usize) -> anyhow::Result<Payload> {
+    #[cfg(not(target_family = "wasm"))]
+    let decompress = zstd::Decoder::new(data.reader())?;
+    #[cfg(target_family = "wasm")]
+    let decompress = ruzstd::decoding::StreamingDecoder::new(data.reader())
+        .map_err(|e| anyhow::anyhow!("ruzstd: {e}"))?;
+    use std::io::Read as _;
+    let mut inflated = Vec::new();
+    decompress
+        .take(limit as u64 + 1)
+        .read_to_end(&mut inflated)
+        .context("inflating a payload")?;
+    if inflated.len() > limit {
+        return Err(CorruptResponse(format!(
+            "a payload inflating past {limit} bytes is more than this connection takes"
+        ))
+        .into());
+    }
+    let mut payload = Payload::default();
+    payload.push(inflated);
+    Ok(payload)
+}
 
 /// Where a PDU is going, which decides whether it is compressed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -717,9 +761,29 @@ macro_rules! pdu {
                       R: AsyncRead,
                       R: std::fmt::Debug
             {
+                Self::decode_async_within(r, max_serial, None).await
+            }
+
+            /// `decode_async` for a peer trusted with little, such as a
+            /// viewer on the share socket: a payload past `payload_limit` is
+            /// refused before it is read, and one that inflates past it is
+            /// refused as it inflates.
+            pub async fn decode_async_bounded<R>(r: &mut R, max_serial: Option<u64>, payload_limit: usize) -> Result<DecodedPdu, Error>
+                where R: std::marker::Unpin,
+                      R: AsyncRead,
+                      R: std::fmt::Debug
+            {
+                Self::decode_async_within(r, max_serial, Some(payload_limit)).await
+            }
+
+            async fn decode_async_within<R>(r: &mut R, max_serial: Option<u64>, payload_limit: Option<usize>) -> Result<DecodedPdu, Error>
+                where R: std::marker::Unpin,
+                      R: AsyncRead,
+                      R: std::fmt::Debug
+            {
                 #[cfg(not(target_family = "wasm"))]
                 let started = std::time::Instant::now();
-                let decoded = decode_raw_async(r, max_serial).await.context("decoding a PDU")?;
+                let decoded = decode_raw_async(r, max_serial, payload_limit).await.context("decoding a PDU")?;
                 // Only a debug line above 64 KiB reads these; wasm has no
                 // Instant, and the line is not worth a clock abstraction.
                 #[cfg(not(target_family = "wasm"))]
@@ -828,7 +892,19 @@ macro_rules! pdu {
 ///     threads behind workspaces (GetWorkspaceNames), and
 ///     ClientJoined/ClientLeft.
 /// 82: SwapPanes swaps two panes of a tab, each into the other's place.
-pub const CODEC_VERSION: usize = 82;
+/// 83: Sharing a pane with other accounts on the machine (Share* PDUs).
+/// 84: Render pushes say whether the program takes pastes bracketed
+///     (GetPaneRenderChangesResponse::bracketed_paste).
+/// 85: The machine a pane of another one is on (ListPanesResponse::
+///     pane_machines), as a window gives the panes it is connected to.
+/// 87: A foreground program carries what its task rules read off its
+///     screen (ForegroundProgram::task), for a tool such as apt or brew.
+/// 88: Task readings carry their stable rules id, so display-name overrides
+///     cannot bypass a client's per-tool switch.
+/// 89: A plugin's page in a pane's place (SpawnPage, SpawnPageResponse,
+///     ListPanesResponse::pane_pages), and what its plugin changes of it
+///     (ChangePage, PageChanged).
+pub const CODEC_VERSION: usize = 89;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -949,6 +1025,41 @@ pdu! {
     ClientJoined: 120,
     ClientLeft: 121,
     SwapPanes: 122,
+    ShareStart: 123,
+    ShareList: 124,
+    ShareListResponse: 125,
+    ShareStop: 126,
+    ShareKick: 127,
+    ShareGrant: 128,
+    ShareRevoke: 129,
+    ShareIncoming: 130,
+    ShareIncomingResponse: 131,
+    ShareJoin: 132,
+    ShareJoinResponse: 133,
+    ShareRequestControl: 134,
+    ShareReleaseControl: 135,
+    ShareStateChanged: 136,
+    ShareDiscover: 137,
+    ShareDiscoverResponse: 138,
+    ShareDeny: 139,
+    ShareCandidates: 140,
+    ShareCandidatesResponse: 141,
+    GetConnectEndpoint: 142,
+    GetConnectEndpointResponse: 143,
+    SpawnPage: 144,
+    SpawnPageResponse: 145,
+    ChangePage: 146,
+    PageChanged: 147,
+}
+
+/// Discovery only. This address conveys no authority to approve or export.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GetConnectEndpoint {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GetConnectEndpointResponse {
+    pub server_id: String,
+    pub address: String,
 }
 
 impl Pdu {
@@ -1245,6 +1356,95 @@ pub struct ListPanesResponse {
     /// The labels of the panes that have one.
     #[serde(default)]
     pub pane_labels: HashMap<PaneId, String>,
+    /// The panes that are another machine's, as a window connected to it
+    /// gives them: the machine, and each one's id there.
+    #[serde(default)]
+    pub pane_machines: HashMap<PaneId, PaneMachine>,
+    /// The panes that hold a plugin's page in place of a terminal, and
+    /// which: a client draws those from the plugin's frames, and asks the
+    /// mux for none of their lines.
+    #[serde(default)]
+    pub pane_pages: HashMap<PaneId, thinkterm_proto::PageSpec>,
+}
+
+/// Open a plugin's page in a pane of its own, which runs nothing: the mux
+/// keeps where it is and what it was opened with, and each client draws
+/// it. Responds with SpawnPageResponse describing the new pane.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SpawnPage {
+    pub page: thinkterm_proto::PageSpec,
+    pub place: PagePlace,
+    /// The size of the tab, for a page in a new one.
+    pub size: TerminalSize,
+}
+
+/// The pane a page was opened in, as SpawnResponse describes a terminal's,
+/// and the page as the mux keeps it: with the id it was given, and where
+/// it was opened from.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SpawnPageResponse {
+    pub pane_id: PaneId,
+    pub tab_id: TabId,
+    pub window_id: WindowId,
+    pub size: TerminalSize,
+    pub page: thinkterm_proto::PageSpec,
+}
+
+impl SpawnPageResponse {
+    /// The new pane, as SpawnResponse describes a terminal's, and its page.
+    pub fn into_parts(self) -> (SpawnResponse, thinkterm_proto::PageSpec) {
+        let spawned = SpawnResponse {
+            pane_id: self.pane_id,
+            tab_id: self.tab_id,
+            window_id: self.window_id,
+            size: self.size,
+        };
+        (spawned, self.page)
+    }
+}
+
+/// Change what the page `pane_id` holds says of itself, as its plugin asked
+/// a client that shows it. Returns `UnitResponse`; every client then hears
+/// PageChanged.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ChangePage {
+    pub pane_id: PaneId,
+    pub edit: thinkterm_proto::PageEdit,
+}
+
+/// Unilateral to every client: what the page pane `pane_id` holds says of
+/// itself changed, and is now `page`.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct PageChanged {
+    pub pane_id: PaneId,
+    pub page: thinkterm_proto::PageSpec,
+}
+
+/// Where a page is opened.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub enum PagePlace {
+    /// A tab of its own: in `window_id`, or in a new window of `workspace`.
+    /// It is of the domain `pane_id` is of, the one the user is on.
+    Tab {
+        window_id: Option<WindowId>,
+        workspace: String,
+        pane_id: Option<PaneId>,
+    },
+    /// A level-2 tab in the pane stack that contains `pane_id`.
+    Stack { pane_id: PaneId },
+    /// A split of `pane_id`.
+    Split {
+        pane_id: PaneId,
+        split_request: SplitRequest,
+    },
+}
+
+/// Where a pane of another machine is: the name the window gives the
+/// machine, and the pane's id on it.
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct PaneMachine {
+    pub machine: String,
+    pub pane_id: PaneId,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -1984,6 +2184,243 @@ pub struct ClientLeft {
     pub client_id: ClientId,
 }
 
+/// The directory an account's server listens in for viewers of the panes it
+/// shares. It belongs to that account and nobody else may write to it, so a
+/// socket found in it is that account's; a viewer checks both before it
+/// believes one.
+pub fn share_socket_dir(uid: u32) -> PathBuf {
+    PathBuf::from(format!("/tmp/{SHARE_SOCKET_DIR_PREFIX}{uid}"))
+}
+
+pub const SHARE_SOCKET_DIR_PREFIX: &str = "thinkterm-share-";
+pub const SHARE_SOCKET_NAME: &str = "share.sock";
+
+/// Who a shared pane is for: an account on the server's machine, or every
+/// account in one of its groups, by name.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub enum ShareAudience {
+    User(String),
+    Group(String),
+}
+
+/// As it is typed: `name`, or `group:name`.
+impl std::fmt::Display for ShareAudience {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::User(name) => write!(f, "{name}"),
+            Self::Group(name) => write!(f, "group:{name}"),
+        }
+    }
+}
+
+/// Share a pane with other accounts on the server's machine: they may
+/// watch it, and one at a time may type into it once its owner agrees.
+/// Responds with `ShareListResponse` holding just the new share.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareStart {
+    pub pane_id: PaneId,
+    pub audience: Vec<ShareAudience>,
+    /// Asks for viewers to read the pane's history too. Not granted: a
+    /// share shows only what is on the pane's screen.
+    pub history: bool,
+    /// Seconds until the share ends by itself: at most half an hour, which
+    /// is also what `None` gets.
+    pub expires_in_secs: Option<u64>,
+    /// Asked by a person, from the desktop's share button. A share starts
+    /// no other way: a program in a pane -- an agent -- is refused.
+    pub from_desktop: bool,
+}
+
+/// The shares this server holds. Responds with `ShareListResponse`.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareList {}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareListResponse {
+    pub shares: Vec<ShareInfo>,
+}
+
+/// A share as its owner sees it. Times are seconds since the Unix epoch.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareInfo {
+    pub share_id: u64,
+    pub pane_id: PaneId,
+    pub audience: Vec<ShareAudience>,
+    pub history: bool,
+    pub started: u64,
+    pub expires: Option<u64>,
+    pub viewers: Vec<ShareViewer>,
+    /// The viewer who may type, and until when; `None` when only the owner
+    /// types.
+    pub controller: Option<ShareController>,
+    /// Viewers waiting to be allowed to type, oldest first.
+    pub requests: Vec<ShareViewer>,
+}
+
+/// One viewer's connection. The id names it to `ShareKick` and `ShareGrant`.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareViewer {
+    pub viewer_id: u64,
+    pub name: String,
+    pub since: u64,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareController {
+    pub viewer_id: u64,
+    pub name: String,
+    pub until: Option<u64>,
+}
+
+/// End a share and drop everyone watching it. Responds with UnitResponse.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareStop {
+    pub share_id: u64,
+}
+
+/// Drop one viewer from a share. Responds with UnitResponse.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareKick {
+    pub share_id: u64,
+    pub viewer_id: u64,
+}
+
+/// Let one viewer type, in place of whoever could before. Responds with
+/// UnitResponse.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareGrant {
+    pub share_id: u64,
+    pub viewer_id: u64,
+    /// Seconds until the right lapses; `None` keeps it until taken back.
+    pub for_secs: Option<u64>,
+    /// Asked by a person, from the desktop's share panel, as a share's
+    /// start is.
+    pub from_desktop: bool,
+}
+
+/// Turn down a viewer's request to type; it goes on watching. Responds
+/// with UnitResponse.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareDeny {
+    pub share_id: u64,
+    pub viewer_id: u64,
+}
+
+/// Take typing back from the viewer who has it. Responds with UnitResponse.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareRevoke {
+    pub share_id: u64,
+}
+
+/// From a viewer: the shares this server has made for it. Responds with
+/// `ShareIncomingResponse`.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareIncoming {}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareIncomingResponse {
+    /// The account the server runs as.
+    pub owner: String,
+    pub shares: Vec<IncomingShare>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct IncomingShare {
+    pub share_id: u64,
+    pub pane_id: PaneId,
+    pub title: String,
+    pub history: bool,
+    pub started: u64,
+    /// The name of whoever may type now, besides the owner.
+    pub controller: Option<String>,
+}
+
+/// To a client's own server: the panes other accounts on its machine share
+/// with the account it runs as. The server asks each of them, as that
+/// account. Responds with `ShareDiscoverResponse`.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareDiscover {}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareDiscoverResponse {
+    /// One entry per account with something shared, each with its shares.
+    pub owners: Vec<ShareIncomingResponse>,
+    /// The accounts whose ThinkTerm is another version than the server's:
+    /// what they share cannot be read from it.
+    pub other_version: Vec<String>,
+    /// The `thinkterm` program beside the server, which watches a share
+    /// with `cli share watch OWNER/SHARE`.
+    pub watch_program: Option<PathBuf>,
+}
+
+/// From a viewer: start watching a share. A connection watches one share.
+/// Responds with `ShareJoinResponse`; the pane's rows are then read as any
+/// client reads them.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareJoin {
+    pub share_id: u64,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareJoinResponse {
+    pub share_id: u64,
+    pub pane_id: PaneId,
+    pub viewer_id: u64,
+    /// Whether the viewer may read the pane's history. Without it only the
+    /// rows on the screen when they are asked for come back.
+    pub history: bool,
+}
+
+/// From a viewer: ask the owner to let it type. Responds with UnitResponse.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareRequestControl {
+    pub share_id: u64,
+}
+
+/// From a viewer: give typing back, or withdraw a request. Responds with
+/// UnitResponse.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareReleaseControl {
+    pub share_id: u64,
+}
+
+/// The accounts and groups of the server's machine a pane can be shared
+/// with, for a person to pick from. Responds with
+/// `ShareCandidatesResponse`.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareCandidates {}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareCandidatesResponse {
+    /// The account the server runs as.
+    pub me: String,
+    /// People's accounts, not the system's own; `me` among them.
+    pub accounts: Vec<String>,
+    pub groups: Vec<String>,
+}
+
+/// Why a viewer's watch ended, in `ShareStateChanged::ended`.
+pub mod share_end {
+    /// The owner stopped sharing, or the owner's ThinkTerm stopped.
+    pub const STOPPED: &str = "stopped";
+    /// The owner removed this viewer.
+    pub const REMOVED: &str = "removed";
+    pub const EXPIRED: &str = "expired";
+    /// The shared pane closed.
+    pub const CLOSED: &str = "closed";
+}
+
+/// Unilateral, to a viewer: whether it may type now, and who does; or,
+/// with `ended`, why the share is over for it (a `share_end` code).
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ShareStateChanged {
+    pub share_id: u64,
+    pub controlling: bool,
+    pub requested: bool,
+    pub controller: Option<String>,
+    pub ended: Option<String>,
+}
+
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct SetPaneZoomed {
     pub containing_tab_id: TabId,
@@ -2061,6 +2498,10 @@ pub struct GetPaneRenderChangesResponse {
 
     pub input_serial: Option<InputSerial>,
     pub seqno: SequenceNo,
+    /// Whether the program takes pastes bracketed (DECSET 2004). A
+    /// client asks before pasting line breaks to one that does not:
+    /// each line would run as it went in. Last, as codec 84 added it.
+    pub bracketed_paste: bool,
 }
 
 /// `termwiz::input::KeyboardEncoding` for the wire: the termwiz type has no
@@ -2465,6 +2906,8 @@ mod golden {
             tab_titles: vec!["main".to_string()],
             window_titles,
             pane_labels: HashMap::new(),
+            pane_machines: Default::default(),
+            pane_pages: Default::default(),
         }
     }
 
@@ -2519,6 +2962,7 @@ mod golden {
             mouse_grabbed: false,
             alt_screen: true,
             keyboard_encoding: WireKeyboardEncoding::Kitty(3),
+            bracketed_paste: true,
             cursor_position: StableCursorPosition::default(),
             dimensions: RenderableDimensions {
                 cols: 80,
@@ -2609,10 +3053,19 @@ mod golden {
         assert_eq!(back, command_spec());
     }
 
-    /// LIST_PANES as codec 81 writes it: the pane labels went on the end,
-    /// and an empty map is one zero byte after the bytes captured before.
+    /// LIST_PANES as codec 89 writes it: the pane labels went on the end at
+    /// 81, the panes' machines after them at 85, the panes' pages after
+    /// those at 89, and an empty map is one zero byte, each after the bytes
+    /// captured before.
     fn list_panes_with_labels() -> Vec<u8> {
-        [LIST_PANES, &[0]].concat()
+        [LIST_PANES, &[0, 0, 0]].concat()
+    }
+
+    /// RENDER_CHANGES as codec 84 writes it: whether the program takes
+    /// pastes bracketed went on the end, a one after the bytes captured
+    /// before.
+    fn render_changes_with_bracketed_paste() -> Vec<u8> {
+        [RENDER_CHANGES, &[1]].concat()
     }
 
     #[test]
@@ -2624,7 +3077,10 @@ mod golden {
         assert_eq!(varbincode_bytes(&split_pane()), SPLIT_PANE);
         assert_eq!(varbincode_bytes(&search_request()), SEARCH);
         assert_eq!(varbincode_bytes(&client_list_response()), CLIENT_LIST);
-        assert_eq!(varbincode_bytes(&render_changes_response()), RENDER_CHANGES);
+        assert_eq!(
+            varbincode_bytes(&render_changes_response()),
+            render_changes_with_bracketed_paste()
+        );
     }
 
     #[test]
@@ -2645,7 +3101,7 @@ mod golden {
             client_list_response()
         );
         assert_eq!(
-            back::<GetPaneRenderChangesResponse>(RENDER_CHANGES),
+            back::<GetPaneRenderChangesResponse>(&render_changes_with_bracketed_paste()),
             render_changes_response()
         );
     }
@@ -2925,9 +3381,43 @@ mod test {
             futures_lite::future::block_on(decode_raw_async(
                 &mut futures_lite::io::Cursor::new(encoded),
                 None,
+                None,
             ))
             .unwrap(),
         );
+    }
+
+    #[test]
+    fn a_bounded_peer_may_compress_but_not_past_the_limit() {
+        let decode = |bytes: Vec<u8>| {
+            futures_lite::future::block_on(Pdu::decode_async_bounded(
+                &mut futures_lite::io::Cursor::new(bytes),
+                None,
+                4096,
+            ))
+        };
+        // A paste the client compressed, as it compresses anything that
+        // shrinks: taken, and read as it was sent.
+        let paste = Pdu::SendPaste(SendPaste {
+            pane_id: 1,
+            data: "echo hello; ".repeat(50),
+        });
+        let mut bytes = vec![];
+        paste.encode(&mut bytes, 7).unwrap();
+        assert!(bytes.len() < 600, "it went compressed");
+        assert_eq!(decode(bytes).unwrap().pdu, paste);
+
+        // One that inflates past the limit is refused, however small it
+        // was on the wire.
+        let bomb = Pdu::SendPaste(SendPaste {
+            pane_id: 1,
+            data: "a".repeat(64 * 1024),
+        });
+        let mut bytes = vec![];
+        bomb.encode(&mut bytes, 8).unwrap();
+        assert!(bytes.len() < 4096);
+        let err = decode(bytes).expect_err("refused");
+        assert!(format!("{err:#}").contains("inflating past"), "{:#}", err);
     }
 
     /// The wasm client's receive path: a native server compresses with the
@@ -3198,7 +3688,7 @@ mod test {
         // tripwire: whoever bumps the codec must come here, confirm the
         // round-trips still cover the new version, and advance it
         // deliberately.
-        assert_eq!(CODEC_VERSION, 82);
+        assert_eq!(CODEC_VERSION, 89);
         use thinkterm_proto::{
             AgentEvidence, AgentState, AgentStatus, ProgramBlockedKind, ProgramReport,
             ProgramReportChild, ProgramReportState,
@@ -3268,7 +3758,7 @@ mod test {
     #[test]
     fn foreground_program_protocol_round_trip_at_version_74() {
         // Same tripwire as the agent-status test above.
-        assert_eq!(CODEC_VERSION, 82);
+        assert_eq!(CODEC_VERSION, 89);
         use thinkterm_proto::ForegroundProgram;
 
         fn round_trip(pdu: &Pdu) -> Pdu {
@@ -3282,6 +3772,7 @@ mod test {
         let program = ForegroundProgram {
             executable: "node".to_string(),
             runs: Some("npm".to_string()),
+            task: None,
         };
         for pdu in [
             Pdu::ForegroundProgramChanged(ForegroundProgramChanged {
@@ -3303,11 +3794,37 @@ mod test {
             assert_eq!(round_trip(&pdu), pdu);
         }
 
+        let task_program = ForegroundProgram {
+            executable: "brew".into(),
+            task: Some(thinkterm_proto::TaskReading {
+                id: "brew".into(),
+                name: "Homebrew".into(),
+                state: thinkterm_proto::TaskState::Waiting,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for pdu in [
+            Pdu::ForegroundProgramChanged(ForegroundProgramChanged {
+                pane_id: 7,
+                program: Some(task_program.clone()),
+            }),
+            Pdu::GetForegroundProgramsResponse(GetForegroundProgramsResponse {
+                programs: vec![ForegroundProgramEntry {
+                    pane_id: 7,
+                    program: task_program,
+                }],
+            }),
+        ] {
+            assert_eq!(round_trip(&pdu), pdu);
+        }
+
         // A name that is a path, not a file name, is dropped on arrival
         // rather than handed to whoever draws it.
         let smuggled = ForegroundProgram {
             executable: "node".to_string(),
             runs: Some("../../etc/passwd".to_string()),
+            task: None,
         };
         assert_eq!(
             round_trip(&Pdu::ForegroundProgramChanged(ForegroundProgramChanged {
@@ -3340,6 +3857,7 @@ mod test {
                     program: ForegroundProgram {
                         executable: "node".to_string(),
                         runs: Some("npm".to_string()),
+                        task: None,
                     },
                 }],
             })
@@ -3369,7 +3887,7 @@ mod test {
     #[test]
     fn run_state_protocol_round_trip_at_version_80() {
         // Same tripwire as the agent-status test above.
-        assert_eq!(CODEC_VERSION, 82);
+        assert_eq!(CODEC_VERSION, 89);
         use thinkterm_proto::{PaneExit, PaneRunState, ProgramState, ShellCommands};
 
         let exit = PaneExit {
@@ -3432,6 +3950,80 @@ mod test {
                 tab_titles: vec![],
                 window_titles: HashMap::new(),
                 pane_labels: HashMap::from([(10, "reviewer".to_string())]),
+                pane_machines: HashMap::from([(
+                    12,
+                    PaneMachine {
+                        machine: "devbox".to_string(),
+                        pane_id: 3,
+                    },
+                )]),
+                pane_pages: HashMap::from([(
+                    14,
+                    thinkterm_proto::PageSpec {
+                        plugin: "board".to_string(),
+                        args: "{\"board\":\"release\"}".to_string(),
+                        title: "Board".to_string(),
+                        icon: String::new(),
+                        id: "0f3a9c2e5b7d1846".to_string(),
+                        cwd: "/home/user/project".to_string(),
+                        terminal: Some(3),
+                    },
+                )]),
+            }),
+            Pdu::SpawnPage(SpawnPage {
+                page: thinkterm_proto::PageSpec {
+                    plugin: "board".to_string(),
+                    args: String::new(),
+                    title: "Board".to_string(),
+                    ..Default::default()
+                },
+                place: PagePlace::Tab {
+                    window_id: Some(2),
+                    workspace: "default".to_string(),
+                    pane_id: Some(10),
+                },
+                size: TerminalSize::default(),
+            }),
+            Pdu::SpawnPage(SpawnPage {
+                page: thinkterm_proto::PageSpec::default(),
+                place: PagePlace::Stack { pane_id: 10 },
+                size: TerminalSize::default(),
+            }),
+            Pdu::SpawnPage(SpawnPage {
+                page: thinkterm_proto::PageSpec::default(),
+                place: PagePlace::Split {
+                    pane_id: 10,
+                    split_request: SplitRequest::default(),
+                },
+                size: TerminalSize::default(),
+            }),
+            Pdu::SpawnPageResponse(SpawnPageResponse {
+                pane_id: 14,
+                tab_id: 5,
+                window_id: 2,
+                size: TerminalSize::default(),
+                page: thinkterm_proto::PageSpec {
+                    plugin: "board".to_string(),
+                    id: "0f3a9c2e5b7d1846".to_string(),
+                    terminal: Some(10),
+                    ..Default::default()
+                },
+            }),
+            Pdu::ChangePage(ChangePage {
+                pane_id: 14,
+                edit: thinkterm_proto::PageEdit {
+                    title: Some("Release board".to_string()),
+                    icon: None,
+                    args: Some("{\"card\":12}".to_string()),
+                },
+            }),
+            Pdu::PageChanged(PageChanged {
+                pane_id: 14,
+                page: thinkterm_proto::PageSpec {
+                    plugin: "board".to_string(),
+                    title: "Release board".to_string(),
+                    ..Default::default()
+                },
             }),
             Pdu::GetWorkspaceNames(GetWorkspaceNames {}),
             Pdu::GetWorkspaceNamesResponse(GetWorkspaceNamesResponse {
@@ -3468,7 +4060,7 @@ mod test {
     fn frame_control_extension_round_trips_without_changing_legacy_version() {
         // The extension is asked for, so it needed no bump of its own; 74
         // is the foreground program's, which a server sends unasked.
-        assert_eq!(CODEC_VERSION, 82);
+        assert_eq!(CODEC_VERSION, 89);
         for pdu in [
             Pdu::GetKittyImage(GetKittyImage { pane_id: 3, image_id: 7, data_hash: [9; 32], have_frames: 2, image_epoch: Some(4) }),
             Pdu::GetKittyFrameSelections(GetKittyFrameSelections { pane_id: 3, subscribe: true }),

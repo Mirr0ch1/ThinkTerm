@@ -87,8 +87,51 @@ impl GetText {
         client: Client,
         pushes: Option<smol::channel::Receiver<Pdu>>,
     ) -> anyhow::Result<()> {
-        let pane_id =
-            crate::cli::target::resolve(&client, self.pane_id, self.pane.as_deref()).await?;
+        if self
+            .pane
+            .as_deref()
+            .is_some_and(crate::cli::reverse::looks_like_target)
+            && self.text_format() != TextFormat::Text
+        {
+            return Err(
+                crate::cli::UsageError("reverse access supports plain text only".into()).into(),
+            );
+        }
+        if let Some(target) = crate::cli::reverse::resolve(&client, self.pane.as_deref()).await? {
+            use thinkterm_reverse_access::protocol::{Command, ReadOptions, Reply};
+            let (reply, payload) = target
+                .router
+                .request_read(
+                    target.route,
+                    Command::Read {
+                        export: target.export,
+                        options: ReadOptions {
+                            start: self.start_line.map(|n| n as i64),
+                            end: self.end_line.map(|n| n as i64),
+                            trim: self.trim,
+                            unwrap: self.unwrap,
+                        },
+                    },
+                )
+                .await?;
+            match (reply, payload) {
+                (Reply::Text { .. }, Some(text)) => {
+                    std::io::stdout()
+                        .lock()
+                        .write_all(text.text().as_bytes())
+                        .map_err(crate::stdout_error)?;
+                    return Ok(());
+                }
+                (Reply::Failed(failure), _) => anyhow::bail!("reverse read failed: {:?}", failure),
+                _ => anyhow::bail!("invalid reverse read response"),
+            }
+        }
+        let (client, pane_id) = crate::cli::target::resolve_reaching_servers(
+            client,
+            self.pane_id,
+            self.pane.as_deref(),
+        )
+        .await?;
 
         let info = client
             .get_dimensions(codec::GetPaneRenderableDimensions { pane_id })
@@ -140,6 +183,19 @@ impl GetText {
             .into_iter()
             .map(|(_idx, line)| line)
             .collect();
+        // A pane that holds a plugin's page has no text, which is said
+        // rather than answered with blank lines. Only a screen with nothing
+        // on it is asked about, so a terminal's read costs what it did.
+        if lines.iter().all(|line| line.as_str().trim().is_empty()) {
+            let page = client
+                .list_panes()
+                .await
+                .ok()
+                .and_then(|mut listing| listing.pane_pages.remove(&pane_id));
+            if let Some(page) = page {
+                anyhow::bail!("{}: it has no text", page.no_terminal(pane_id));
+            }
+        }
         if self.unwrap {
             lines = unwrapped(lines);
         }

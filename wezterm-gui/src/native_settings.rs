@@ -132,6 +132,7 @@ pub(crate) enum NativeAppIcon {
     Red,
     #[serde(alias = "default")]
     Classic,
+    Otter,
 }
 
 impl Default for NativeAppIcon {
@@ -146,6 +147,7 @@ impl NativeAppIcon {
             Self::Simple => "Blue Pill",
             Self::Red => "Red Pill",
             Self::Classic => "Classic",
+            Self::Otter => "Otter",
         }
     }
 
@@ -154,10 +156,13 @@ impl NativeAppIcon {
             Self::Simple => "ThinkTerm_simple.icns",
             Self::Red => "ThinkTerm_red.icns",
             Self::Classic => "ThinkTerm.icns",
+            Self::Otter => "ThinkTerm_otter.icns",
         }
     }
 
-    pub(crate) const ALL: [Self; 3] = [Self::Simple, Self::Red, Self::Classic];
+    /// The icons Settings offers. Classic is no longer among them, but a
+    /// settings file that chose it keeps it.
+    pub(crate) const CHOICES: [Self; 3] = [Self::Simple, Self::Red, Self::Otter];
 
     /// A 128px copy of the icon, for Settings to show as a choice: the
     /// full-size art is megabytes of PNG to decode for a 44pt picture.
@@ -166,6 +171,7 @@ impl NativeAppIcon {
             Self::Simple => include_bytes!("../../assets/icon/ThinkTerm_simple_128.png"),
             Self::Red => include_bytes!("../../assets/icon/ThinkTerm_red_128.png"),
             Self::Classic => include_bytes!("../../assets/icon/ThinkTerm_128.png"),
+            Self::Otter => include_bytes!("../../assets/icon/ThinkTerm_otter_128.png"),
         }
     }
 }
@@ -388,6 +394,32 @@ impl NativeCursorBlink {
     pub(crate) const ALL: [Self; 3] = [Self::Off, Self::Smooth, Self::Hard];
 }
 
+/// The cursor's usual shape.
+///
+/// `Block` is the default and leaves the shape to the Lua
+/// `default_cursor_style`, which is a block unless it says otherwise. `Bar`
+/// and `Underline` replace the configured shape and keep its blink. A
+/// program that sets its own cursor style still decides, as with
+/// [`NativeCursorBlink`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeCursorShape {
+    Block,
+    Bar,
+    Underline,
+}
+
+impl Default for NativeCursorShape {
+    fn default() -> Self {
+        Self::Block
+    }
+}
+
+impl NativeCursorShape {
+    /// Every choice, in the order the settings window offers them.
+    pub(crate) const ALL: [Self; 3] = [Self::Block, Self::Bar, Self::Underline];
+}
+
 /// A value this build does not know about must not cost the user the rest of
 /// their settings, so an unreadable choice reads as the default rather than
 /// failing the whole file. Same reasoning as `theme_mode_or_default`.
@@ -433,6 +465,55 @@ impl NativeBottomQuoteMode {
     pub(crate) const ALL: [Self; 2] = [Self::Timed, Self::PseudoRandom];
 }
 
+/// The window tab row: the first of the two tab bars.
+///
+/// `Show` is the default and the row it has always been. `AutoHide` gives
+/// its height back to the terminal and brings it down over the top of the
+/// window while the pointer rests at the top edge, pushing the terminal
+/// area down rather than resizing it; its pin keeps it out
+/// (`window_tabs_pinned`). A file that chose to hide it outright, a choice
+/// since withdrawn, has it auto-hide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeWindowTabs {
+    Show,
+    #[serde(alias = "hide")]
+    AutoHide,
+}
+
+impl Default for NativeWindowTabs {
+    fn default() -> Self {
+        Self::Show
+    }
+}
+
+impl NativeWindowTabs {
+    /// Every choice, in the order the settings window offers them.
+    pub(crate) const ALL: [Self; 2] = [Self::Show, Self::AutoHide];
+}
+
+/// Where a connected server's threads show, and how the Space menu lists
+/// servers.
+///
+/// `OwnSpace` is the default and what servers have always done: each one
+/// has Spaces of its own, every one of them spelled out in the Space menu
+/// under its server. `OneRowEach` keeps those Spaces and folds each server
+/// into one row of the menu. `Folders` keeps the Space menu to this device's
+/// Spaces and shows every server as folders in one of them instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeServerPlacement {
+    #[default]
+    OwnSpace,
+    OneRowEach,
+    Folders,
+}
+
+impl NativeServerPlacement {
+    /// Every choice, in the order the settings window offers them.
+    pub(crate) const ALL: [Self; 3] = [Self::OwnSpace, Self::OneRowEach, Self::Folders];
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct NativeAppearanceSettings {
@@ -471,6 +552,15 @@ pub(crate) struct NativeAppearanceSettings {
     /// hover cards.
     #[serde(deserialize_with = "choice_or_default")]
     pub(crate) agents_status: NativeThreadStatus,
+    /// See [`NativeWindowTabs`].
+    #[serde(deserialize_with = "choice_or_default")]
+    pub(crate) window_tabs: NativeWindowTabs,
+    /// Under `AutoHide`, the row's pin is in: it stays out and takes its
+    /// height in the layout, as under `Show`.
+    pub(crate) window_tabs_pinned: bool,
+    /// See [`NativeServerPlacement`].
+    #[serde(deserialize_with = "choice_or_default")]
+    pub(crate) server_placement: NativeServerPlacement,
 }
 
 /// How a sidebar thread row draws the programs its panes run. All but
@@ -516,28 +606,37 @@ impl NativeThreadStatus {
     pub(crate) const ALL: [Self; 4] = [Self::Ring, Self::Pulse, Self::Pixels, Self::Dots];
 }
 
-/// What a see-through window shows behind it on macOS: the plain blur, or
-/// Liquid Glass (see `config::MacosWindowGlass`).
+/// What a see-through window shows behind it on macOS: the plain blur, the
+/// system's frosted material, or Liquid Glass (see
+/// `config::MacosWindowGlass`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NativeMacGlass {
     #[default]
     Blur,
+    /// Clear glass over the material was offered once; the material is
+    /// what is left of it.
+    #[serde(alias = "clear_over_blur")]
+    Frosted,
     Regular,
     Clear,
-    ClearOverBlur,
 }
 
 impl NativeMacGlass {
     /// Every look, in the order the settings window offers them.
-    pub(crate) const ALL: [Self; 4] = [Self::Blur, Self::Regular, Self::Clear, Self::ClearOverBlur];
+    pub(crate) const ALL: [Self; 4] = [Self::Frosted, Self::Regular, Self::Clear, Self::Blur];
+
+    /// Whether it is Liquid Glass, which only macOS 26 and later have.
+    pub(crate) fn is_liquid_glass(self) -> bool {
+        matches!(self, Self::Regular | Self::Clear)
+    }
 
     fn glass(self) -> config::MacosWindowGlass {
         match self {
             Self::Blur => config::MacosWindowGlass::Blur,
+            Self::Frosted => config::MacosWindowGlass::Frosted,
             Self::Regular => config::MacosWindowGlass::Regular,
             Self::Clear => config::MacosWindowGlass::Clear,
-            Self::ClearOverBlur => config::MacosWindowGlass::ClearOverBlur,
         }
     }
 }
@@ -893,6 +992,10 @@ pub(crate) struct NativeTerminalSettings {
     pub(crate) copy_on_select: bool,
     #[serde(deserialize_with = "choice_or_default")]
     pub(crate) right_click: NativeRightClick,
+    /// Ask before a paste whose line breaks would run its lines one by one,
+    /// in a program that did not ask for pastes bracketed. Off unless chosen.
+    #[serde(default)]
+    pub(crate) paste_confirmation: bool,
     #[serde(deserialize_with = "choice_or_default")]
     pub(crate) copy_effect: NativeCopyEffect,
     /// The pane the mouse moves onto takes the focus, without a click.
@@ -906,6 +1009,10 @@ pub(crate) struct NativeTerminalSettings {
     /// cursor the configuration describes.
     #[serde(deserialize_with = "choice_or_default")]
     pub(crate) cursor_blink: NativeCursorBlink,
+    /// See [`NativeCursorShape`]. Block is the default, keeping the shape
+    /// the configuration describes.
+    #[serde(deserialize_with = "choice_or_default")]
+    pub(crate) cursor_shape: NativeCursorShape,
     pub(crate) bottom_quote_enabled: bool,
     pub(crate) bottom_quote_mode: NativeBottomQuoteMode,
     pub(crate) bottom_quote_interval_minutes: Option<u32>,
@@ -927,10 +1034,12 @@ impl Default for NativeTerminalSettings {
             selection_style: NativeSelectionStyle::default(),
             copy_on_select: true,
             right_click: NativeRightClick::default(),
+            paste_confirmation: false,
             copy_effect: NativeCopyEffect::default(),
             focus_follows_mouse: false,
             text_contrast: NativeTextContrast::default(),
             cursor_blink: NativeCursorBlink::default(),
+            cursor_shape: NativeCursorShape::default(),
             bottom_quote_enabled: false,
             bottom_quote_mode: NativeBottomQuoteMode::default(),
             bottom_quote_interval_minutes: None,
@@ -968,6 +1077,11 @@ pub(crate) fn selection_rounded() -> bool {
 /// Read on every right click, through the shared handle.
 pub(crate) fn right_click() -> NativeRightClick {
     load_shared().terminal.right_click
+}
+
+/// Read on every paste with a line break in it, through the shared handle.
+pub(crate) fn paste_confirmation() -> bool {
+    load_shared().terminal.paste_confirmation
 }
 
 /// Read on every copy and paste, through the shared handle.
@@ -1021,6 +1135,43 @@ pub(crate) fn cursor_blinks_by_default() -> bool {
     load_shared().terminal.cursor_blink != NativeCursorBlink::Off
 }
 
+/// The cursor shape chosen in Settings. Read alongside `cursor_blink_eases`,
+/// not per frame.
+pub(crate) fn cursor_shape_choice() -> NativeCursorShape {
+    load_shared().terminal.cursor_shape
+}
+
+/// The window tab row's mode and, under `AutoHide`, whether it is pinned.
+/// Read when a window builds or refreshes its state, not per frame.
+pub(crate) fn window_tabs_choice() -> (NativeWindowTabs, bool) {
+    let settings = load_shared();
+    (
+        settings.appearance.window_tabs,
+        settings.appearance.window_tabs_pinned,
+    )
+}
+
+/// Pin or unpin the auto-hiding window tab row, from its pin button. Every
+/// window is told directly, so no reload is owed.
+pub(crate) fn save_window_tabs_pinned(pinned: bool) -> anyhow::Result<()> {
+    update_ui_state_and_settings_window(|settings| {
+        settings.appearance.window_tabs_pinned = pinned
+    })
+}
+
+/// Whether servers show as folders in this device's Spaces rather than in
+/// Spaces of their own. Through the shared handle: the sidebar asks each
+/// time it builds its rows.
+pub(crate) fn servers_as_folders() -> bool {
+    load_shared().appearance.server_placement == NativeServerPlacement::Folders
+}
+
+/// Whether the Space menu folds each server into one row. Asked as the
+/// menu opens.
+pub(crate) fn space_menu_one_row_per_server() -> bool {
+    load_shared().appearance.server_placement == NativeServerPlacement::OneRowEach
+}
+
 /// Read once per painted pane, through the shared handle.
 pub(crate) fn overlay_scrollbar() -> bool {
     load_shared().terminal.overlay_scrollbar
@@ -1071,6 +1222,9 @@ pub(crate) struct NativeChromeSettings {
     /// home_font_size.
     pub(crate) right_sidebar_font_size: Option<f64>,
     pub(crate) workspace_sidebar_width: Option<usize>,
+    /// The Library's width in design pixels, as its edge was last left;
+    /// `None` for the default.
+    pub(crate) library_width: Option<usize>,
     /// Hover-reveal of the collapsed left sidebar; `None` means enabled.
     pub(crate) workspace_sidebar_hover_reveal: Option<bool>,
     /// Whether the file preview shows a Markdown file rendered (the default)
@@ -1114,6 +1268,13 @@ pub(crate) struct NativeChromeSettings {
     pub(crate) agent_panel_enabled: Option<bool>,
     /// What is shown of the state programs report about themselves.
     pub(crate) agent_status_display: NativeAgentStatusDisplay,
+    /// Dynamic Status, the corner of the terminal area that shows what is
+    /// out of sight. Absent means on. Off, it shows only ThinkTerm's own
+    /// news: an update, a transfer.
+    pub(crate) dynamic_status_enabled: Option<bool>,
+    /// Tools whose screens are not read for Dynamic Status, by the id of
+    /// their task rules (`mux::task_status`).
+    pub(crate) task_tools_off: Vec<String>,
     /// How the Agents panel's view menu filters, groups and orders it.
     pub(crate) agents_panel_view: NativeAgentsPanelView,
     /// The panels plugins add to the right sidebar, as the plugin host last
@@ -1234,7 +1395,7 @@ impl Default for NativeWindowSettings {
 
 /// What the sidebar's thread cards, the bell and the Agents panel show of
 /// the state programs report about themselves (OSC 7501). All of it, unless
-/// the user turned a part off in Settings › Agents.
+/// the user turned a part off in the Agents panel's view menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct NativeAgentStatusDisplay {
@@ -1259,8 +1420,7 @@ impl Default for NativeAgentStatusDisplay {
 }
 
 /// The parts of a program's own status report (OSC 7501) that can be
-/// switched on and off: in Settings › Agents and in the Agents panel's view
-/// menu, which flip the same settings.
+/// switched on and off, in the Agents panel's view menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgentStatusPart {
     Description,
@@ -1270,7 +1430,7 @@ pub(crate) enum AgentStatusPart {
 }
 
 impl AgentStatusPart {
-    /// In the order the Status Display card numbers them.
+    /// In the order the Agents panel's view menu lists them.
     pub(crate) const ALL: [Self; 4] = [
         Self::Description,
         Self::Reason,
@@ -1284,15 +1444,6 @@ impl AgentStatusPart {
             Self::Reason => "settings-agent-status-reason",
             Self::Progress => "settings-agent-status-progress",
             Self::Subtasks => "settings-agent-status-subtasks",
-        }
-    }
-
-    pub(crate) fn description_key(self) -> &'static str {
-        match self {
-            Self::Description => "settings-agent-status-description-description",
-            Self::Reason => "settings-agent-status-reason-description",
-            Self::Progress => "settings-agent-status-progress-description",
-            Self::Subtasks => "settings-agent-status-subtasks-description",
         }
     }
 
@@ -1430,6 +1581,14 @@ pub(crate) struct NativeWorkspaceSettings {
     /// While ThinkTerm is in the background, tell the system when a thread
     /// finishes, starts waiting on you, or stops on an error.
     pub(crate) system_notifications_enabled: bool,
+    /// Which of a thread's moments the sounds mark, while they are on.
+    pub(crate) notification_sound_moments: WorkMoments,
+    /// Which of them the system notifications tell of, while they are on.
+    pub(crate) system_notification_moments: WorkMoments,
+    /// Count the threads with something unseen on the Dock icon (macOS).
+    pub(crate) dock_badge_enabled: bool,
+    /// Which of their moments the Dock icon counts, while it counts.
+    pub(crate) dock_badge_moments: WorkMoments,
     /// Updating a remote mux server hands its sessions to the new version
     /// instead of stopping it; off, the update asks whether to stop it.
     pub(crate) remote_update_keeps_sessions: bool,
@@ -1458,6 +1617,10 @@ impl Default for NativeWorkspaceSettings {
             remote_drop_destination: String::new(),
             notification_sounds_enabled: true,
             system_notifications_enabled: true,
+            notification_sound_moments: WorkMoments::default(),
+            system_notification_moments: WorkMoments::default(),
+            dock_badge_enabled: true,
+            dock_badge_moments: WorkMoments::default(),
             remote_update_keeps_sessions: true,
             update_download_source: thinkterm_update::DownloadSource::Auto.name().to_string(),
             check_for_updates: None,
@@ -1466,6 +1629,59 @@ impl Default for NativeWorkspaceSettings {
             // Fresh installs enable it in ThinkTermNativeSettings::for_new_install.
             local_sessions_via_mux: false,
         }
+    }
+}
+
+/// A moment in a thread's work that may prompt you: it finished, it waits
+/// on you, or its program stopped on an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkMoment {
+    Finished,
+    NeedsInput,
+    Error,
+}
+
+impl WorkMoment {
+    pub(crate) const ALL: [WorkMoment; 3] =
+        [WorkMoment::Finished, WorkMoment::NeedsInput, WorkMoment::Error];
+}
+
+/// Which [`WorkMoment`]s one kind of prompt -- the sound, the system
+/// notification, the Dock count -- answers. All of them unless taken out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct WorkMoments {
+    pub(crate) finished: bool,
+    pub(crate) needs_input: bool,
+    pub(crate) error: bool,
+}
+
+impl Default for WorkMoments {
+    fn default() -> Self {
+        Self {
+            finished: true,
+            needs_input: true,
+            error: true,
+        }
+    }
+}
+
+impl WorkMoments {
+    pub(crate) fn includes(self, moment: WorkMoment) -> bool {
+        match moment {
+            WorkMoment::Finished => self.finished,
+            WorkMoment::NeedsInput => self.needs_input,
+            WorkMoment::Error => self.error,
+        }
+    }
+
+    pub(crate) fn toggle(&mut self, moment: WorkMoment) {
+        let slot = match moment {
+            WorkMoment::Finished => &mut self.finished,
+            WorkMoment::NeedsInput => &mut self.needs_input,
+            WorkMoment::Error => &mut self.error,
+        };
+        *slot = !*slot;
     }
 }
 
@@ -1545,6 +1761,76 @@ impl Default for NativeWebSettings {
             relay: false,
         }
     }
+}
+
+/// How far the programs on this machine -- `thinkterm cli`, the agents it
+/// is run by, plugins -- may reach the terminals of the servers a window is
+/// connected to: Settings › Agents & Status. Off until turned on: what they would
+/// reach is a shell on another machine, logged in as the person at the
+/// window (`wezterm_mux_server_impl::foreign_panes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeServerTerminals {
+    #[default]
+    Off,
+    /// Listed and read, not typed into.
+    Read,
+    /// Listed, read and typed into.
+    Type,
+}
+
+impl NativeServerTerminals {
+    /// Every choice, in the order the settings window offers them.
+    pub(crate) const ALL: [Self; 3] = [Self::Off, Self::Read, Self::Type];
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct NativeAgentsSettings {
+    /// A build without a choice a newer one made falls back to off rather
+    /// than failing the file.
+    #[serde(deserialize_with = "choice_or_default")]
+    pub(crate) server_terminals: NativeServerTerminals,
+    #[serde(deserialize_with = "reverse_minutes")]
+    pub(crate) reverse_access_minutes: u16,
+}
+
+impl Default for NativeAgentsSettings {
+    fn default() -> Self {
+        Self {
+            server_terminals: NativeServerTerminals::Off,
+            reverse_access_minutes: 30,
+        }
+    }
+}
+
+/// A value outside the range reads as the default, and the file is kept: see
+/// [`choice_or_default`].
+fn reverse_minutes<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u16, D::Error> {
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    match u16::deserialize(&raw) {
+        Ok(value @ 1..=120) => Ok(value),
+        _ => {
+            log::warn!("reverse access duration {raw} is not 1 to 120 minutes; using the default");
+            Ok(NativeAgentsSettings::default().reverse_access_minutes)
+        }
+    }
+}
+
+/// How far the programs here may reach servers' terminals. Through the
+/// shared handle: asked of every request a program makes of one.
+pub(crate) fn server_terminals() -> NativeServerTerminals {
+    load_shared().agents.server_terminals
+}
+
+/// Sharing a terminal with other accounts on its machine
+/// (`termwindow::share`): the Share & Sync page. Off until turned on.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct NativeSharingSettings {
+    /// The share button on terminals, "Shared with me" in the sidebar, and
+    /// the window asking its servers after shares: none of it while off.
+    pub(crate) enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1852,6 +2138,15 @@ pub(crate) use thinkterm_tab_icons::{
     TabIconCard as NativeTabIconCard, TabIconSettings as NativeTabIconSettings,
 };
 
+/// Settings › Accessibility.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct NativeAccessibilitySettings {
+    /// The sidebar's add buttons keep their circle when the pointer is not
+    /// over them.
+    pub(crate) show_button_shapes: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct ThinkTermNativeSettings {
@@ -1869,6 +2164,9 @@ pub(crate) struct ThinkTermNativeSettings {
     pub(crate) keymap: NativeKeymapSettings,
     pub(crate) web: NativeWebSettings,
     pub(crate) tab_icons: NativeTabIconSettings,
+    pub(crate) sharing: NativeSharingSettings,
+    pub(crate) agents: NativeAgentsSettings,
+    pub(crate) accessibility: NativeAccessibilitySettings,
 }
 
 impl Default for ThinkTermNativeSettings {
@@ -1888,6 +2186,9 @@ impl Default for ThinkTermNativeSettings {
             keymap: NativeKeymapSettings::default(),
             web: NativeWebSettings::default(),
             tab_icons: NativeTabIconSettings::default(),
+            sharing: NativeSharingSettings::default(),
+            agents: NativeAgentsSettings::default(),
+            accessibility: NativeAccessibilitySettings::default(),
         }
     }
 }
@@ -2280,7 +2581,10 @@ fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNati
     let font_size = (before.terminal.font_size != after.terminal.font_size)
         .then_some(after.terminal.font_size);
     let contrast = before.terminal.text_contrast != after.terminal.text_contrast;
-    let cursor_blink = before.terminal.cursor_blink != after.terminal.cursor_blink;
+    let cursor_style = before.terminal.cursor_blink != after.terminal.cursor_blink
+        || before.terminal.cursor_shape != after.terminal.cursor_shape;
+    let window_tabs = before.appearance.window_tabs != after.appearance.window_tabs
+        || before.appearance.window_tabs_pinned != after.appearance.window_tabs_pinned;
     let before_chrome = &before.chrome;
     let after_chrome = &after.chrome;
     let panels = before_chrome.right_sidebar_files_enabled != after_chrome.right_sidebar_files_enabled
@@ -2314,8 +2618,11 @@ fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNati
                         if contrast {
                             term_window.refresh_text_min_contrast();
                         }
-                        if cursor_blink {
-                            term_window.refresh_cursor_blink();
+                        if cursor_style {
+                            term_window.refresh_cursor_style();
+                        }
+                        if window_tabs {
+                            term_window.refresh_window_tabs();
                         }
                         if panels {
                             term_window.right_sidebar_panels_changed();
@@ -2802,6 +3109,15 @@ pub(crate) fn save_workspace_sidebar_width(width: usize) -> anyhow::Result<()> {
     update_ui_state(|settings| settings.chrome.workspace_sidebar_width = Some(width))
 }
 
+/// The Library's width in design pixels, if its edge was ever dragged.
+pub(crate) fn library_width() -> Option<usize> {
+    load_shared().chrome.library_width
+}
+
+pub(crate) fn save_library_width(width: usize) -> anyhow::Result<()> {
+    update_ui_state(|settings| settings.chrome.library_width = Some(width))
+}
+
 /// Remember whether the workspace sidebar is open, so a new window starts the
 /// way the last one was left.
 ///
@@ -2914,6 +3230,10 @@ pub(crate) fn right_sidebar_open_with_app() -> Option<NativeOpenWithApp> {
     load().chrome.right_sidebar_open_with_app
 }
 
+pub(crate) fn show_button_shapes() -> bool {
+    load_shared().accessibility.show_button_shapes
+}
+
 pub(crate) fn sidebar_thread_icons() -> NativeThreadIcons {
     load_shared().appearance.sidebar_thread_icons
 }
@@ -3012,7 +3332,7 @@ pub(crate) fn mark_onboarding_seen(settings: &mut ThinkTermNativeSettings) {
 }
 
 pub(crate) fn tab_font_size() -> f64 {
-    load()
+    load_shared()
         .chrome
         .tab_font_size
         .unwrap_or(DEFAULT_TAB_FONT_SIZE)
@@ -3027,18 +3347,58 @@ pub(crate) fn pane_header_font_size(settings: &ThinkTermNativeSettings) -> f64 {
         .clamp(10.0, 28.0)
 }
 
-pub(crate) fn notification_sounds_enabled() -> bool {
-    load().workspaces.notification_sounds_enabled
-}
-
 pub(crate) fn system_notifications_enabled() -> bool {
     load_shared().workspaces.system_notifications_enabled
+}
+
+/// Whether a sound marks `moment`: sounds are on, and on for it.
+pub(crate) fn notification_sound_for(moment: WorkMoment) -> bool {
+    let settings = load_shared();
+    settings.workspaces.notification_sounds_enabled
+        && settings.workspaces.notification_sound_moments.includes(moment)
+}
+
+/// Whether the system is told of `moment`, as for the sounds.
+pub(crate) fn system_notification_for(moment: WorkMoment) -> bool {
+    system_notifications_enabled()
+        && load_shared()
+            .workspaces
+            .system_notification_moments
+            .includes(moment)
+}
+
+/// The moments the Dock icon counts, or `None` while it counts nothing.
+pub(crate) fn dock_badge_moments() -> Option<WorkMoments> {
+    let settings = load_shared();
+    settings
+        .workspaces
+        .dock_badge_enabled
+        .then_some(settings.workspaces.dock_badge_moments)
 }
 
 /// What is shown of programs' own status reports. `load_shared`: asked
 /// while painting.
 pub(crate) fn agent_status_display() -> NativeAgentStatusDisplay {
     load_shared().chrome.agent_status_display
+}
+
+/// Whether Dynamic Status shows what is out of sight, or only ThinkTerm's
+/// own news.
+pub(crate) fn dynamic_status_enabled() -> bool {
+    load_shared().chrome.dynamic_status_enabled.unwrap_or(true)
+}
+
+/// Whether the tool with task rules `id` has its screen read: Dynamic
+/// Status on, and the tool not switched off.
+pub(crate) fn task_tool_enabled(id: &str) -> bool {
+    load_shared().chrome.task_tool_enabled(id)
+}
+
+impl NativeChromeSettings {
+    pub(crate) fn task_tool_enabled(&self, id: &str) -> bool {
+        self.dynamic_status_enabled.unwrap_or(true)
+            && !self.task_tools_off.iter().any(|off| off == id)
+    }
 }
 
 /// Flip one part of the status display from outside Settings (the Agents
@@ -3141,6 +3501,58 @@ pub(crate) fn main_window_renderer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_moment_prompts_until_one_is_taken_out() {
+        // A settings file from before the moments: as it behaved, and the
+        // Dock counts.
+        let settings: ThinkTermNativeSettings = serde_json::from_str("{}").unwrap();
+        let workspaces = &settings.workspaces;
+        for moment in WorkMoment::ALL {
+            assert!(workspaces.notification_sound_moments.includes(moment));
+            assert!(workspaces.system_notification_moments.includes(moment));
+            assert!(workspaces.dock_badge_moments.includes(moment));
+        }
+        assert!(workspaces.dock_badge_enabled);
+
+        let settings: ThinkTermNativeSettings = serde_json::from_str(
+            r#"{"workspaces": {"notification_sound_moments": {"finished": false}}}"#,
+        )
+        .unwrap();
+        let moments = settings.workspaces.notification_sound_moments;
+        assert!(!moments.includes(WorkMoment::Finished));
+        assert!(moments.includes(WorkMoment::NeedsInput));
+        assert!(moments.includes(WorkMoment::Error));
+
+        let mut moments = WorkMoments::default();
+        moments.toggle(WorkMoment::Error);
+        assert!(!moments.includes(WorkMoment::Error));
+        moments.toggle(WorkMoment::Error);
+        assert_eq!(moments, WorkMoments::default());
+    }
+
+    #[test]
+    fn sharing_is_off_until_turned_on() {
+        let settings: ThinkTermNativeSettings = serde_json::from_str("{}").unwrap();
+        assert!(!settings.sharing.enabled);
+        assert!(!ThinkTermNativeSettings::for_new_install().sharing.enabled);
+        let settings: ThinkTermNativeSettings =
+            serde_json::from_str(r#"{"sharing": {"enabled": true}}"#).unwrap();
+        assert!(settings.sharing.enabled);
+    }
+
+    #[test]
+    fn a_reverse_access_duration_out_of_range_costs_only_itself() {
+        let agents = |json: &str| -> NativeAgentsSettings { serde_json::from_str(json).unwrap() };
+        assert_eq!(agents("{}").reverse_access_minutes, 30);
+        assert_eq!(agents(r#"{"reverse_access_minutes": 45}"#).reverse_access_minutes, 45);
+        for bad in ["0", "121", "-1", "70000", "\"long\"", "null"] {
+            let json = format!(r#"{{"reverse_access_minutes": {bad}, "server_terminals": "type"}}"#);
+            let settings = agents(&json);
+            assert_eq!(settings.reverse_access_minutes, 30, "{bad}");
+            assert_eq!(settings.server_terminals, NativeServerTerminals::Type, "{bad}");
+        }
+    }
 
     #[test]
     fn the_right_sidebar_starts_as_it_was_left_while_that_is_remembered() {
@@ -3347,12 +3759,12 @@ mod tests {
     fn the_mac_glass_is_asked_for_on_macos_and_read_whatever_was_written() {
         use wezterm_dynamic::ToDynamic;
         let mut settings = ThinkTermNativeSettings::default();
-        settings.appearance.mac_glass = NativeMacGlass::ClearOverBlur;
+        settings.appearance.mac_glass = NativeMacGlass::Frosted;
         let [.., glass] = window_opacity_overrides(&settings);
         assert_eq!(
             glass.1,
             cfg!(target_os = "macos")
-                .then(|| config::MacosWindowGlass::ClearOverBlur.to_dynamic())
+                .then(|| config::MacosWindowGlass::Frosted.to_dynamic())
         );
         let read = |written: &str| {
             let text = format!(r#"{{"appearance":{{"mac_glass":{written}}}}}"#);
@@ -3361,7 +3773,9 @@ mod tests {
                 .appearance
                 .mac_glass
         };
-        assert_eq!(read(r#""clear_over_blur""#), NativeMacGlass::ClearOverBlur);
+        assert_eq!(read(r#""frosted""#), NativeMacGlass::Frosted);
+        // Clear glass over the blur became the blur on its own.
+        assert_eq!(read(r#""clear_over_blur""#), NativeMacGlass::Frosted);
         // A look tried and dropped reads as the blur.
         assert_eq!(read(r#""regular_over_blur""#), NativeMacGlass::Blur);
         assert_eq!(read(r#""something_new""#), NativeMacGlass::Blur);
@@ -3468,6 +3882,97 @@ mod tests {
         let settings: ThinkTermNativeSettings =
             serde_json::from_str(json).expect("the file has to survive");
         assert_eq!(settings.terminal.cursor_blink, NativeCursorBlink::Off);
+        assert_eq!(settings.terminal.cursor_shape, NativeCursorShape::Block);
+    }
+
+    /// A file from before the window tab row could hide keeps it shown.
+    #[test]
+    fn a_settings_file_without_a_window_tabs_choice_shows_the_row() {
+        let json = r#"{ "version": 1, "appearance": { "theme_mode": "system" } }"#;
+        let settings: ThinkTermNativeSettings =
+            serde_json::from_str(json).expect("the file has to survive");
+        assert_eq!(settings.appearance.window_tabs, NativeWindowTabs::Show);
+        assert!(!settings.appearance.window_tabs_pinned);
+    }
+
+    #[test]
+    fn a_window_tabs_choice_round_trips_through_the_file() {
+        for (written, expected) in [
+            ("show", NativeWindowTabs::Show),
+            ("auto_hide", NativeWindowTabs::AutoHide),
+        ] {
+            let json = format!(r#"{{"appearance": {{"window_tabs": "{written}"}}}}"#);
+            let settings: ThinkTermNativeSettings =
+                serde_json::from_str(&json).expect("the file has to survive");
+            assert_eq!(settings.appearance.window_tabs, expected, "{written}");
+
+            let out = serde_json::to_string(&settings).expect("serialises");
+            assert!(
+                out.contains(&format!("\"window_tabs\":\"{written}\"")),
+                "{} has to survive a save: {}",
+                written,
+                out
+            );
+        }
+    }
+
+    /// Hiding the row outright was offered for a while; a file that chose
+    /// it has the row auto-hide, and says so when saved.
+    #[test]
+    fn a_window_tabs_choice_to_hide_reads_as_auto_hide() {
+        let json = r#"{"appearance": {"window_tabs": "hide"}}"#;
+        let settings: ThinkTermNativeSettings =
+            serde_json::from_str(json).expect("the file has to survive");
+        assert_eq!(settings.appearance.window_tabs, NativeWindowTabs::AutoHide);
+        let out = serde_json::to_string(&settings).expect("serialises");
+        assert!(out.contains("\"window_tabs\":\"auto_hide\""), "{out}");
+    }
+
+    /// Servers keep their own Spaces unless a file says otherwise, and a
+    /// choice this build does not know falls back to that too.
+    #[test]
+    fn a_server_placement_choice_round_trips_and_defaults_to_own_spaces() {
+        let json = r#"{ "version": 1, "appearance": { "theme_mode": "system" } }"#;
+        let settings: ThinkTermNativeSettings =
+            serde_json::from_str(json).expect("the file has to survive");
+        assert_eq!(
+            settings.appearance.server_placement,
+            NativeServerPlacement::OwnSpace
+        );
+
+        for (written, expected) in [
+            ("own_space", NativeServerPlacement::OwnSpace),
+            ("one_row_each", NativeServerPlacement::OneRowEach),
+            ("folders", NativeServerPlacement::Folders),
+            ("someday", NativeServerPlacement::OwnSpace),
+        ] {
+            let json = format!(r#"{{"appearance": {{"server_placement": "{written}"}}}}"#);
+            let settings: ThinkTermNativeSettings =
+                serde_json::from_str(&json).expect("the file has to survive");
+            assert_eq!(settings.appearance.server_placement, expected, "{written}");
+        }
+    }
+
+    #[test]
+    fn a_cursor_shape_choice_round_trips_through_the_file() {
+        for (written, expected) in [
+            ("block", NativeCursorShape::Block),
+            ("bar", NativeCursorShape::Bar),
+            ("underline", NativeCursorShape::Underline),
+        ] {
+            let json = format!(r#"{{"terminal": {{"cursor_shape": "{written}"}}}}"#);
+            let settings: ThinkTermNativeSettings =
+                serde_json::from_str(&json).expect("the file has to survive");
+            assert_eq!(settings.terminal.cursor_shape, expected, "{written}");
+
+            let out = serde_json::to_string(&settings).expect("serialises");
+            assert!(
+                out.contains(&format!("\"cursor_shape\":\"{written}\"")),
+                "{} has to survive a save: {}",
+                written,
+                out
+            );
+        }
     }
 
     #[test]
@@ -3578,15 +4083,16 @@ mod tests {
         assert_eq!(settings.terminal.scroll_mode, NativeScrollMode::Stepped);
         assert_eq!(settings.localization.language.as_deref(), Some("ja-JP"));
 
-        // Selecting copies unless turned off; the focus waits for a click
-        // unless turned on.
+        // Selecting copies unless turned off; the focus waits for a click,
+        // and a paste goes in without asking, unless turned on.
         assert!(settings.terminal.copy_on_select);
         assert!(!settings.terminal.focus_follows_mouse);
+        assert!(!settings.terminal.paste_confirmation);
 
         // The ones this build knows still read as written.
         let json = r#"{ "version": 1, "terminal": {
             "selection_style": "square", "copy_on_select": false, "right_click": "copy_or_paste",
-            "copy_effect": "color", "focus_follows_mouse": true
+            "copy_effect": "color", "focus_follows_mouse": true, "paste_confirmation": true
         } }"#;
         let settings: ThinkTermNativeSettings = serde_json::from_str(json).unwrap();
         assert!(!settings.terminal.copy_on_select);
@@ -3594,6 +4100,7 @@ mod tests {
         assert_eq!(settings.terminal.right_click, NativeRightClick::CopyOrPaste);
         assert_eq!(settings.terminal.copy_effect, NativeCopyEffect::Color);
         assert!(settings.terminal.focus_follows_mouse);
+        assert!(settings.terminal.paste_confirmation);
     }
 
     /// The four this build does know still round-trip.

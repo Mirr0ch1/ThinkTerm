@@ -211,12 +211,18 @@ pub enum ContextMenuIcon {
     ArchiveRestore,
     Back,
     Check,
+    /// The kinds of machine a remote host can be shown as (`HostIcon`):
+    /// these and `Server`.
+    Chip,
     Close,
+    Cloud,
     Code,
     Collapse,
+    Container,
     Copy,
     Cut,
     Delete,
+    Desktop,
     Disconnect,
     Edit,
     Expand,
@@ -227,10 +233,13 @@ pub enum ContextMenuIcon {
     FolderRemove,
     /// What a view shows: the sliders of a view-options button.
     Filter,
+    Globe,
     /// How a view groups its rows.
     Group,
     Home,
     Info,
+    Laptop,
+    MacMini,
     MoveLeft,
     MoveRight,
     Network,
@@ -283,6 +292,33 @@ impl Default for FolderPickerOptions {
     }
 }
 
+/// What a path picker offers: files, folders, or both, and whether more than
+/// one selection is allowed. macOS can offer both in one panel; the other
+/// native dialogs generally cannot, so callers check
+/// [`WindowOps::supports_combined_path_picker`] first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathPickerOptions {
+    pub title: String,
+    pub prompt: String,
+    pub directory: Option<PathBuf>,
+    pub allow_files: bool,
+    pub allow_directories: bool,
+    pub multiple: bool,
+}
+
+impl Default for PathPickerOptions {
+    fn default() -> Self {
+        Self {
+            title: "Choose".to_string(),
+            prompt: "Choose".to_string(),
+            directory: None,
+            allow_files: true,
+            allow_directories: false,
+            multiple: false,
+        }
+    }
+}
+
 /// What a file picker offers and how it is worded: one kind of file, named
 /// by its extension.
 #[derive(Debug, Clone)]
@@ -307,7 +343,11 @@ impl ContextMenuIcon {
             Self::ArchiveRestore => "tray.and.arrow.up",
             Self::Back => "chevron.left",
             Self::Check => "checkmark.circle",
+            Self::Chip => "cpu",
             Self::Close => "xmark",
+            Self::Cloud => "cloud",
+            Self::Container => "shippingbox",
+            Self::Desktop => "desktopcomputer",
             Self::Code => "chevron.left.forwardslash.chevron.right",
             Self::Collapse => "rectangle.compress.vertical",
             Self::Copy => "doc.on.doc",
@@ -326,6 +366,9 @@ impl ContextMenuIcon {
             Self::FolderAdd => "folder.badge.plus",
             Self::FolderRemove => "folder.badge.minus",
             Self::Filter => "slider.horizontal.3",
+            Self::Globe => "globe",
+            Self::Laptop => "laptopcomputer",
+            Self::MacMini => "macmini",
             Self::Group => "square.stack.3d.up",
             Self::Home => "house",
             Self::Info => "info.circle",
@@ -369,7 +412,11 @@ impl ContextMenuIcon {
                 include_bytes!("../../third_party/lucide/icons/arrow-left.svg")
             }
             Self::Check => include_bytes!("../../third_party/lucide/icons/circle-check.svg"),
+            Self::Chip => include_bytes!("../../third_party/lucide/icons/cpu.svg"),
             Self::Close => include_bytes!("../../third_party/lucide/icons/x.svg"),
+            Self::Cloud => include_bytes!("../../third_party/lucide/icons/cloud.svg"),
+            Self::Container => include_bytes!("../../third_party/lucide/icons/package.svg"),
+            Self::Desktop => include_bytes!("../../third_party/lucide/icons/monitor.svg"),
             Self::Code => include_bytes!("../../third_party/lucide/icons/code-xml.svg"),
             Self::Collapse => include_bytes!("../../third_party/lucide/icons/shrink.svg"),
             Self::Copy => include_bytes!("../../third_party/lucide/icons/copy.svg"),
@@ -390,6 +437,11 @@ impl ContextMenuIcon {
             Self::Filter => {
                 include_bytes!("../../third_party/lucide/icons/sliders-horizontal.svg")
             }
+            Self::Globe => include_bytes!("../../third_party/lucide/icons/globe.svg"),
+            Self::Laptop => include_bytes!("../../third_party/lucide/icons/laptop.svg"),
+            // lucide has no Mac mini; its flat drive with the lights on the
+            // front is the same squat box.
+            Self::MacMini => include_bytes!("../../third_party/lucide/icons/hard-drive.svg"),
             Self::Group => include_bytes!("../../third_party/lucide/icons/layers.svg"),
             Self::Home => include_bytes!("../../third_party/lucide/icons/house.svg"),
             Self::Info => include_bytes!("../../third_party/lucide/icons/info.svg"),
@@ -784,6 +836,26 @@ pub trait WindowOps {
     /// Show a hidden window
     fn show(&self);
 
+    /// Bring the window up as `card`, fading in, without taking the focus
+    /// from the one that has it.
+    fn show_floating(&self, _card: FloatingCard) {
+        self.show();
+    }
+
+    /// Give a window shown as a card this much of the card, in pixels.
+    fn resize_floating(&self, _width: f32, _height: f32) {}
+
+    /// How many of this window's pixels make one point.
+    fn pixels_per_point(&self) -> f32 {
+        1.0
+    }
+
+    /// What one of this window's pixels comes to in the units of a
+    /// [`ScreenPoint`], for working out a position from the pointer's.
+    fn screen_units_per_pixel(&self) -> f32 {
+        1.0
+    }
+
     fn notify<T: Any + Send + Sync>(&self, t: T)
     where
         Self: Sized;
@@ -836,6 +908,24 @@ pub trait WindowOps {
         callback(None);
     }
 
+    /// Show a native picker for files, folders, or both. The callback gets
+    /// every selected path, or an empty list when the user cancels. A platform
+    /// that cannot offer both kinds in one panel leaves
+    /// [`Self::supports_combined_path_picker`] false and the caller offers a
+    /// menu instead.
+    fn pick_paths_async(
+        &self,
+        _options: PathPickerOptions,
+        callback: Box<dyn FnOnce(Vec<PathBuf>) + 'static>,
+    ) {
+        callback(Vec::new());
+    }
+
+    /// Whether one native panel can offer files and folders together.
+    fn supports_combined_path_picker(&self) -> bool {
+        false
+    }
+
     /// Invalidate the window so that the entire client area will
     /// be repainted shortly
     fn invalidate(&self);
@@ -861,6 +951,11 @@ pub trait WindowOps {
     /// This is only implemented on backends that handle
     /// window movement on the server side (Wayland).
     fn request_drag_move(&self) {}
+
+    /// Move only for `request_drag_move`: a press on what the system takes
+    /// for its title bar leaves the window where it is, whatever is drawn
+    /// there.
+    fn set_moved_on_request_only(&self) {}
 
     /// Signal to the windowing system that the mouse is over
     /// a window dragging area.
@@ -977,6 +1072,29 @@ pub trait WindowOps {
     ) -> anyhow::Result<Option<os::parameters::Parameters>> {
         Ok(None)
     }
+}
+
+/// A window that is a card floating over everything else: the card, with a
+/// shadow of the window's own in `margin` around it. All in pixels.
+#[derive(Debug, Clone, Copy)]
+pub struct FloatingCard {
+    pub fade_in: std::time::Duration,
+    /// The pixels of the window the card comes from, per point.
+    pub scale: f32,
+    /// How much of the card to show to begin with.
+    pub width: f32,
+    pub height: f32,
+    /// The whole card, as the window's picture has it.
+    pub full_width: f32,
+    pub full_height: f32,
+    pub margin: f32,
+    pub corner_radius: f32,
+    /// On glass, the picture shows through the title's band across the top
+    /// and a rectangle under it, this far in from the card's other sides,
+    /// with the system's corners.
+    pub title_height: f32,
+    pub thumbnail_inset: f32,
+    pub thumbnail_radius: f32,
 }
 
 #[derive(Debug, Clone, Default)]

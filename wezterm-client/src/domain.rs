@@ -332,6 +332,11 @@ pub fn is_fatal_attach_error(err: &anyhow::Error) -> bool {
         cause
             .downcast_ref::<mux::ssh::AuthCancelledError>()
             .is_some()
+            // The same stored password would be refused the same way, and
+            // the server counts each time.
+            || cause
+                .downcast_ref::<mux::ssh::StoredPasswordRefused>()
+                .is_some()
             || cause
                 .downcast_ref::<crate::client::IncompatibleVersionError>()
                 .is_some()
@@ -2107,6 +2112,9 @@ pub struct ClientDomain {
     unsent_labels: Mutex<HashMap<PaneId, Option<String>>>,
     label_edits: Mutex<LabelEdits>,
     local_domain_id: DomainId,
+    /// The password kept for an ssh host, where it has been given another
+    /// since `config` was made (see `set_stored_password`).
+    stored_password: Mutex<Option<Option<String>>>,
 }
 
 async fn update_remote_workspace(
@@ -2569,6 +2577,7 @@ impl ClientDomain {
             unsent_labels: Mutex::new(HashMap::new()),
             label_edits: Mutex::new(LabelEdits::default()),
             local_domain_id,
+            stored_password: Mutex::new(None),
         }
     }
 
@@ -2577,6 +2586,12 @@ impl ClientDomain {
     /// `/etc/os-release`.
     pub fn remote_os_release(&self) -> Option<String> {
         self.inner()?.client.remote_os_release()
+    }
+
+    pub fn connect_client(&self) -> Option<crate::client::Client> {
+        let inner = self.inner()?;
+        (inner.client.connection_phase() == ClientConnectionPhase::Ready)
+            .then(|| inner.client.clone())
     }
 
     pub(crate) fn inner(&self) -> Option<Arc<ClientInner>> {
@@ -2595,8 +2610,24 @@ impl ClientDomain {
     /// cannot accidentally share the mux Session and stall terminal traffic.
     pub fn ssh_domain_config(&self) -> Option<SshDomain> {
         match &self.config {
-            ClientDomainConfig::Ssh(ssh) => Some(ssh.clone()),
+            ClientDomainConfig::Ssh(ssh) => {
+                let mut ssh = ssh.clone();
+                if let Some(password) = self.stored_password.lock().unwrap().clone() {
+                    ssh.stored_password = password;
+                }
+                Some(ssh)
+            }
             ClientDomainConfig::Unix(_) | ClientDomainConfig::Tls(_) => None,
+        }
+    }
+
+    /// The host was given another password while this domain is in use.
+    /// Nothing is reconnected for it: the next sign-in uses it, be that a
+    /// reconnect already waiting or a later attach.
+    pub fn set_stored_password(&self, password: Option<String>) {
+        *self.stored_password.lock().unwrap() = Some(password.clone());
+        if let Some(inner) = self.inner() {
+            inner.client.set_stored_password(password);
         }
     }
 
@@ -2713,6 +2744,12 @@ impl ClientDomain {
 
     pub fn connection_generation(&self) -> Option<u64> {
         Some(self.inner()?.client.connection_generation())
+    }
+
+    /// How a connection for plugin frames alone is opened to this domain's
+    /// server, while it is attached.
+    pub fn plugin_way(&self) -> Option<crate::plugin_link::PluginWay> {
+        self.inner()?.client.plugin_way()
     }
 
     /// Record which terminal this frontend slot is actively presenting. This
@@ -4031,6 +4068,35 @@ impl ClientDomain {
         }
     }
 
+    /// What the page of the server's pane `remote_pane_id` says of itself
+    /// changed, to `page`: its mirror here says so too.
+    pub fn process_remote_page_change(
+        &self,
+        remote_pane_id: PaneId,
+        page: thinkterm_proto::PageSpec,
+    ) {
+        let Some(inner) = self.inner() else {
+            return;
+        };
+        let Some(local_pane_id) = inner.remote_to_local_pane_id(remote_pane_id) else {
+            return;
+        };
+        let mux = Mux::get();
+        let Some(pane) = mux.get_pane(local_pane_id) else {
+            return;
+        };
+        let Some(mirror) = pane.downcast_ref::<ClientPane>() else {
+            return;
+        };
+        // Only a page is changed: a pane is not made one by what is said
+        // of a page in its place.
+        if !mirror.is_page() {
+            return;
+        }
+        mirror.set_page(Some(page));
+        mux.notify(MuxNotification::PageChanged(local_pane_id));
+    }
+
     pub fn process_remote_window_title_change(&self, remote_window_id: WindowId, title: String) {
         if let Some(inner) = self.inner() {
             if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
@@ -4103,6 +4169,7 @@ impl ClientDomain {
         // Where each local window's next tab goes: the wire lists a
         // window's tabs in its order, and a mirror keeps that order.
         let mut placed: HashMap<WindowId, usize> = HashMap::new();
+        let pane_pages = &panes.pane_pages;
         for (mut tabroot, tab_title) in panes.tabs.into_iter().zip(panes.tab_titles.iter()) {
             // Sizes off the wire build grids and layouts below. A tab listed
             // with sizes no screen could have is left as it was: not built
@@ -4210,7 +4277,7 @@ impl ClientDomain {
                     workspace.replace(entry.workspace.clone());
                     remote_panes_to_forget.remove(&entry.pane_id);
                     live_mirrors_in_response += 1;
-                    if let Some(pane_id) = inner.remote_to_local_pane_id(entry.pane_id) {
+                    let pane = if let Some(pane_id) = inner.remote_to_local_pane_id(entry.pane_id) {
                         match mux.get_pane(pane_id) {
                             Some(pane) => {
                                 if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
@@ -4263,7 +4330,12 @@ impl ClientDomain {
                         );
                         mux.add_pane(&pane).expect("failed to add pane to mux");
                         pane
+                    };
+                    // Whether it holds a plugin's page, the listing says.
+                    if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                        client_pane.set_page(pane_pages.get(&entry.pane_id).cloned());
                     }
+                    pane
                 });
 
                 if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
@@ -5018,6 +5090,10 @@ mod tests {
     fn fatal_attach_errors_do_not_retry_even_when_wrapped() {
         let fatal_errors = [
             anyhow::Error::new(mux::ssh::AuthCancelledError).context("ssh setup"),
+            anyhow::Error::new(mux::ssh::StoredPasswordRefused(
+                "password auth status: Denied".to_string(),
+            ))
+            .context("ssh setup"),
             anyhow::Error::new(crate::client::IncompatibleVersionError {
                 version: "20990101-000000-abcdef".to_string(),
                 codec_vers: 1,
@@ -5554,6 +5630,197 @@ mod tests {
     }
 }
 
+/// What the server is asked to put in a pane it makes: a command to run,
+/// in a directory, or a plugin's page.
+enum InPane {
+    Command(Option<CommandBuilder>, Option<String>),
+    Page(thinkterm_proto::PageSpec),
+}
+
+impl ClientDomain {
+    /// Level-2 tab in a remote pane's stack: ask the server to make the
+    /// pane -- spawning a command in it, or holding a page -- and insert it
+    /// into ITS stack, then mirror it locally as a ClientPane. The caller
+    /// performs the local stack insertion; the next resync converges both
+    /// sides via the stable translated stack id.
+    async fn spawn_in_stack(
+        &self,
+        base_pane_id: PaneId,
+        what: InPane,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        let _mutation = inner.begin_structure_mutation();
+
+        let mux = Mux::get();
+        let local_pane = mux
+            .get_pane(base_pane_id)
+            .ok_or_else(|| anyhow!("pane_id {} is invalid", base_pane_id))?;
+        let pane = local_pane
+            .downcast_ref::<ClientPane>()
+            .ok_or_else(|| anyhow!("pane_id {} is not a ClientPane", base_pane_id))?;
+
+        if !inner.prepare_remote_tab_input(pane.remote_tab_id()).await? {
+            bail!("terminal is being operated on another device");
+        }
+
+        let (result, page) = match what {
+            InPane::Command(command, command_dir) => {
+                let spawned = inner
+                    .client
+                    .spawn_pane_in_stack(codec::SpawnPaneInStack {
+                        pane_id: pane.remote_pane_id,
+                        command: self.command_spec_for(command.as_ref()),
+                        command_dir,
+                        domain: SpawnTabDomain::CurrentPaneDomain,
+                    })
+                    .await?;
+                (spawned, None)
+            }
+            InPane::Page(page) => {
+                let (spawned, page) = inner
+                    .client
+                    .spawn_page(codec::SpawnPage {
+                        page,
+                        place: codec::PagePlace::Stack {
+                            pane_id: pane.remote_pane_id,
+                        },
+                        size: TerminalSize::default(),
+                    })
+                    .await?
+                    .into_parts();
+                (spawned, Some(page))
+            }
+        };
+
+        if !thinkterm_proto::layout::terminal_size_is_plausible(&result.size) {
+            bail!("the server described the new pane with an impossible size");
+        }
+        let mirror = ClientPane::new(
+            &inner,
+            result.tab_id,
+            result.pane_id,
+            result.size,
+            "thinkterm",
+            false,
+        );
+        mirror.set_page(page);
+        let pane: Arc<dyn Pane> = Arc::new(mirror);
+        mux.add_pane(&pane)?;
+
+        Ok(pane)
+    }
+
+    /// A tab of `window` on the server -- a command spawned in it, or a
+    /// page held in it -- and its mirror here.
+    async fn spawn_tab(
+        &self,
+        size: TerminalSize,
+        what: InPane,
+        window: WindowId,
+        beside: Option<PaneId>,
+    ) -> anyhow::Result<Arc<Tab>> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        let _mutation = inner.begin_structure_mutation();
+
+        // File the remote window under the workspace of the local window we
+        // are spawning into, NOT the globally active workspace: with several
+        // Spaces open the active workspace routinely belongs to a different
+        // (even local) thread, and a remote window misfiled under that name
+        // folds into the wrong window on every later attach.
+        let workspace = Mux::get()
+            .get_window(window)
+            .map(|w| w.get_workspace().to_string())
+            .unwrap_or_else(|| Mux::get().active_workspace());
+
+        let (result, page) = match what {
+            InPane::Command(command, command_dir) => {
+                let spawned = inner
+                    .client
+                    .spawn_v2(SpawnV2 {
+                        domain: SpawnTabDomain::DefaultDomain,
+                        window_id: inner.local_to_remote_window(window),
+                        size,
+                        command: self.command_spec_for(command.as_ref()),
+                        command_dir,
+                        workspace: workspace.clone(),
+                    })
+                    .await?;
+                (spawned, None)
+            }
+            InPane::Page(page) => {
+                // The server says where the user was, from the pane in
+                // focus as it numbers it: one of this connection's.
+                let beside = beside
+                    .and_then(|pane_id| Mux::get().get_pane(pane_id))
+                    .and_then(|pane| {
+                        let mirror = pane.downcast_ref::<ClientPane>()?;
+                        mirror
+                            .belongs_to_client(&inner)
+                            .then(|| mirror.remote_pane_id())
+                    });
+                let (spawned, page) = inner
+                    .client
+                    .spawn_page(codec::SpawnPage {
+                        page,
+                        place: codec::PagePlace::Tab {
+                            window_id: inner.local_to_remote_window(window),
+                            workspace: workspace.clone(),
+                            pane_id: beside,
+                        },
+                        size,
+                    })
+                    .await?
+                    .into_parts();
+                (spawned, Some(page))
+            }
+        };
+
+        inner.record_remote_to_local_window_mapping(result.window_id, window);
+
+        let mirror = ClientPane::new(
+            &inner,
+            result.tab_id,
+            result.pane_id,
+            size,
+            "thinkterm",
+            false,
+        );
+        mirror.set_page(page);
+        let pane: Arc<dyn Pane> = Arc::new(mirror);
+        let tab = Arc::new(Tab::new(&size));
+        tab.assign_pane(&pane);
+        inner.remove_old_tab_mapping(result.tab_id);
+        inner.record_remote_to_local_tab_mapping(result.tab_id, tab.tab_id());
+
+        let mux = Mux::get();
+        mux.add_tab_and_active_pane(&tab)?;
+        // The window was empty while the server answered, and an empty
+        // window is what a pane removal's prune sweeps away; the tab then
+        // needs a window of its own rather than a fatal error.
+        let window = if mux.get_window(window).is_some() {
+            window
+        } else {
+            let replacement = *mux.new_empty_window_for_domain(
+                Some(workspace.clone()),
+                None,
+                Some(self.local_domain_id),
+            );
+            log::warn!(
+                "local window {window} for the new tab was pruned while spawning; using {replacement}"
+            );
+            inner.record_remote_to_local_window_mapping(result.window_id, replacement);
+            replacement
+        };
+        mux.add_tab_to_window(&tab, window)?;
+
+        Ok(tab)
+    }
+}
+
 #[async_trait(?Send)]
 impl Domain for ClientDomain {
     fn domain_id(&self) -> DomainId {
@@ -5589,47 +5856,40 @@ impl Domain for ClientDomain {
         command: Option<CommandBuilder>,
         command_dir: Option<String>,
     ) -> anyhow::Result<Arc<dyn Pane>> {
-        let inner = self
-            .inner()
-            .ok_or_else(|| anyhow!("domain is not attached"))?;
-        let _mutation = inner.begin_structure_mutation();
+        self.spawn_in_stack(base_pane_id, InPane::Command(command, command_dir))
+            .await
+    }
 
-        let mux = Mux::get();
-        let local_pane = mux
-            .get_pane(base_pane_id)
-            .ok_or_else(|| anyhow!("pane_id {} is invalid", base_pane_id))?;
-        let pane = local_pane
-            .downcast_ref::<ClientPane>()
-            .ok_or_else(|| anyhow!("pane_id {} is not a ClientPane", base_pane_id))?;
+    /// A page as a level-2 tab in a remote pane's stack: the server makes
+    /// its pane there, as it spawns a terminal for one.
+    async fn spawn_page_in_stack(
+        &self,
+        base_pane_id: PaneId,
+        _size: TerminalSize,
+        page: thinkterm_proto::PageSpec,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        self.spawn_in_stack(base_pane_id, InPane::Page(page)).await
+    }
 
-        if !inner.prepare_remote_tab_input(pane.remote_tab_id()).await? {
-            bail!("terminal is being operated on another device");
-        }
+    /// The pane of a page is the server's to make: there is none of it
+    /// here to make one from.
+    fn new_page_pane(
+        &self,
+        _size: TerminalSize,
+        _page: thinkterm_proto::PageSpec,
+        _beside: Option<PaneId>,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        anyhow::bail!("new_page_pane not implemented for ClientDomain")
+    }
 
-        let result = inner
-            .client
-            .spawn_pane_in_stack(codec::SpawnPaneInStack {
-                pane_id: pane.remote_pane_id,
-                command: self.command_spec_for(command.as_ref()),
-                command_dir,
-                domain: SpawnTabDomain::CurrentPaneDomain,
-            })
-            .await?;
-
-        if !thinkterm_proto::layout::terminal_size_is_plausible(&result.size) {
-            bail!("the server described the new pane with an impossible size");
-        }
-        let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
-            &inner,
-            result.tab_id,
-            result.pane_id,
-            result.size,
-            "thinkterm",
-            false,
-        ));
-        mux.add_pane(&pane)?;
-
-        Ok(pane)
+    async fn spawn_page(
+        &self,
+        size: TerminalSize,
+        page: thinkterm_proto::PageSpec,
+        window: WindowId,
+        beside: Option<PaneId>,
+    ) -> anyhow::Result<Arc<Tab>> {
+        self.spawn_tab(size, InPane::Page(page), window, beside).await
     }
 
     async fn move_pane_to_stack(
@@ -5868,70 +6128,8 @@ impl Domain for ClientDomain {
         command_dir: Option<String>,
         window: WindowId,
     ) -> anyhow::Result<Arc<Tab>> {
-        let inner = self
-            .inner()
-            .ok_or_else(|| anyhow!("domain is not attached"))?;
-        let _mutation = inner.begin_structure_mutation();
-
-        // File the remote window under the workspace of the local window we
-        // are spawning into, NOT the globally active workspace: with several
-        // Spaces open the active workspace routinely belongs to a different
-        // (even local) thread, and a remote window misfiled under that name
-        // folds into the wrong window on every later attach.
-        let workspace = Mux::get()
-            .get_window(window)
-            .map(|w| w.get_workspace().to_string())
-            .unwrap_or_else(|| Mux::get().active_workspace());
-
-        let result = inner
-            .client
-            .spawn_v2(SpawnV2 {
-                domain: SpawnTabDomain::DefaultDomain,
-                window_id: inner.local_to_remote_window(window),
-                size,
-                command: self.command_spec_for(command.as_ref()),
-                command_dir,
-                workspace: workspace.clone(),
-            })
-            .await?;
-
-        inner.record_remote_to_local_window_mapping(result.window_id, window);
-
-        let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
-            &inner,
-            result.tab_id,
-            result.pane_id,
-            size,
-            "thinkterm",
-            false,
-        ));
-        let tab = Arc::new(Tab::new(&size));
-        tab.assign_pane(&pane);
-        inner.remove_old_tab_mapping(result.tab_id);
-        inner.record_remote_to_local_tab_mapping(result.tab_id, tab.tab_id());
-
-        let mux = Mux::get();
-        mux.add_tab_and_active_pane(&tab)?;
-        // The window was empty while the server answered, and an empty
-        // window is what a pane removal's prune sweeps away; the tab then
-        // needs a window of its own rather than a fatal error.
-        let window = if mux.get_window(window).is_some() {
-            window
-        } else {
-            let replacement = *mux.new_empty_window_for_domain(
-                Some(workspace.clone()),
-                None,
-                Some(self.local_domain_id),
-            );
-            log::warn!(
-                "local window {window} for the new tab was pruned while spawning; using {replacement}"
-            );
-            inner.record_remote_to_local_window_mapping(result.window_id, replacement);
-            replacement
-        };
-        mux.add_tab_to_window(&tab, window)?;
-
-        Ok(tab)
+        self.spawn_tab(size, InPane::Command(command, command_dir), window, None)
+            .await
     }
 
     async fn split_pane(
@@ -5967,11 +6165,18 @@ impl Domain for ClientDomain {
             bail!("terminal is being operated on another device");
         }
 
+        // A page to open there, rather than a command to run or a pane to
+        // move: the server makes its pane, and this mirrors it.
+        let mut page = None;
         let (command, command_dir, move_pane_id, moved_local_pane, source_tab_id) = match source {
             SplitSource::Spawn {
                 command,
                 command_dir,
             } => (command, command_dir, None, None, None),
+            SplitSource::Page(spec) => {
+                page = Some(spec);
+                (None, None, None, None, None)
+            }
             SplitSource::MovePane(source_local_pane_id) => {
                 let source_pane = mux
                     .get_pane(source_local_pane_id)
@@ -6029,19 +6234,37 @@ impl Domain for ClientDomain {
             false
         };
 
-        let result = match inner
-            .client
-            .split_pane(SplitPane {
-                domain: SpawnTabDomain::CurrentPaneDomain,
-                pane_id: target_remote_pane_id,
-                split_request,
-                command: self.command_spec_for(command.as_ref()),
-                command_dir,
-                move_pane_id,
-            })
-            .await
-        {
-            Ok(result) => result,
+        let asked = match page {
+            Some(page) => inner
+                .client
+                .spawn_page(codec::SpawnPage {
+                    page,
+                    place: codec::PagePlace::Split {
+                        pane_id: target_remote_pane_id,
+                        split_request,
+                    },
+                    size: TerminalSize::default(),
+                })
+                .await
+                .map(|opened| {
+                    let (spawned, page) = opened.into_parts();
+                    (spawned, Some(page))
+                }),
+            None => inner
+                .client
+                .split_pane(SplitPane {
+                    domain: SpawnTabDomain::CurrentPaneDomain,
+                    pane_id: target_remote_pane_id,
+                    split_request,
+                    command: self.command_spec_for(command.as_ref()),
+                    command_dir,
+                    move_pane_id,
+                })
+                .await
+                .map(|spawned| (spawned, None)),
+        };
+        let (result, page) = match asked {
+            Ok(answer) => answer,
             Err(err) => {
                 // The transport may have failed after the server committed
                 // the mutation. Always fetch the authoritative tree instead
@@ -6099,14 +6322,16 @@ impl Domain for ClientDomain {
         if !thinkterm_proto::layout::terminal_size_is_plausible(&result.size) {
             bail!("the server described the new pane with an impossible size");
         }
-        let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
+        let mirror = ClientPane::new(
             &inner,
             result.tab_id,
             result.pane_id,
             result.size,
             "thinkterm",
             false,
-        ));
+        );
+        mirror.set_page(page);
+        let pane: Arc<dyn Pane> = Arc::new(mirror);
 
         let pane_index = match tab
             .iter_panes()
@@ -6259,7 +6484,11 @@ impl ClientDomain {
         ui: ConnectionUI,
     ) -> anyhow::Result<()> {
         let domain_id = self.local_domain_id;
-        let config = self.config.clone();
+        let config = match self.ssh_domain_config() {
+            // With the password the host has now.
+            Some(ssh) => ClientDomainConfig::Ssh(ssh),
+            None => self.config.clone(),
+        };
 
         let activity = mux::activity::Activity::new();
         ui.title("ThinkTerm: Connecting...");
@@ -6341,16 +6570,23 @@ impl ClientDomain {
                 // client's build whenever the two differ, codec mismatch or
                 // not: the running one hands its panes over and exits. A
                 // failed takeover leaves a compatible server serving and
-                // an incompatible one refused as before.
+                // an incompatible one refused as before. A newer release
+                // is not brought back: compatible it serves, incompatible
+                // it is refused without trying.
                 if let (ClientDomainConfig::Unix(unix), true) =
                     (&config, config.is_local_session_host())
                 {
                     let needs_takeover = match &verified {
-                        Ok(info) => info.version_string != config::wezterm_version(),
+                        Ok(info) => {
+                            info.version_string != config::wezterm_version()
+                                && !crate::local_update::server_is_newer(&info.version_string)
+                        }
                         Err(err)
                             if err
                                 .downcast_ref::<crate::client::IncompatibleVersionError>()
-                                .is_some() =>
+                                .is_some_and(|mismatch| {
+                                    !crate::local_update::server_is_newer(&mismatch.version)
+                                }) =>
                         {
                             true
                         }

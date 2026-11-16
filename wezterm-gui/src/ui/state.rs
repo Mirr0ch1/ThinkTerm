@@ -75,6 +75,15 @@ impl<A: Copy> UiContext<A> {
         });
     }
 
+    /// Move every target by `(dx, dy)`: for a surface laid out before it
+    /// knew where it would stand.
+    pub(crate) fn shift(&mut self, dx: f32, dy: f32) {
+        for target in &mut self.hits {
+            target.rect.origin.x += dx;
+            target.rect.origin.y += dy;
+        }
+    }
+
     pub(crate) fn hit_test(&self, x: f32, y: f32) -> Option<HitTarget<A>> {
         self.hits
             .iter()

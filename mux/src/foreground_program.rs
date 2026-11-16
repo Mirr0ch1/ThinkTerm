@@ -11,7 +11,8 @@
 //! what it runs. What a program looks like is the frontend's business.
 //!
 //! Nothing is polled. A pane is looked at when it prints or retitles, and
-//! once more after that burst settles; a pane doing nothing costs nothing.
+//! once more after that burst settles, or when detection settings change;
+//! a pane doing nothing costs nothing.
 //!
 //! A pane whose terminal is on another machine -- an ssh domain's channel,
 //! which has no local leader, or `ssh` run in a local pane -- runs whatever
@@ -56,6 +57,9 @@ const REMOTE_SESSION_CLIENTS: &[&str] = &["ssh", "autossh", "mosh", "mosh-client
 /// The user var shell integration sets to the command line it is about to
 /// run, and empties at the prompt (`assets/shell-integration/wezterm.sh`).
 const REPORTED_PROGRAM_VAR: &str = "WEZTERM_PROG";
+/// A tool with task rules (`crate::task_status`) has its screen read no
+/// more often than this; a reading that has not changed goes nowhere.
+const TASK_READ_EVERY: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 struct Record {
@@ -68,6 +72,33 @@ struct Record {
     candidate: Option<(Option<ForegroundProgram>, Instant)>,
     /// When the pane was last looked at, for the floor.
     probed_at: Option<Instant>,
+    /// When a tool's screen was last read, for its own floor.
+    read_at: Option<Instant>,
+    /// Whether the tool has printed since its screen was last read: a
+    /// screen that has not changed is not read again.
+    read_owed: bool,
+}
+
+/// Whether a tool's screen is to be read now, once it is due, or not at
+/// all because nothing has changed it since the last read.
+#[derive(Debug, PartialEq, Eq)]
+enum ReadDue {
+    Now,
+    Later,
+    Never,
+}
+
+/// Note whether the tool has `printed`, and say when its screen is to be
+/// read.
+fn read_due(record: &mut Record, printed: bool, now: Instant) -> ReadDue {
+    record.read_owed |= printed;
+    if !record.read_owed {
+        return ReadDue::Never;
+    }
+    match record.read_at {
+        Some(at) if now.saturating_duration_since(at) < TASK_READ_EVERY => ReadDue::Later,
+        _ => ReadDue::Now,
+    }
 }
 
 lazy_static::lazy_static! {
@@ -115,6 +146,15 @@ pub fn refresh_enabled() {
         mark_all_panes();
     } else {
         schedule_drain();
+    }
+}
+
+/// Settings may enable task detection for a tool already waiting quietly
+/// for input. Queue a read even though its screen has not changed. The
+/// drain still applies the tool switches and skips remote mirrors.
+pub fn refresh_task_readings() {
+    if enabled() && INSTALLED.load(Ordering::Acquire) {
+        mark_all_panes();
     }
 }
 
@@ -268,6 +308,9 @@ fn drain() {
             }
             continue;
         }
+        if read_task(pane.as_ref(), pane_id, now, activity) {
+            publish_change(pane_id);
+        }
         let (known, confirming, since_probe) = match REGISTRY.read().get(&pane_id) {
             Some(record) => (
                 true,
@@ -307,6 +350,12 @@ fn drain() {
         };
         if changed {
             publish_change(pane_id);
+            // A tool that has just taken the foreground is read at once: it
+            // may have drawn its screen and gone quiet already, a question
+            // waiting for an answer, with no more output to bring it here.
+            if read_task(pane.as_ref(), pane_id, now, true) {
+                publish_change(pane_id);
+            }
         }
         // Activity owes a look after it; a candidate waits for its
         // confirmation. Neither is new activity.
@@ -319,18 +368,78 @@ fn drain() {
     }
 }
 
+/// Read the screen of a tool that has task rules into its published
+/// program, when a reading is due. Returns whether the reading changed. A
+/// reading not yet due is owed a look once it is: the screen the tool left
+/// when it went quiet -- a question waiting for an answer -- must be read.
+/// Once read, that screen is not read again until the tool has `printed`:
+/// a tool waiting out of sight for an answer costs nothing while it waits.
+fn read_task(pane: &dyn Pane, pane_id: PaneId, now: Instant, printed: bool) -> bool {
+    let rules = {
+        let mut registry = REGISTRY.write();
+        let Some(record) = registry.get_mut(&pane_id) else {
+            return false;
+        };
+        let Some(program) = record.published.as_ref() else {
+            return false;
+        };
+        let rules = program
+            .runs
+            .as_deref()
+            .and_then(crate::task_status::rules_for)
+            .or_else(|| crate::task_status::rules_for(&program.executable));
+        let Some(rules) = rules else {
+            return false;
+        };
+        match read_due(record, printed, now) {
+            ReadDue::Now => rules,
+            ReadDue::Later => {
+                drop(registry);
+                requeue(pane_id, false);
+                return false;
+            }
+            ReadDue::Never => return false,
+        }
+    };
+    let reading = rules.read(&crate::task_status::screen_tail(pane));
+    let mut registry = REGISTRY.write();
+    let Some(record) = registry.get_mut(&pane_id) else {
+        return false;
+    };
+    record.read_at = Some(now);
+    record.read_owed = false;
+    let Some(program) = record.published.as_mut() else {
+        return false;
+    };
+    if program.task.as_ref() == Some(&reading) {
+        return false;
+    }
+    program.task = Some(reading);
+    true
+}
+
+/// The same program, whatever its task reading says.
+fn same_program(a: &Option<ForegroundProgram>, b: &Option<ForegroundProgram>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.executable == b.executable && a.runs == b.runs,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 /// Fold one look into the pane's record. Returns whether the published
-/// program changed.
+/// program changed. A look sees the program, not what it is doing: the
+/// published task reading stays until the program changes.
 fn observe(record: &mut Record, observed: Option<ForegroundProgram>, now: Instant) -> bool {
     record.probed_at = Some(now);
     if !record.announced {
         record.announced = true;
         record.candidate = None;
-        let changed = record.published != observed;
+        let changed = !same_program(&record.published, &observed);
         record.published = observed;
         return changed;
     }
-    if observed == record.published {
+    if same_program(&observed, &record.published) {
         record.candidate = None;
         return false;
     }
@@ -394,7 +503,11 @@ fn command_line_program(command: &str) -> Option<ForegroundProgram> {
     } else {
         None
     };
-    let program = ForegroundProgram { executable, runs };
+    let program = ForegroundProgram {
+        executable,
+        runs,
+        task: None,
+    };
     program.within_budget().then_some(program)
 }
 
@@ -424,7 +537,11 @@ fn process_program(pane: &dyn Pane, policy: CachePolicy) -> Option<ForegroundPro
     } else {
         None
     };
-    let program = ForegroundProgram { executable, runs };
+    let program = ForegroundProgram {
+        executable,
+        runs,
+        task: None,
+    };
     program.within_budget().then_some(program)
 }
 
@@ -1045,6 +1162,7 @@ mod tests {
         Some(ForegroundProgram {
             executable: executable.to_string(),
             runs: None,
+            task: None,
         })
     }
 
@@ -1087,6 +1205,7 @@ mod tests {
         let sudo_ssh = Some(ForegroundProgram {
             executable: "sudo".to_string(),
             runs: Some("ssh".to_string()),
+            task: None,
         });
         assert_eq!(choose(sudo_ssh, reported), program("vim"));
         // At the remote prompt the client itself shows.
@@ -1144,6 +1263,24 @@ mod tests {
         ));
         assert_eq!(record.published, program("zsh"));
         assert!(record.candidate.is_none());
+    }
+
+    #[test]
+    fn a_quiet_tool_has_its_screen_read_once() {
+        let start = Instant::now();
+        let mut record = Record::default();
+        // Printed: read at once, then not again until it prints.
+        assert_eq!(read_due(&mut record, true, start), ReadDue::Now);
+        record.read_at = Some(start);
+        record.read_owed = false;
+        assert_eq!(read_due(&mut record, false, start + Duration::from_secs(3)), ReadDue::Never);
+        // Printing again within the floor waits for it, and is not lost.
+        let printed = start + Duration::from_millis(500);
+        assert_eq!(read_due(&mut record, true, printed), ReadDue::Later);
+        assert_eq!(
+            read_due(&mut record, false, start + Duration::from_secs(2)),
+            ReadDue::Now
+        );
     }
 
     #[test]

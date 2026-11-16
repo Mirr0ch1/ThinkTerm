@@ -151,6 +151,7 @@ pub mod charselect;
 pub mod clipboard;
 pub mod content_view;
 pub mod keyevent;
+mod link_open;
 pub(crate) mod live_overview;
 pub mod modal;
 mod mouseevent;
@@ -164,9 +165,16 @@ pub mod remote_thread_view;
 pub(crate) mod remote_walk;
 pub mod render;
 pub mod resize;
+pub(crate) mod share;
 mod selection;
 mod sidebar_hover;
+mod sidebar_disclosure;
+mod sidebar_make_way;
+mod sidebar_slide;
 mod space_swipe;
+pub(crate) mod thread_numbers;
+pub(crate) mod thread_window;
+mod window_tab_reveal;
 pub mod spawn;
 pub mod ssh_hosts_view;
 pub(crate) mod transfer_walk;
@@ -260,6 +268,34 @@ pub(crate) struct LocalThreadActivationState {
     pub thread_id: String,
     pub space_id: String,
     pub workspace_name: String,
+}
+
+/// The connection page of a mux-domain Space reached on demand: a mux
+/// window of its own, shown in place of the thread the window was on, so
+/// the page never lands among that thread's tabs. Leaving it (another
+/// thread, another Space) gives the connection up.
+pub(crate) struct SpaceConnectionPage {
+    pub mux_window_id: MuxWindowId,
+    pub domain_name: String,
+    /// What to open once the server answers.
+    pub thread_id: String,
+    pub orphan_candidate_window_id: Option<MuxWindowId>,
+    pub workspaces_to_kill_after_adopt: Vec<String>,
+    /// Where to go back to when the page closes without a connection.
+    pub return_space_id: String,
+    /// The thread the page took the place of, when it opened in place in
+    /// that Space (a reference or server folder row): the one to go back
+    /// to, rather than whichever thread the Space would pick.
+    pub return_thread_id: Option<String>,
+    /// The attach behind the page ended without a connection. The page
+    /// stays up to show why; opening the Space again starts over.
+    pub gave_up: bool,
+}
+
+fn domain_is_attached(domain_name: &str) -> bool {
+    Mux::get()
+        .get_domain_by_name(domain_name)
+        .is_some_and(|domain| domain.state() == mux::domain::DomainState::Attached)
 }
 
 use crate::spawn::SpawnWhere;
@@ -473,17 +509,15 @@ const CONTENT_VIEW_FADE: Duration = Duration::from_millis(140);
 /// registers as a jump rather than as travel.
 const CONTENT_VIEW_TRAVEL: Duration = Duration::from_millis(260);
 
-/// How long the travelling terminal takes to dissolve into the card's own
-/// thumbnail of it, once the two are close enough in size to overlap.
+/// How long the travelling terminal takes to dissolve away when the arriving
+/// view has no card for it to land in, once it is close to the size of its
+/// destination.
 ///
 /// Long enough to be seen, which is a lower bound with real teeth: a timeline
 /// does not start its clock until the frame after it is armed, so a dissolve
-/// budgeted at 45ms spent one frame arming and left two usable ones. That is a
-/// cut with extra steps, and it is what the first version of this shipped as.
+/// budgeted at 45ms spent one frame arming and left two usable ones.
 ///
-/// Deliberately outlasts the travel. The last stretch of it therefore runs
-/// after the terminal has settled into the card, where the two pictures are
-/// aligned exactly and the dissolve costs nothing at all.
+/// Landing in a card is a cut instead (`content_view::flight_lands_in_card`).
 const CONTENT_VIEW_LANDING_FADE: Duration = Duration::from_millis(140);
 
 /// How long the window frame takes to clear its own edges. Shorter than the
@@ -515,6 +549,10 @@ pub(crate) const COMMAND_PALETTE_ZINDEX: i8 = 11;
 /// z-index are a global order rather than per-surface depth, so a view sharing
 /// them with the terminal would have the terminal's text drawn through it.
 pub(crate) const CONTENT_VIEW_FADE_ZINDEX: i8 = 8;
+
+/// What a drag carries is solid, and goes over the panes and every panel a
+/// drag can cross. Within one z-index their text would be drawn through it.
+pub(crate) const DRAG_GHOST_ZINDEX: i8 = 13;
 
 lazy_static::lazy_static! {
     static ref WINDOW_CLASS: Mutex<String> = Mutex::new(wezterm_gui_subcommands::DEFAULT_WINDOW_CLASS.to_owned());
@@ -650,6 +688,8 @@ pub(crate) enum ContextMenuApplicationAction {
     /// The new tab menu's remote host: open it as its card's Connect does,
     /// whether or not the Remote Hosts page is open.
     OpenRemoteHost(String),
+    /// The new tab menu's plugin: open its page in a tab of its own.
+    OpenPluginPage(String),
     SetFrontendAccessMode(codec::FrontendAccessMode),
     /// Notification bell entry: jump to a thread, switching Space first when
     /// it lives elsewhere, and acknowledge its unseen work.
@@ -657,6 +697,10 @@ pub(crate) enum ContextMenuApplicationAction {
         space_id: String,
         thread_id: String,
     },
+    /// Thread menu: give the thread a window of its own.
+    OpenThreadInOwnWindow(crate::workspace_threads::WorkspaceThreadId),
+    /// Thread menu: bring forward the window the thread is open in.
+    GoToThreadWindow(crate::workspace_threads::WorkspaceThreadId),
     /// Sidebar view-options: show/hide threads with this work status.
     ToggleWorkspaceStatusFilter(crate::workspace_threads::WorkspaceThreadWorkStatus),
     /// Sidebar view-options: transiently reveal archived projects.
@@ -668,8 +712,8 @@ pub(crate) enum ContextMenuApplicationAction {
     ToggleAgentsMachineFilter(String),
     SetAgentsGroupBy(crate::native_settings::AgentsGroupBy),
     SetAgentsSortBy(crate::native_settings::AgentsSortBy),
-    /// Agents panel view menu: one part of programs' status reports, the
-    /// same switch Settings › Agents flips.
+    /// Agents panel view menu: one part of programs' status reports, shown
+    /// or not.
     ToggleAgentStatusPart(crate::native_settings::AgentStatusPart),
     /// Agents panel view menu: re-read the agent detection rules.
     ReloadAgentRules,
@@ -726,6 +770,15 @@ pub(crate) enum ContextMenuApplicationAction {
         parent: remote_files::RemotePath,
         origin: remote_files::RemoteOperationOrigin,
     },
+    /// The header's Upload button on a platform whose native dialog cannot
+    /// offer files and folders together: choose which one this picker is for.
+    UploadFromPicker {
+        allow_files: bool,
+        allow_directories: bool,
+        directory: remote_files::RemotePath,
+        origin: remote_files::RemoteOperationOrigin,
+        anchor: ::window::Point,
+    },
     /// Run a finished transfer again from its recorded source. Carries the
     /// menu's position so a retried folder download can re-raise its size
     /// confirmation in place.
@@ -742,6 +795,12 @@ pub(crate) enum ContextMenuApplicationAction {
     CopyRemotePreviewAll,
     /// Answer to "these files already exist" for a queued local copy.
     ResolveLocalCopyConflict(transfer_walk::ConflictChoice),
+    /// Answer to "open this terminal link in another app?": the link to
+    /// open, or `None` to leave it.
+    ResolveTerminalLink(Option<String>),
+    /// Answer to "this paste could run commands, paste anyway?": the pane
+    /// and the text to paste into it, or `None` to leave it.
+    ResolvePaste(Option<(PaneId, String)>),
 }
 
 /// The scrollbar track a thumb, or the space above or below it, belongs
@@ -774,6 +833,9 @@ pub enum UIItemType {
     /// domain is disconnected (retry loop parked, detached, or never
     /// connected this session).
     SpaceReconnect,
+    /// A row of "Shared with me": the pane another account shares, by its
+    /// place in `TermWindow::shared_with_us`.
+    SharedWithMe(usize),
     ProjectToggleThreads(String),
     /// Collapse/expand a folder-style thread-reference group. `key` is the
     /// collapse-state key (`"<space_id>::"` + the group key — the origin
@@ -811,9 +873,17 @@ pub enum UIItemType {
     WorkspaceSidebarSshHosts,
     WorkspaceSidebarLiveOverview,
     WorkspaceSidebarNotifications,
+    /// The pill that brings the list back to the thread out of sight.
+    WorkspaceSidebarJump,
+    /// Anything in the Library, and the sidebar footer's button opening it.
+    Library(ui::library::LibraryItem),
     UpdateCapsule,
     UpdateCapsuleDismiss,
     RightSidebarToggle,
+    /// The pin of an auto-hiding window tab row.
+    WindowTabsPin,
+    /// A window tab row on its way down or back up: takes no click.
+    WindowTabsTravelling,
     RightSidebarMode(RightSidebarMode),
     RightSidebarBackground,
     RightSidebarResize,
@@ -870,17 +940,41 @@ pub enum UIItemType {
     RightSidebarFileCopyText,
     RightSidebarRemoteFileConnect,
     RightSidebarRemoteFileRefresh,
+    /// Upload local files or folders into the remote directory shown here.
+    RightSidebarRemoteFileUpload,
     RightSidebarRemoteFileRow(remote_files::RemotePath),
     RightSidebarRemoteFileBack,
     RightSidebarRemoteFileCopyText,
     /// A row in the transfer strip. Clicking cancels it while it runs and
     /// dismisses it once it has finished.
     RightSidebarRemoteTransfer(u64),
+    /// A control on the floating transfer card: cancel a running transfer,
+    /// dismiss a finished one, open what it downloaded, or copy the remote
+    /// path of what it uploaded.
+    TransferCardCancel(u64),
+    TransferCardDismiss(u64),
+    /// Put away a finished agent's or command's notice gone quiet, unseen.
+    FinishedNoticeDismiss(PaneId),
+    TransferCardRetry(u64),
+    TransferCardOpen(u64),
+    TransferCardOpenDownloads(u64),
+    TransferCardCopyPath(u64),
+    /// The card's own surface: swallows clicks that miss a button so they do
+    /// not fall through to the file tree or terminal underneath.
+    TransferCardBackground,
+    /// Go to the pane a dynamic status card is about; `true` when it is in
+    /// this window.
+    DynamicStatusReveal(PaneId, bool),
+    /// The pill on top of the open dynamic status: opens the Status panel.
+    DynamicStatusShowAll,
     /// The area a plugin's panel draws in: the pointer and the wheel over it
     /// go to the panel's player.
     RightSidebarPluginPanel,
     /// The same, for the panel's extended view.
     RightSidebarPluginExtended,
+    /// The place of a pane that holds a plugin's page: the pointer and the
+    /// wheel over it go to the page's player, and never to a terminal.
+    PluginPage(PaneId),
     /// The close button at the extended view's top left, ThinkTerm's own
     /// whatever the plugin draws.
     RightSidebarPluginExtendedClose,
@@ -892,6 +986,9 @@ pub enum UIItemType {
     /// share the room between them.
     RightSidebarPluginExtendedResize,
     ContextMenuBackdrop,
+    /// Over the whole window while a pane's share panel is open: every
+    /// pointer event goes to the panel (see `share.rs`).
+    SharePanel,
     ContextMenuItem(Vec<usize>),
     /// Backdrop of the command palette; the palette routes its own pointer
     /// events, this item only keeps clicks from reading as terminal surface.
@@ -1310,6 +1407,11 @@ pub enum PaneNavAction {
     ToggleCollapse,
     SplitRight,
     SplitDown,
+    /// Share the pane with other accounts, or see who watches it.
+    Share,
+    /// A pane watching another account's share: ask to type, or give it
+    /// back.
+    SharePill,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1326,6 +1428,89 @@ struct FileDragState {
     active: bool,
 }
 
+/// How a drag took hold of what it carries: the pointer's distance from the
+/// thing's top-left corner, and the thing's size. What follows the pointer
+/// is the thing itself, still held where it was pressed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DragGrip {
+    pub x: f32,
+    pub y: f32,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl DragGrip {
+    pub fn of(item: &UIItem, pointer: ::window::Point) -> Self {
+        Self {
+            x: pointer.x as f32 - item.x as f32,
+            y: pointer.y as f32 - item.y as f32,
+            width: item.width,
+            height: item.height,
+        }
+    }
+
+    /// Where the thing's top-left corner goes with the pointer at `pointer`,
+    /// whole inside a window of `window` pixels.
+    pub fn origin(&self, pointer: ::window::Point, window: (usize, usize)) -> (f32, f32) {
+        let place = |at: f32, size: usize, room: usize| at.min(room as f32 - size as f32).max(0.0);
+        (
+            place(pointer.x as f32 - self.x, self.width, window.0),
+            place(pointer.y as f32 - self.y, self.height, window.1),
+        )
+    }
+}
+
+/// What a drag carried, going into its place once let go of, wherever that
+/// has turned out to be. The row or tab stays hidden until then, so there
+/// is never one of it too many or too few.
+#[derive(Clone, Debug)]
+pub(crate) struct DragLanding<T> {
+    pub what: T,
+    pub title: String,
+    pub grip: DragGrip,
+    /// Where it was let go of.
+    from: (f32, f32),
+    started: Instant,
+}
+
+impl<T> DragLanding<T> {
+    const TIME: Duration = Duration::from_millis(170);
+
+    pub fn new(
+        what: T,
+        title: String,
+        grip: DragGrip,
+        pointer: ::window::Point,
+        window: (usize, usize),
+        now: Instant,
+    ) -> Self {
+        Self {
+            what,
+            title,
+            grip,
+            from: grip.origin(pointer, window),
+            started: now,
+        }
+    }
+
+    /// How far it has come, 0 to 1, slowing as it arrives.
+    pub fn progress(&self, now: Instant) -> f32 {
+        let t = now.saturating_duration_since(self.started).as_secs_f32()
+            / Self::TIME.as_secs_f32();
+        1.0 - (1.0 - t.min(1.0)).powi(3)
+    }
+
+    /// Where it is on its way to `rest`. Asked every frame, since `rest` can
+    /// move: a tab goes on to the stack a drop has only just taken it to.
+    pub fn place(&self, rest: (f32, f32), now: Instant) -> (f32, f32) {
+        let along = self.progress(now);
+        (
+            self.from.0 + (rest.0 - self.from.0) * along,
+            self.from.1 + (rest.1 - self.from.1) * along,
+        )
+    }
+}
+
 /// A left-sidebar Project or thread row being dragged to a new position in
 /// its list. Armed on press; the pending click fires on release when the
 /// drag never crossed the movement threshold.
@@ -1333,6 +1518,7 @@ pub(crate) struct SidebarRowDragState {
     pub kind: SidebarRowKind,
     /// The row's display name, for the floating ghost under the cursor.
     pub title: String,
+    pub grip: DragGrip,
     pub start: ::window::Point,
     pub current: ::window::Point,
     pub active: bool,
@@ -1344,6 +1530,9 @@ pub(crate) struct SidebarRowDragState {
     /// single while the pointer parks in an edge hot zone.
     pub autoscroll_scheduled: bool,
     pub target: Option<SidebarInsertTarget>,
+    /// A thread row out of the sidebar: let go of there, it gets a window
+    /// of its own.
+    pub tear_off: Option<thread_window::ThreadTearOff>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1359,12 +1548,10 @@ pub(crate) enum SidebarRowKind {
 }
 
 /// Where releasing the drag would insert the row: directly before `before`,
-/// or last in the list when None. `line_y` is where the insert indicator
-/// paints.
+/// or last in the list when None.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SidebarInsertTarget {
     pub before: Option<String>,
-    pub line_y: isize,
 }
 
 /// What a Files-panel drag will paste once it lands on the terminal.
@@ -1536,6 +1723,7 @@ impl PaneDropPreviewAnim {
 pub(crate) struct PaneTabDragState {
     pub pane_id: PaneId,
     pub title: String,
+    pub grip: DragGrip,
     pub start: ::window::Point,
     pub current: ::window::Point,
     pub active: bool,
@@ -1615,15 +1803,23 @@ mod tooltip_tests {
 
     #[test]
     fn every_icon_only_sidebar_button_has_a_name() {
-        // These five carry no text of their own, so the hover tag is the only
+        // These carry no text of their own, so the hover tag is the only
         // place their name appears.
         for item_type in [
             UIItemType::WorkspaceSidebarSettings,
             UIItemType::WorkspaceSidebarThreadSearch,
+            UIItemType::ProjectNew,
+            UIItemType::WorkspaceThreadNew(String::new()),
+            UIItemType::ThreadRefGroupNewThread(String::new()),
             UIItemType::WorkspaceSidebarViewOptions,
             UIItemType::WorkspaceSidebarSshHosts,
             UIItemType::WorkspaceSidebarLiveOverview,
             UIItemType::WorkspaceSidebarNotifications,
+            UIItemType::WorkspaceSidebarJump,
+            UIItemType::Library(ui::library::LibraryItem::Open),
+            UIItemType::Library(ui::library::LibraryItem::Back),
+            UIItemType::Library(ui::library::LibraryItem::NewSpace(None)),
+            UIItemType::Library(ui::library::LibraryItem::SpaceMenu("s".to_string())),
         ] {
             let label = tooltip_label_for(&item_type)
                 .unwrap_or_else(|| panic!("no tooltip label for {:?}", item_type));
@@ -1900,10 +2096,13 @@ struct InlineTabRename {
     input: TextInputState,
     /// The text the editor opened with.
     initial: String,
+    /// Tells this edit from every other, of the same target too.
+    edit: u64,
 }
 
 impl InlineTabRename {
     fn new(target: InlineTabRenameTarget, text: String) -> Self {
+        static LAST_EDIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let mut input = TextInputState::new();
         input.set_text_end(text.clone());
         input.caret_select_all();
@@ -1911,6 +2110,7 @@ impl InlineTabRename {
             target,
             input,
             initial: text,
+            edit: LAST_EDIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -2140,10 +2340,39 @@ pub fn tooltip_label_for(item_type: &UIItemType) -> Option<String> {
     let key = match item_type {
         UIItemType::WorkspaceSidebarSettings => "tooltip-sidebar-settings",
         UIItemType::WorkspaceSidebarThreadSearch => "tooltip-sidebar-thread-search",
+        UIItemType::ProjectNew => "tooltip-sidebar-new-project",
+        UIItemType::WorkspaceThreadNew(_) | UIItemType::ThreadRefGroupNewThread(_) => {
+            "sidebar-new-thread"
+        }
         UIItemType::WorkspaceSidebarViewOptions => "tooltip-sidebar-view-options",
         UIItemType::WorkspaceSidebarSshHosts => "tooltip-sidebar-ssh-hosts",
         UIItemType::WorkspaceSidebarLiveOverview => "tooltip-sidebar-live-overview",
         UIItemType::WorkspaceSidebarNotifications => "tooltip-sidebar-notifications",
+        UIItemType::WorkspaceSidebarJump => "tooltip-sidebar-jump",
+        UIItemType::Library(ui::library::LibraryItem::Open) => "tooltip-sidebar-library",
+        UIItemType::Library(ui::library::LibraryItem::Back) => "tooltip-library-back",
+        UIItemType::Library(ui::library::LibraryItem::Spaces) => "library-spaces",
+        UIItemType::Library(ui::library::LibraryItem::NewSpace(_)) => "tooltip-library-new-space",
+        UIItemType::Library(ui::library::LibraryItem::SpaceMenu(_)) => "tooltip-library-more",
+        UIItemType::PaneNav {
+            action: PaneNavAction::Share,
+            ..
+        } => "tooltip-share-pane",
+        UIItemType::SharedWithMe(_) => "tooltip-watch-shared-pane",
+        UIItemType::RightSidebarFileRefresh | UIItemType::RightSidebarRemoteFileRefresh => {
+            "tooltip-refresh-files"
+        }
+        UIItemType::RightSidebarRemoteFileUpload => "tooltip-upload-files",
+        UIItemType::TransferCardDismiss(_)
+        | UIItemType::FinishedNoticeDismiss(_)
+        | UIItemType::UpdateCapsuleDismiss => "right-dismiss",
+        UIItemType::UpdateCapsule => render::update_capsule::action_tooltip(),
+        UIItemType::TransferCardCancel(_) => "right-cancel",
+        UIItemType::TransferCardRetry(_) => "right-retry",
+        UIItemType::TransferCardOpen(_) => "right-open",
+        UIItemType::TransferCardOpenDownloads(_) => "command-reveal-in-folder",
+        UIItemType::TransferCardCopyPath(_) => "right-copy-path",
+        UIItemType::DynamicStatusReveal(..) => "dynamic-status-go-to",
         UIItemType::RightSidebarAgent(crate::agent_status::AgentPanelAction::ViewOptions) => {
             "tooltip-sidebar-view-options"
         }
@@ -2914,6 +3143,9 @@ pub struct TermWindow {
     last_mouse_coords: (usize, i64),
     window_drag_position: Option<MouseEvent>,
     current_mouse_event: Option<MouseEvent>,
+    /// The active pane's cursor cell as last painted, in window pixels:
+    /// where a question about a paste is asked.
+    text_cursor_rect: Option<Rect>,
     prev_cursor: PrevCursorPos,
     last_scroll_info: RenderableDimensions,
 
@@ -3087,6 +3319,9 @@ pub struct TermWindow {
     /// Settings' cursor blink is Smooth or Hard, so a cursor in the default
     /// style blinks. Rebuilt with `cursor_blink_state`.
     cursor_blinks_by_default: bool,
+    /// The cursor shape chosen in Settings, for a cursor in the default
+    /// style. Rebuilt with `cursor_blink_state`.
+    cursor_shape_choice: crate::native_settings::NativeCursorShape,
     blink_state: RefCell<ColorEase>,
     rapid_blink_state: RefCell<ColorEase>,
 
@@ -3102,6 +3337,9 @@ pub struct TermWindow {
     /// A pane sliding in on a split, or out on closing (see
     /// `render::split_slide`).
     split_slides: render::split_slide::SplitSlides,
+    /// A docked sidebar sliding out as it opens, or back as it closes (see
+    /// `sidebar_slide`).
+    sidebar_slides: sidebar_slide::SidebarSlides,
     /// Set while a closed pane is painted on its way out.
     closed_pane_nav: Option<render::split_slide::ClosedNav>,
     /// Set while a pane carried into another stack is painted on its way.
@@ -3131,6 +3369,8 @@ pub struct TermWindow {
     scheme_preview: Option<Option<String>>,
     context_menu_application_actions: HashMap<u64, ContextMenuApplicationAction>,
     next_context_menu_application_action_id: u64,
+    /// Panes shared with other accounts, and what they share with ours.
+    pub(crate) share: share::ShareUi,
     context_menu_suppressed_release: Option<MousePress>,
     dragging: Option<(UIItem, MouseEvent)>,
     // In-flight drag of a Files-panel row toward the terminal; becomes
@@ -3139,10 +3379,19 @@ pub struct TermWindow {
     right_sidebar_file_drag: Option<FileDragState>,
     /// In-flight drag of a level-2 pane tab toward a move/split drop.
     pane_tab_drag: Option<PaneTabDragState>,
+    pane_tab_landing: Option<DragLanding<PaneId>>,
     /// Eased picture of `pane_tab_drag`'s drop target; see PaneDropPreviewAnim.
     pane_drop_preview: Option<PaneDropPreviewAnim>,
     /// In-flight reorder drag of a left-sidebar Project or thread row.
     sidebar_row_drag: Option<SidebarRowDragState>,
+    sidebar_row_landing: Option<DragLanding<SidebarRowKind>>,
+    sidebar_make_way: sidebar_make_way::SidebarMakeWay,
+    folder_chevrons: sidebar_disclosure::FolderChevrons,
+    sidebar_row_places: sidebar_make_way::RowPlaces,
+    /// A folder's rows as they are recorded, to be replayed faded while it
+    /// opens and closes; kept unless it grew large, so that a frame records
+    /// into the last one's buffers.
+    sidebar_folder_rows: crate::quad::HeapQuadAllocator,
     /// Content views (e.g. SSH hosts) shown as synthetic tabs.
     content_views: Vec<ContentViewTab>,
     active_content_view_id: Option<ContentViewId>,
@@ -3172,12 +3421,31 @@ pub struct TermWindow {
     next_mosh_connect_generation: u64,
     local_thread_activation: Option<LocalThreadActivationState>,
     next_local_thread_activation_generation: u64,
+    space_connection_page: Option<SpaceConnectionPage>,
+    /// The Space this window showed before `active_space_id`: where a remote
+    /// Space that loses its server sends the window back to.
+    previous_space_id: Option<String>,
     space_owner_id: u64,
     active_space_id: String,
     /// True for windows the user did not explicitly open (domain-owned
     /// windows spawned by the reconcile, e.g. reconnect/auth prompts): they
     /// close when their mux window dies instead of falling back to a thread.
     dies_with_mux_window: bool,
+    /// The thread this window exists to show: a window of its own, with no
+    /// sidebars, opened from the thread list (see `thread_window`).
+    dedicated_thread: Option<crate::workspace_threads::WorkspaceThreadId>,
+    /// A tear-off card let go of, up until the thread's window takes over.
+    thread_card_landing: Option<thread_window::ThreadCardWindow>,
+    /// The page standing in here for a thread open in its own window.
+    elsewhere_page: Option<thread_window::ThreadElsewherePage>,
+    /// A thread to give its own window as soon as it is on screen here.
+    thread_bound_for_own_window: Option<thread_window::ThreadBoundForOwnWindow>,
+    /// Thread windows the app was left with, still to open.
+    threads_to_reopen: std::collections::VecDeque<crate::workspace_threads::WorkspaceThreadId>,
+    /// Opened for a server's connection (Connect, `thinkterm connect`) that
+    /// has not got through yet: if it fails or is turned down, the window
+    /// goes, as it came for nothing else.
+    opened_to_connect: bool,
     /// Domains with a user-requested reconnect currently in flight (the
     /// sidebar Reconnect button); suppresses double-clicks and drives the
     /// row's "Connecting…" label.
@@ -3224,15 +3492,29 @@ pub struct TermWindow {
     /// entry and sets it around the row loop, so it describes that paint and
     /// no other; a paint that bailed out before the list leaves it `None`.
     workspace_sidebar_list_quads: Option<(HeapQuadMark, HeapQuadMark)>,
-    /// The see-through left sidebar's recording buffer, kept from frame to
-    /// frame: no larger than `WORKSPACE_SIDEBAR_SCRATCH_KEEP_BYTES`, let go
-    /// when the sidebar collapses.
+    /// A tab row's recording buffer, kept from frame to frame and from one
+    /// row to the next: no larger than `TAB_ROW_SCRATCH_KEEP_BYTES`, and
+    /// let go while the window is hidden.
+    tab_row_scratch: HeapQuadAllocator,
+    /// The left sidebar's recording buffer, kept from frame to frame: no
+    /// larger than `WORKSPACE_SIDEBAR_SCRATCH_KEEP_BYTES`, let go when the
+    /// sidebar collapses.
     workspace_sidebar_scratch: HeapQuadAllocator,
     workspace_sidebar_scrollbar_visible_until: Option<Instant>,
+    /// The pill at the list's edge while the window's thread is out of
+    /// sight, and the scroll its click starts.
+    pub(crate) sidebar_jump: ui::sidebar_jump::SidebarJump,
+    /// The Library in place of the left sidebar, open or on its way.
+    pub(crate) library: ui::library::LibraryState,
     /// Presentation-only hover reveal of the collapsed sidebar. This never
     /// touches `workspace_sidebar_collapsed` or `workspace_sidebar_width`:
     /// the terminal must not reflow for a hover.
     workspace_sidebar_hover: sidebar_hover::SidebarHoverReveal,
+    /// The window tab row hidden or brought down from the top edge, as
+    /// Settings asks; see `window_tab_reveal`.
+    window_tab_reveal: window_tab_reveal::WindowTabReveal,
+    /// The numbers on the sidebar's threads while their keys are held.
+    thread_numbers: thread_numbers::ThreadNumbers,
     /// Hover-reveal of the collapsed right sidebar: the same machine as the
     /// left one's, mirrored onto the right edge.
     right_sidebar_hover: sidebar_hover::SidebarHoverReveal,
@@ -3293,6 +3575,14 @@ pub struct TermWindow {
     right_sidebar_snippet_listing: thinkterm_snippets::view::Listing,
     /// The plugin panel on show in this window, while one is.
     pub(crate) right_sidebar_plugin: Option<ui::plugin_panel::PluginPanel>,
+    /// The plugins' pages this window has on show, by the pane each holds
+    /// the place of (`ui::plugin_panel::page`).
+    pub(crate) plugin_pages: HashMap<PaneId, ui::plugin_panel::PluginPanel>,
+    /// The pages painted since the last sweep of those that were not.
+    pub(crate) plugin_pages_on_show: HashSet<PaneId>,
+    /// The pane whose page stands in the sidebar panel's place for the
+    /// moment (`with_plugin_page`).
+    pub(crate) plugin_page_standing: Option<PaneId>,
     /// The user's key asked for this plugin's panel to have the keyboard
     /// before the panel was open: it is given it as it opens, and holds
     /// the keyboard meanwhile.
@@ -3310,6 +3600,10 @@ pub struct TermWindow {
     /// The answer is the domain's, so another pane of one looked at already
     /// has it at once. One entry a domain, dropped with the panel.
     pub(crate) plugin_panel_domains: Vec<(DomainId, Option<bool>)>,
+    /// The pane in focus the plugin panel was last beside, and how
+    /// `thinkterm cli` reaches it: worked out once a pane, dropped with the
+    /// panel.
+    pub(crate) plugin_panel_terminal: Option<(PaneId, Option<thinkterm_plugin_panel::Terminal>)>,
     /// How the machine the pane in focus runs on is reached when that is
     /// another, for the plugin panel, and when that was found: for one
     /// pane, found again every few seconds.
@@ -3485,6 +3779,10 @@ pub struct TermWindow {
     /// its own lease and must outlive the panel switching between trees.
     right_sidebar_remote_transfers: Vec<remote_files::RemoteTransfer>,
     right_sidebar_remote_transfer_next_id: u64,
+    /// Downloads that have stopped, held for the floating card after the
+    /// transfer row may already have been trimmed out of the strip.
+    transfer_toasts: Vec<render::transfer_card::TransferToast>,
+    dynamic_status: render::dynamic_status::DynamicStatus,
     /// The directory a file drag is currently hovering over, so the row can be
     /// highlighted and the drop knows where it would land.
     right_sidebar_remote_drop_target: Option<remote_files::RemotePath>,
@@ -3936,6 +4234,17 @@ impl TermWindow {
         }
         self.persist_workspace_layout_after_mutation("window close requested");
 
+        // A thread's own window is one view of a thread that goes on running
+        // in the thread list. As the last window it goes with the app, and
+        // comes back with it.
+        if let Some(thread_id) = &self.dedicated_thread {
+            if front_end().gui_windows().len() > 1 {
+                crate::workspace_threads::note_thread_left_own_window(thread_id);
+                self.close_gui_window_now(window, true);
+                return;
+            }
+        }
+
         let mux = Mux::get();
         let preserve_mux_window = self.should_preserve_mux_window_on_gui_close();
         match self.config.window_close_confirmation {
@@ -4093,8 +4402,11 @@ impl TermWindow {
         // them would draw the overview in whatever now occupies those texels.
         // `PreviewQuadKey` also carries `shape_generation`, so this is belt and
         // braces -- but the two live in different files and the invariant
-        // belongs with the rest of the captures.
-        self.preview_quad_cache.borrow_mut().clear();
+        // belongs with the rest of the captures. A card's texture, though, is
+        // finished pixels a repack does not touch, and stays on screen until
+        // the card is rebuilt: dropped with the quads, every card went blank at
+        // once -- the one a terminal was landing in among them.
+        self.retire_preview_quads_for_new_atlas();
         // The half-built card holds the same kind of atlas-addressed quads.
         *self.preview_rebuild_partial.borrow_mut() = None;
         let Some(fade) = self.content_view_fade.as_mut() else {
@@ -4159,8 +4471,7 @@ impl TermWindow {
 
     /// What has to keep going even where nobody can see it, because its end
     /// changes more than this window's picture: a transition whose last
-    /// frame tidies up after it, the update notice's dismissal (every
-    /// window hides it then), a takeover or recovery waiting for this
+    /// frame tidies up after it, a takeover or recovery waiting for this
     /// window to confirm its geometry (the whole connection waits with it),
     /// and a remote thread being opened (claimed on a frame).
     ///
@@ -4168,7 +4479,7 @@ impl TermWindow {
     /// terminal shown; one owed to a tab switched away from or closed, or
     /// held up behind a page, would keep the window drawing for good.
     fn owes_frames_while_hidden(&self) -> bool {
-        if self.content_view_fade.is_some() || self.update_capsule.owes_frames_while_hidden() {
+        if self.content_view_fade.is_some() {
             return true;
         }
         if self.content_view_foreground() {
@@ -4218,13 +4529,19 @@ impl TermWindow {
             || self.active_content_view_index().is_some()
             || self.workspace_sidebar_hover.needs_frames()
             || self.right_sidebar_hover.needs_frames()
+            || self.window_tab_reveal.needs_frames()
             || self.overlay_scrollbar_owes_frames()
+            || self.library_open()
             // A light still running, or a paste still to show up for one:
             // copying and then switching to the app to paste it in is the
             // usual way, and a light left frozen on screen would stay.
             || !self.edge_lights.is_empty()
             || self.pending_paste.is_some()
-            || self.update_capsule.owes_frames()
+            || self.dynamic_status.owes_frames()
+            // A finished transfer's notice runs out in a window seen but
+            // not in front too.
+            || self.next_transfer_toast_deadline().is_some()
+            || self.dynamic_status.finished.deadline().is_some()
     }
 
     /// An overlay scrollbar that is still up has a fade to finish; the
@@ -4319,6 +4636,11 @@ impl TermWindow {
             // What is split or closed while it is out of sight is not to
             // slide when it is seen again, nor a closed pane held till then.
             self.split_slides.release();
+            // Nor a sidebar left on its way, still holding what it shows.
+            self.finish_sidebar_slides();
+            // Nor a finished transfer's or agent's notice left to run out
+            // unseen; the first frame back starts its clock again.
+            self.pause_status_notices(Instant::now());
         }
     }
 
@@ -4465,8 +4787,10 @@ impl TermWindow {
             render_state.dedicated_images.borrow_mut().clear();
         }
         self.line_quad_cache.borrow_mut().clear();
-        // Likewise the scratch recorder: a hidden window records no lines.
+        // Likewise the scratch recorders: a hidden window records no lines,
+        // nor tab rows.
         *self.line_quad_scratch.borrow_mut() = HeapQuadAllocator::default();
+        self.tab_row_scratch = HeapQuadAllocator::default();
         // Nor renders cards.
         self.release_card_frame_buffers();
         // And the panes last painted, which would keep one closed since
@@ -4540,7 +4864,8 @@ impl TermWindow {
             let mux = Mux::get();
             let ws = mux
                 .get_window(self.mux_window_id)
-                .map(|w| w.get_workspace().to_string());
+                .map(|w| w.get_workspace().to_string())
+                .filter(|ws| !crate::workspace_threads::is_thread_page_workspace(ws));
             if let Some(ws) = ws {
                 if mux.active_workspace() != ws {
                     mux.set_active_workspace(&ws);
@@ -4553,6 +4878,8 @@ impl TermWindow {
             self.workspace_sidebar_swipe.cancel_immediately();
             self.workspace_sidebar_hover.cancel_immediately();
             self.right_sidebar_hover.cancel_immediately();
+            self.window_tab_reveal.cancel();
+            self.cancel_thread_numbers();
             self.clear_workspace_space_swipe_frame_transition();
             self.right_sidebar_note.native_text_input_snapshot_key = None;
             window.set_native_text_input_snapshot(None);
@@ -4584,7 +4911,10 @@ impl TermWindow {
             self.finish_inline_tab_rename(true);
             self.right_sidebar_file_drag = None;
             self.pane_tab_drag = None;
+            self.pane_tab_landing = None;
             self.sidebar_row_drag = None;
+            self.sidebar_row_landing = None;
+            self.sidebar_make_way.finish(false);
             let lost_split_drag = self
                 .dragging
                 .as_ref()
@@ -4630,7 +4960,7 @@ impl TermWindow {
 
 impl TermWindow {
     pub async fn new_window(mux_window_id: MuxWindowId) -> anyhow::Result<()> {
-        Self::new_window_impl(mux_window_id, None, true, None).await
+        Self::new_window_impl(mux_window_id, None, true, None, None).await
     }
 
     /// For domain-owned mux windows (remote mux windows arriving via a
@@ -4638,7 +4968,7 @@ impl TermWindow {
     /// a saved workspace thread. Restoring would adopt this window onto a
     /// different mux window, orphaning/killing the one the domain created.
     pub async fn new_window_without_restore(mux_window_id: MuxWindowId) -> anyhow::Result<()> {
-        Self::new_window_impl(mux_window_id, None, false, None).await
+        Self::new_window_impl(mux_window_id, None, false, None, None).await
     }
 
     pub async fn new_window_with_claimed_space(
@@ -4652,6 +4982,26 @@ impl TermWindow {
             Some((space_owner_id, active_space_id)),
             false,
             remote_open_domain,
+            None,
+        )
+        .await
+    }
+
+    /// A window of its own for `thread_id`, showing its running mux window.
+    /// It sits in the thread's Space without holding it: the window with the
+    /// sidebar goes on holding that, and never hears of this one.
+    pub(crate) async fn new_thread_window(
+        mux_window_id: MuxWindowId,
+        space_id: String,
+        request: thread_window::OwnWindowRequest,
+    ) -> anyhow::Result<()> {
+        let space_owner_id = crate::workspace_threads::next_space_owner_id();
+        Self::new_window_impl(
+            mux_window_id,
+            Some((space_owner_id, space_id)),
+            false,
+            None,
+            Some(request),
         )
         .await
     }
@@ -4661,6 +5011,7 @@ impl TermWindow {
         claimed_space: Option<(u64, String)>,
         restore_saved_thread: bool,
         remote_open_domain: Option<DomainId>,
+        own_window: Option<thread_window::OwnWindowRequest>,
     ) -> anyhow::Result<()> {
         let config = configuration();
         let native_settings = crate::native_settings::load();
@@ -4745,7 +5096,21 @@ impl TermWindow {
 
         // Initially we have only a single tab, and no status text yet.
         let terminal_bar_kind = crate::tabbar::terminal_bar_kind(&config, 1, false);
-        let tab_bar_height = Self::tab_bar_pixel_height_impl(&fontconfig)? as usize
+        // A window tab row that hides gives its height to the terminal: the
+        // window opens without it, and the shell starts at the size it asked
+        // for rather than being resized as the window appears.
+        let in_own_window = own_window.is_some();
+        let window_tab_reveal = if in_own_window {
+            window_tab_reveal::WindowTabReveal::always_hiding()
+        } else {
+            window_tab_reveal::WindowTabReveal::new()
+        };
+        let window_tab_row_height = if window_tab_reveal.in_layout() {
+            Self::tab_bar_pixel_height_impl(&fontconfig)? as usize
+        } else {
+            0
+        };
+        let tab_bar_height = window_tab_row_height
             + crate::termwindow::render::tab_bar::terminal_bar_height(
                 terminal_bar_kind,
                 &render_metrics,
@@ -4787,9 +5152,9 @@ impl TermWindow {
         // A right sidebar that starts open, as it was left, takes its width
         // beside the terminal rather than out of it: the shell starts at the
         // size asked for instead of being resized as the window opens.
-        let right_sidebar_shown =
-            crate::native_settings::right_sidebar_starts_shown(&native_settings.chrome)
-                && RightSidebarMode::any_panel_enabled();
+        let right_sidebar_shown = !in_own_window
+            && crate::native_settings::right_sidebar_starts_shown(&native_settings.chrome)
+            && RightSidebarMode::any_panel_enabled();
         let right_sidebar_width = if right_sidebar_shown {
             ui::right_sidebar_width_for_metrics(&render_metrics, dpi as usize)
         } else {
@@ -4806,7 +5171,7 @@ impl TermWindow {
 
         let mut dimensions = Dimensions {
             pixel_width: (terminal_size.pixel_width
-                + workspace_sidebar_width
+                + if in_own_window { 0 } else { workspace_sidebar_width }
                 + right_sidebar_width
                 + padding_left
                 + padding_right) as usize,
@@ -4834,7 +5199,8 @@ impl TermWindow {
         let render_state = None;
 
         let connection_name = Connection::get().unwrap().name();
-        let dies_with_mux_window = claimed_space.is_none() && !restore_saved_thread;
+        let dies_with_mux_window =
+            in_own_window || (claimed_space.is_none() && !restore_saved_thread);
         let (space_owner_id, active_space_id) = claimed_space.unwrap_or_else(|| {
             let space_owner_id = crate::workspace_threads::next_space_owner_id();
             // Windows created without a saved-thread restore are incidental
@@ -4942,6 +5308,7 @@ impl TermWindow {
             last_mouse_coords: (0, -1),
             window_drag_position: None,
             current_mouse_event: None,
+            text_cursor_rect: None,
             current_modifier_and_leds: Default::default(),
             prev_cursor: PrevCursorPos::new(),
             last_scroll_info: RenderableDimensions::default(),
@@ -5020,6 +5387,7 @@ impl TermWindow {
                 None,
             )),
             cursor_blinks_by_default: crate::native_settings::cursor_blinks_by_default(),
+            cursor_shape_choice: crate::native_settings::cursor_shape_choice(),
             blink_state: RefCell::new(ColorEase::new(
                 config.text_blink_rate,
                 config.text_blink_ease_in,
@@ -5052,6 +5420,7 @@ impl TermWindow {
             edge_lights: vec![],
             pending_paste: None,
             split_slides: Default::default(),
+            sidebar_slides: Default::default(),
             closed_pane_nav: None,
             nav_morph: None,
             right_press_claimed: false,
@@ -5063,12 +5432,19 @@ impl TermWindow {
             scheme_preview_ground: None,
             context_menu_application_actions: HashMap::new(),
             next_context_menu_application_action_id: 1,
+            share: Default::default(),
             context_menu_suppressed_release: None,
             dragging: None,
             right_sidebar_file_drag: None,
             pane_tab_drag: None,
             pane_drop_preview: None,
             sidebar_row_drag: None,
+            sidebar_row_landing: None,
+            sidebar_make_way: Default::default(),
+            folder_chevrons: Default::default(),
+            sidebar_row_places: Default::default(),
+            sidebar_folder_rows: Default::default(),
+            pane_tab_landing: None,
             content_views: vec![],
             active_content_view_id: None,
             content_view_response_tab_id: None,
@@ -5085,15 +5461,24 @@ impl TermWindow {
             next_mosh_connect_generation: 1,
             local_thread_activation: None,
             next_local_thread_activation_generation: 1,
+            space_connection_page: None,
+            previous_space_id: None,
             space_owner_id,
             active_space_id,
             dies_with_mux_window,
+            dedicated_thread: own_window.as_ref().map(|request| request.thread_id.clone()),
+            thread_card_landing: None,
+            elsewhere_page: None,
+            thread_bound_for_own_window: None,
+            threads_to_reopen: std::collections::VecDeque::new(),
+            opened_to_connect: remote_open_domain.is_some(),
             space_reconnects_in_flight: HashSet::new(),
             watched_space_connection_state: None,
             workspace_layout_structure_fingerprint,
             workspace_sidebar_width,
             workspace_sidebar_pending_thread_selection: None,
-            workspace_sidebar_collapsed: !native_settings.onboarding.show_left_sidebar_by_default,
+            workspace_sidebar_collapsed: in_own_window
+                || !native_settings.onboarding.show_left_sidebar_by_default,
             workspace_sidebar_scroll_offset: 0.0,
             workspace_sidebar_scroll_offsets: HashMap::new(),
             workspace_sidebar_swipe: space_swipe::SidebarSpaceSwipeState::default(),
@@ -5103,13 +5488,18 @@ impl TermWindow {
             workspace_space_swipe_target_frame: None,
             workspace_space_swipe_tracked: false,
             workspace_sidebar_list_quads: None,
+            tab_row_scratch: HeapQuadAllocator::default(),
             workspace_sidebar_scratch: HeapQuadAllocator::default(),
             workspace_space_swipe_push_active: false,
             workspace_space_swipe_direction: 0.0,
             workspace_space_swipe_pending_commit: None,
             workspace_space_swipe_needs_settle_start: false,
             workspace_sidebar_scrollbar_visible_until: None,
+            sidebar_jump: Default::default(),
+            library: Default::default(),
             workspace_sidebar_hover: sidebar_hover::SidebarHoverReveal::default(),
+            window_tab_reveal,
+            thread_numbers: Default::default(),
             right_sidebar_hover: sidebar_hover::SidebarHoverReveal::default(),
             right_sidebar_hover_was_presented: false,
             titlebar_sidebar_button_hovered: false,
@@ -5135,10 +5525,14 @@ impl TermWindow {
             right_sidebar_snippet_scrollbar_visible_until: None,
             right_sidebar_snippet_listing: Default::default(),
             right_sidebar_plugin: None,
+            plugin_pages: HashMap::new(),
+            plugin_pages_on_show: HashSet::new(),
+            plugin_page_standing: None,
             plugin_panel_focus_asked: None,
             plugin_panel_keys_held: false,
             plugin_field_snapshot: None,
             plugin_panel_domains: Vec::new(),
+            plugin_panel_terminal: None,
             plugin_panel_reach: None,
             right_sidebar_snippet_saving: false,
             right_sidebar_note: crate::markdown_editor::NoteHostState::default(),
@@ -5238,6 +5632,8 @@ impl TermWindow {
             right_sidebar_remote_files_lease: None,
             right_sidebar_remote_transfers: Vec::new(),
             right_sidebar_remote_transfer_next_id: 0,
+            transfer_toasts: Vec::new(),
+            dynamic_status: Default::default(),
             right_sidebar_remote_drop_target: None,
             right_sidebar_local_drop_target: None,
             pending_local_copy: None,
@@ -5294,7 +5690,8 @@ impl TermWindow {
         //
         // macOS is untouched by any of this and keeps using AppKit's frame
         // autosave below; `frame_to_restore` yields nothing there.
-        let restored_frame = if crate::main_window_placement::claim_main_window(mux_window_id)
+        let restored_frame = if !in_own_window
+            && crate::main_window_placement::claim_main_window(mux_window_id)
             && native_settings.window.restore_main_window_frame
             && x.is_none()
             && y.is_none()
@@ -5312,7 +5709,10 @@ impl TermWindow {
             macos_frame_autosave_name: if cfg!(target_os = "macos")
                 && native_settings.window.restore_main_window_frame
             {
-                Some("ThinkTerm.MainWindow".to_string())
+                Some(match &own_window {
+                    Some(request) => format!("ThinkTerm.ThreadWindow.{}", request.frame_slot),
+                    None => "ThinkTerm.MainWindow".to_string(),
+                })
             } else {
                 None
             },
@@ -5335,7 +5735,13 @@ impl TermWindow {
             },
         )
         .await?;
-        window.set_titlebar_sidebar_button_visible(true);
+        window.set_titlebar_sidebar_button_visible(!in_own_window);
+        // Its one bar is where the system keeps the title bar: what is on the
+        // bar has to stay put under the pointer, and only its blank moves
+        // the window (`pane_bar_blank_is_title_bar`).
+        if in_own_window {
+            window.set_moved_on_request_only();
+        }
         {
             let mut tw = tw.borrow_mut();
             tw.window.replace(window.clone());
@@ -5463,7 +5869,12 @@ impl TermWindow {
             } else {
                 myself.sync_current_workspace_thread();
             }
-            myself.maybe_show_onboarding();
+            if myself.dedicated_thread.is_none() {
+                myself.maybe_show_onboarding();
+            }
+            if restore_saved_thread && front_end().take_reopening_thread_windows() {
+                myself.begin_reopening_thread_windows();
+            }
             // The mux window can predate this native window, so no
             // TabAddedToWindow notification is guaranteed after the GUI has
             // subscribed. Converge the already-active tab before the first
@@ -5471,6 +5882,9 @@ impl TermWindow {
             // takeover epoch here rather than exposing its saved/TUI grid.
             if !myself.content_view_foreground() {
                 myself.resize_mux_tabs_to_current_terminal_size();
+            }
+            if let Some(position) = own_window.as_ref().and_then(|request| request.position) {
+                window.set_window_position(position);
             }
             window.show();
             // Maximizing after the window is shown, rather than asking for a
@@ -5502,6 +5916,9 @@ impl TermWindow {
             )
         };
         front_end().record_known_window(window.clone(), adopted_mux_window_id, recovery_slot);
+        if let Some(request) = &own_window {
+            front_end().thread_window_opened(&request.thread_id, &window);
+        }
 
         // A Project directory refused before this window existed has been
         // waiting for somewhere to be shown; this is the first moment there is
@@ -5552,7 +5969,9 @@ impl TermWindow {
         }
         match event {
             WindowEvent::Destroyed => {
-                crate::main_window_placement::window_closed(self.mux_window_id);
+                if self.dedicated_thread.is_none() {
+                    crate::main_window_placement::window_closed(self.mux_window_id);
+                }
                 self.flush_right_sidebar_note_blocking();
                 self.save_right_sidebar_markdown_preview_before_destroy();
                 self.clear_gui_recovery_intent();
@@ -5569,7 +5988,9 @@ impl TermWindow {
                 // Get the placement on disk before anything that might quit
                 // the process gets going. The claim is kept: the close may
                 // still be called off by a confirmation prompt.
-                crate::main_window_placement::close_requested(self.mux_window_id);
+                if self.dedicated_thread.is_none() {
+                    crate::main_window_placement::close_requested(self.mux_window_id);
+                }
                 self.close_requested(window);
                 Ok(true)
             }
@@ -5577,7 +5998,9 @@ impl TermWindow {
                 // While a restored frame is still being asserted the window is
                 // passing through geometry nobody chose; recording it would
                 // save the startup wobble rather than where the window lives.
-                if !self.settle_restored_frame(frame, maximized, window) {
+                if self.dedicated_thread.is_none()
+                    && !self.settle_restored_frame(frame, maximized, window)
+                {
                     crate::main_window_placement::record(self.mux_window_id, frame, maximized);
                 }
                 Ok(true)
@@ -5622,7 +6045,7 @@ impl TermWindow {
                 // A native context menu delivers its selection this way;
                 // whichever way the menu ended, it is over now.
                 self.native_context_menu_open = false;
-                if let Some(pane) = self.get_active_pane_or_overlay() {
+                if let Some(pane) = self.pane_for_key_bindings() {
                     self.perform_key_assignment(&pane, &action)?;
                     window.invalidate();
                 }
@@ -5711,6 +6134,7 @@ impl TermWindow {
             }
             WindowEvent::AdviseModifiersLedStatus(modifiers, leds) => {
                 self.current_modifier_and_leds = (modifiers, leds);
+                self.note_thread_number_modifiers(modifiers);
                 self.update_title();
                 window.invalidate();
                 Ok(true)
@@ -5802,9 +6226,8 @@ impl TermWindow {
                     Some(pane) => pane,
                     None => return Ok(true),
                 };
-                let cursor = pane.get_cursor_position();
-                pane.send_paste(text.as_str())?;
-                self.light_up_terminal_paste(&pane, &text, cursor);
+                // Dropped text is a paste, and asks first like one.
+                self.paste_text_into(&pane, &text);
                 Ok(true)
             }
             WindowEvent::DroppedUrl(urls) => {
@@ -6183,6 +6606,7 @@ impl TermWindow {
                     pane_id,
                 } => {
                     self.refresh_thread_work_for_pane(pane_id);
+                    self.note_share_watch(pane_id, &name, &value);
                     self.emit_user_var_event(pane_id, name, value);
                 }
                 MuxNotification::WindowTitleChanged { .. }
@@ -6193,21 +6617,33 @@ impl TermWindow {
                     self.update_title();
                 }
                 MuxNotification::Alert {
+                    alert: Alert::Progress(progress),
+                    pane_id,
+                } => {
+                    self.refresh_thread_work_for_pane(pane_id);
+                    self.update_title();
+                    // A pane in another tab or thread reporting its
+                    // progress shows on the dynamic status.
+                    self.dynamic_status_progress_changed(pane_id, &progress);
+                }
+                MuxNotification::Alert {
                     alert:
                         Alert::WindowTitleChanged(_)
                         | Alert::TabTitleChanged(_)
-                        | Alert::IconTitleChanged(_)
-                        | Alert::Progress(_),
+                        | Alert::IconTitleChanged(_),
                     pane_id,
                 } => {
                     self.refresh_thread_work_for_pane(pane_id);
                     self.update_title();
                 }
-                // Filtered out before it gets here; for event subscribers.
+                // How a command ended, for the dynamic status's notice of it.
                 MuxNotification::Alert {
-                    alert: Alert::CommandFinished { .. },
-                    pane_id: _,
-                } => {}
+                    alert: Alert::CommandFinished { exit_code },
+                    pane_id,
+                } => {
+                    let changed = self.dynamic_status_command_exit(pane_id, exit_code);
+                    self.invalidate_window_if(changed);
+                }
                 MuxNotification::Alert {
                     alert: Alert::PaletteChanged,
                     pane_id: _,
@@ -6300,6 +6736,7 @@ impl TermWindow {
                             {
                                 self.set_window_size(size, window)?;
                             } else if tab_size != self.terminal_size {
+                                self.refresh_pane_tree_slack(&tab);
                                 tab.resize(self.terminal_size);
                             }
                             self.stage_workspace_thread_font_scales();
@@ -6309,6 +6746,7 @@ impl TermWindow {
                     self.persist_workspace_layout_after_mutation("tab added");
                 }
                 MuxNotification::PaneOutput(pane_id) => {
+                    self.dynamic_status_pane_printed(pane_id);
                     self.mux_pane_output_event(pane_id);
                 }
                 MuxNotification::AgentStatusChanged(pane_id) => {
@@ -6327,14 +6765,23 @@ impl TermWindow {
                         }
                     }
                     crate::workspace_threads::refresh_thread_work_for_pane(pane_id);
+                    // Blocked and Error share NeedsAttention, but the Dock
+                    // can count just one of them.
+                    crate::workspace_threads::schedule_dock_badge_refresh();
                     // Waiting -> error leaves the aggregate NeedsAttention
                     // unchanged, but changes its icon. Decide from what this
-                    // window displays, not from the aggregate's changed bit.
-                    self.invalidate_window_if(self.agent_status_change_is_visible(pane_id));
+                    // window displays, not from the aggregate's changed bit
+                    // -- the dynamic status included.
+                    let on_dynamic_status = self.dynamic_status_agent_changed(pane_id);
+                    self.invalidate_window_if(
+                        on_dynamic_status || self.agent_status_change_is_visible(pane_id),
+                    );
                 }
                 MuxNotification::ForegroundProgramChanged(pane_id) => {
-                    // The pane's tab, or its thread's row in the sidebar.
-                    self.invalidate_window_if(self.agent_status_change_is_visible(pane_id));
+                    // The pane's tab, or its thread's row in the sidebar, or
+                    // a long command ending on the dynamic status.
+                    let ended = self.dynamic_status_program_changed(pane_id);
+                    self.invalidate_window_if(ended || self.agent_status_change_is_visible(pane_id));
                 }
                 MuxNotification::WindowInvalidated(_) => {
                     window.invalidate();
@@ -6400,6 +6847,12 @@ impl TermWindow {
                     self.update_title_post_status();
                     self.persist_workspace_layout_after_mutation("pane label changed");
                 }
+                // Its tab shows what the page says of itself; the layout
+                // keeps what it is opened with.
+                MuxNotification::PageChanged(_) => {
+                    self.update_title_post_status();
+                    self.persist_workspace_layout_after_mutation("page changed");
+                }
                 MuxNotification::PaneAdded(pane_id) => {
                     self.push_window_config_to_pane(pane_id);
                     self.refresh_thread_work_for_pane(pane_id);
@@ -6407,7 +6860,8 @@ impl TermWindow {
                 }
                 // Filtered out before it gets here; for event subscribers.
                 MuxNotification::PaneExited { .. } => {}
-                MuxNotification::PaneRemoved(_) => {
+                MuxNotification::PaneRemoved(pane_id) => {
+                    self.dynamic_status_pane_removed(pane_id);
                     self.refresh_all_thread_work();
                     self.persist_workspace_layout_after_mutation("pane removed");
                     // A pane leaving a mirror tab (its process exited, a peer
@@ -6458,6 +6912,7 @@ impl TermWindow {
                 self.maybe_release_occluded_memory();
                 self.maybe_release_idle_preview_cache();
                 self.maybe_warm_overview_fonts();
+                self.share_tick();
             }
             TermWindowNotif::OpenProjectPath(path) => {
                 let path = path.to_string_lossy();
@@ -6529,6 +6984,7 @@ impl TermWindow {
             return;
         }
 
+        let left_connection_page = self.take_left_space_connection_page(mux_window_id);
         self.cancel_remote_divider_resizes_except(None);
         self.mux_window_id = mux_window_id;
         *self.mux_window_id_for_subscriptions.lock().unwrap() = mux_window_id;
@@ -6541,6 +6997,7 @@ impl TermWindow {
         // leaving a live window that never hears PaneOutput again, painting
         // only on input events and the 1s render watchdog.
         self.subscribe_to_pane_updates();
+        self.leave_thread_elsewhere_page(mux_window_id);
 
         // Keep the frontend's window<->mux mapping accurate so that the
         // additive reconcile does not try to spawn a duplicate window for the
@@ -6581,6 +7038,7 @@ impl TermWindow {
         // be up).
         self.resize_mux_tabs_to_current_terminal_size();
         self.sync_current_workspace_thread();
+        self.send_on_thread_bound_for_own_window(mux_window_id);
 
         // A Space/thread switch can replace the active pane without changing
         // the native window's focus state, so no FocusChanged event follows
@@ -6596,6 +7054,12 @@ impl TermWindow {
         self.update_title();
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
+        }
+
+        // Only now that the subscription names the adopted window, so the
+        // page window's WindowRemoved cannot be taken for ours.
+        if let Some(page) = left_connection_page {
+            Mux::get().kill_window(page.mux_window_id);
         }
     }
 
@@ -6632,8 +7096,11 @@ impl TermWindow {
     /// exited, e.g. `exit` in a thread's only shell). Fall back to another
     /// thread of the Space — or a fresh one — instead of dying with it,
     /// which used to take the whole app down when this was the last window.
-    /// Incidental windows (reconnect/auth prompts) and remote mux Spaces
-    /// keep the close-with-the-mux-window behavior.
+    /// A remote mux Space moves to another of its threads while its server
+    /// is connected; one with no other thread, no server, or a connection
+    /// page that closed unconnected sends the window back to the Space it
+    /// came from. Only incidental windows (reconnect/auth prompts) close
+    /// with their mux window.
     pub(crate) fn recover_from_dead_mux_window(&mut self) {
         let mux = Mux::get();
         if mux.get_window(self.mux_window_id).is_some() {
@@ -6644,14 +7111,97 @@ impl TermWindow {
         let Some(window) = self.window.clone() else {
             return;
         };
-        let recovery_thread = if self.dies_with_mux_window
-            || crate::workspace_threads::client_domain_for_space(&self.active_space_id).is_some()
+        // The pane shared with us that this window went to watch closed:
+        // back to the thread it came from, still the Space's active one.
+        if self.share_view_closed() {
+            if let Some(thread_id) =
+                crate::workspace_threads::ensure_active_thread_for_space(&self.active_space_id)
+            {
+                self.show_thread_or_its_page(thread_id, &window);
+                return;
+            }
+        }
+        if self
+            .space_connection_page
+            .as_ref()
+            .is_some_and(|page| page.mux_window_id == self.mux_window_id)
         {
+            if let Some(page) = self.space_connection_page.take() {
+                self.recover_from_closed_connection_page(page, &window);
+            }
+            return;
+        }
+        // The thread has another window left (a server holding two for
+        // it): show that one here rather than leaving the thread.
+        if !self.dies_with_mux_window {
+            if let Some(thread_id) =
+                crate::workspace_threads::recorded_active_thread_for_space(&self.active_space_id)
+            {
+                let live_workspaces = Mux::get().iter_workspaces();
+                if crate::workspace_threads::activation_plan_for_thread(
+                    &thread_id,
+                    &live_workspaces,
+                )
+                .is_some_and(|plan| !plan.needs_materialize)
+                {
+                    self.activate_workspace_thread(thread_id, &window);
+                    return;
+                }
+            }
+        }
+        // A mirror rebuilt on reconnecting gets a new window for the same
+        // thread.
+        if let Some(workspace) = self
+            .dedicated_thread
+            .as_deref()
+            .and_then(crate::workspace_threads::thread_workspace_name)
+        {
+            if let Some(target) = crate::workspace_threads::window_to_show_in_workspace(&workspace)
+            {
+                if !front_end().has_mux_window(target) {
+                    self.switch_to_mux_window(target);
+                    return;
+                }
+            }
+        }
+        let recovery_thread = if self.dies_with_mux_window {
             None
+        } else if let Some(domain_name) =
+            crate::workspace_threads::client_domain_for_space(&self.active_space_id)
+        {
+            // Another of the Space's threads while its server is there; no
+            // fresh one, which the server would not know yet.
+            let other_thread = domain_is_attached(&domain_name)
+                .then(|| {
+                    crate::workspace_threads::existing_thread_to_recover_after_window_death(
+                        &self.active_space_id,
+                    )
+                })
+                .flatten();
+            if other_thread.is_none() {
+                // Opened for this connection alone, which never got through:
+                // it goes. Not as the last window, whose closing would end
+                // every other connection.
+                if self.opened_to_connect && front_end().gui_windows().len() > 1 {
+                    window.close();
+                    front_end().forget_known_window(&window);
+                    return;
+                }
+                let return_space_id = self
+                    .previous_space_id
+                    .clone()
+                    .unwrap_or_else(crate::workspace_threads::default_space_id);
+                self.return_from_unreachable_space(return_space_id, None, &window);
+                return;
+            }
+            other_thread
         } else {
             crate::workspace_threads::thread_to_recover_after_window_death(&self.active_space_id)
         };
         let Some(thread_id) = recovery_thread else {
+            if let Some(thread_id) = &self.dedicated_thread {
+                crate::workspace_threads::note_thread_left_own_window(thread_id);
+            }
             window.close();
             front_end().forget_known_window(&window);
             return;
@@ -6661,7 +7211,295 @@ impl TermWindow {
         // subscription id still names the dead mux window, so a queued
         // WindowRemoved would match and kill a subscription made now.
         // switch_to_mux_window re-subscribes after updating the id.
-        self.activate_workspace_thread(thread_id, &window);
+        self.show_thread_or_its_page(thread_id, &window);
+    }
+
+    /// Put the connection page of `domain_name`'s Space on screen: a mux
+    /// window of its own in place of what this window showed, so the page
+    /// is never filed among the tabs of the thread being left. Returns the
+    /// window for the connection UI, or None when this Space's page is up
+    /// and still connecting; that page then opens `thread_id` instead of the
+    /// earlier pick. A page that gave up makes way for a fresh attempt.
+    pub(crate) fn show_space_connection_page(
+        &mut self,
+        domain_name: &str,
+        thread_id: String,
+        orphan_candidate_window_id: Option<MuxWindowId>,
+        workspaces_to_kill_after_adopt: Vec<String>,
+    ) -> Option<MuxWindowId> {
+        let shown_mux_window_id = self.mux_window_id;
+        let shown_page = self
+            .space_connection_page
+            .as_mut()
+            .filter(|page| page.mux_window_id == shown_mux_window_id);
+        let (return_space_id, return_thread_id) = match shown_page {
+            Some(page) if page.domain_name == domain_name && !page.gave_up => {
+                page.thread_id = thread_id;
+                page.orphan_candidate_window_id = orphan_candidate_window_id;
+                page.workspaces_to_kill_after_adopt = workspaces_to_kill_after_adopt;
+                return None;
+            }
+            // Another Space's page, or this one's that gave up, gives way;
+            // going back skips it.
+            Some(page) => Some((page.return_space_id.clone(), page.return_thread_id.clone())),
+            None => None,
+        }
+        .unwrap_or_else(|| self.place_to_return_to());
+        let mux = Mux::get();
+        let workspace = format!(
+            "{}{domain_name}",
+            crate::workspace_threads::CONNECTION_PAGE_WORKSPACE_PREFIX
+        );
+        let builder = mux.new_empty_window_for_domain(Some(workspace.clone()), None, None);
+        let page_window_id = *builder;
+        // Shown here before the frontend hears of it, so the reconcile finds
+        // it taken instead of opening a window of its own for it; the thread
+        // being left goes to the background like any thread switched away
+        // from.
+        mux.set_active_workspace(&workspace);
+        self.switch_to_mux_window(page_window_id);
+        drop(builder);
+        self.space_connection_page = Some(SpaceConnectionPage {
+            mux_window_id: page_window_id,
+            domain_name: domain_name.to_string(),
+            thread_id,
+            orphan_candidate_window_id,
+            workspaces_to_kill_after_adopt,
+            return_space_id,
+            return_thread_id,
+            gave_up: false,
+        });
+        Some(page_window_id)
+    }
+
+    /// The attach behind the connection page failed. The page stays to
+    /// show why, but no longer counts as connecting: opening the Space
+    /// again, or its Reconnect, tries again.
+    pub(crate) fn note_space_connection_page_gave_up(&mut self, page_window_id: MuxWindowId) {
+        if let Some(page) = self
+            .space_connection_page
+            .as_mut()
+            .filter(|page| page.mux_window_id == page_window_id)
+        {
+            page.gave_up = true;
+        }
+    }
+
+    /// The server behind the connection page answered: open what the page
+    /// was for, unless the person moved on (the connection then stays up in
+    /// the background).
+    pub(crate) fn open_connected_space_page(
+        &mut self,
+        page_window_id: MuxWindowId,
+        domain_id: Option<DomainId>,
+    ) {
+        let Some(page) = self
+            .space_connection_page
+            .as_ref()
+            .filter(|page| page.mux_window_id == page_window_id)
+            .filter(|_| self.mux_window_id == page_window_id)
+        else {
+            return;
+        };
+        let domain_name = page.domain_name.clone();
+        let thread_id = page.thread_id.clone();
+        let (return_space_id, return_thread_id) =
+            (page.return_space_id.clone(), page.return_thread_id.clone());
+        let orphan_candidate_window_id = page.orphan_candidate_window_id;
+        let workspaces_to_kill_after_adopt = page.workspaces_to_kill_after_adopt.clone();
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let Some(thread_id) = self.thread_for_connected_page(&domain_name, thread_id) else {
+            self.return_from_unreachable_space(return_space_id, return_thread_id, &window);
+            return;
+        };
+        // Switching into a cold mux-domain Space is as explicit an open as
+        // the Connect button, so it gets the same one-shot claim. Armed
+        // only: the activation releases it when its tab is on screen, and
+        // the paint path consumes it once that tab's gate is claimable.
+        if let Some(domain_id) = domain_id {
+            self.note_remote_open_intent(domain_id);
+        }
+        // Leaving the page for the thread closes it (switch_to_mux_window).
+        self.activate_workspace_thread_impl(
+            thread_id,
+            &window,
+            orphan_candidate_window_id,
+            workspaces_to_kill_after_adopt,
+        );
+    }
+
+    /// What a connection page that got through opens: the thread it was
+    /// for, while this window may still open it, else another of the
+    /// Space's. The thread can have gone while it connected -- deleted from
+    /// another device, or out of the folders here as servers stopped
+    /// showing as them -- and what was settled before the server's tree
+    /// came, which drops anything only this device had, is settled again
+    /// first and the server told of what it still lacks, as
+    /// `connect_domain_into_space` does.
+    fn thread_for_connected_page(&self, domain_name: &str, thread_id: String) -> Option<String> {
+        let settled = crate::workspace_threads::ensure_mux_domain_space(domain_name);
+        crate::workspace_threads::reconcile_remote_subtree(domain_name);
+        std::iter::once(thread_id)
+            .chain(std::iter::once(settled.thread_id))
+            .chain(crate::workspace_threads::existing_thread_to_recover_after_window_death(
+                &self.active_space_id,
+            ))
+            .find(|thread_id| self.may_open_thread(thread_id))
+    }
+
+    /// Whether this window may open `thread_id`: one of its Space's own, or
+    /// one the Space shows -- the gate `activate_workspace_thread_impl`
+    /// keeps.
+    fn may_open_thread(&self, thread_id: &str) -> bool {
+        crate::workspace_threads::thread_space_id(thread_id).as_deref()
+            == Some(self.active_space_id.as_str())
+            || crate::workspace_threads::thread_ref_exists(&self.active_space_id, thread_id)
+    }
+
+    /// The connection page this window leaves by showing `next_mux_window_id`.
+    /// Leaving gives the connection up: closing the page's window answers
+    /// whatever it was asking with a no and stops the retries.
+    fn take_left_space_connection_page(
+        &mut self,
+        next_mux_window_id: MuxWindowId,
+    ) -> Option<SpaceConnectionPage> {
+        if self
+            .space_connection_page
+            .as_ref()
+            .is_some_and(|page| page.mux_window_id != next_mux_window_id)
+        {
+            return self.space_connection_page.take();
+        }
+        None
+    }
+
+    /// The connection page closed while on screen: the person closed it,
+    /// or it ran out its close delay after a failure.
+    fn recover_from_closed_connection_page(&mut self, page: SpaceConnectionPage, window: &Window) {
+        if !domain_is_attached(&page.domain_name) {
+            self.return_from_unreachable_space(page.return_space_id, page.return_thread_id, window);
+            return;
+        }
+        // Connected, and the page went before the thread made it on screen.
+        let opening = self
+            .local_thread_activation
+            .as_ref()
+            .is_some_and(|activation| activation.thread_id == page.thread_id);
+        if opening {
+            return;
+        }
+        let Some(thread_id) = self.thread_for_connected_page(&page.domain_name, page.thread_id)
+        else {
+            self.return_from_unreachable_space(page.return_space_id, page.return_thread_id, window);
+            return;
+        };
+        if let Some(domain_id) = Mux::get()
+            .get_domain_by_name(&page.domain_name)
+            .map(|domain| domain.domain_id())
+        {
+            self.note_remote_open_intent(domain_id);
+        }
+        self.activate_workspace_thread_impl(
+            thread_id,
+            window,
+            page.orphan_candidate_window_id,
+            page.workspaces_to_kill_after_adopt,
+        );
+    }
+
+    /// Where a connection page that closes unconnected goes back to: the
+    /// thread on screen, when it is one this Space shows (its own, or a
+    /// reference or server folder thread opened in place), otherwise the
+    /// Space just left.
+    fn place_to_return_to(&self) -> (String, Option<String>) {
+        let shown_thread = self.current_mux_workspace().and_then(|workspace| {
+            crate::workspace_threads::thread_id_for_workspace(&self.active_space_id, &workspace)
+                .or_else(|| {
+                    crate::workspace_threads::origin_space_for_ref_workspace(
+                        &self.active_space_id,
+                        &workspace,
+                    )
+                    .and_then(|_| crate::workspace_threads::thread_id_for_workspace_any(&workspace))
+                })
+        });
+        if shown_thread.is_some() {
+            return (self.active_space_id.clone(), shown_thread);
+        }
+        let space_id = self
+            .previous_space_id
+            .clone()
+            .unwrap_or_else(crate::workspace_threads::default_space_id);
+        (space_id, None)
+    }
+
+    /// A remote Space with nothing left to show: go back to the Space the
+    /// window came from — or the default Space, when that one is gone,
+    /// taken, or another unreachable server — instead of closing the
+    /// window, which as the last one disconnected every server. A page
+    /// opened in place goes back to the thread it stood in for.
+    fn return_from_unreachable_space(
+        &mut self,
+        return_space_id: String,
+        return_thread_id: Option<String>,
+        window: &Window,
+    ) {
+        if return_space_id == self.active_space_id {
+            // Only while it is still there: activating it otherwise would
+            // build it again, or ask for another server.
+            let live_workspaces = Mux::get().iter_workspaces();
+            if let Some(thread_id) = return_thread_id.filter(|thread_id| {
+                crate::workspace_threads::activation_plan_for_thread(thread_id, &live_workspaces)
+                    .is_some_and(|plan| !plan.needs_materialize)
+            }) {
+                self.activate_workspace_thread(thread_id, window);
+                // Handed to another window that shows it: carry on below.
+                if Mux::get().get_window(self.mux_window_id).is_some() {
+                    return;
+                }
+            }
+        }
+        // An in-place return can lose its original thread while the
+        // server is away. It still has the same Space fallbacks -- and any
+        // local Space free for this window, for when those are all this
+        // server's own: the device's first window connected straight to it.
+        let local_spaces = crate::workspace_threads::spaces_for_window(self.space_owner_id)
+            .into_iter()
+            .filter(|space| !space.is_remote && !space.is_occupied_by_other_window)
+            .map(|space| space.id);
+        let candidates = std::iter::once(return_space_id)
+            .chain(self.previous_space_id.clone())
+            .chain(std::iter::once(crate::workspace_threads::default_space_id()))
+            .chain(local_spaces);
+        for space_id in candidates {
+            let reachable = crate::workspace_threads::client_domain_for_space(&space_id)
+                .map_or(true, |domain_name| domain_is_attached(&domain_name));
+            if space_id != self.active_space_id
+                && reachable
+                && self.switch_space_to_thread(space_id, None, window)
+            {
+                return;
+            }
+        }
+        if crate::workspace_threads::client_domain_for_space(&self.active_space_id).is_none() {
+            if let Some(thread_id) =
+                crate::workspace_threads::thread_to_recover_after_window_death(&self.active_space_id)
+            {
+                self.activate_workspace_thread(thread_id, window);
+                return;
+            }
+        }
+        // The last window, with no local Space to go to: closing it would
+        // end every connection, so a new Space of its own.
+        if front_end().gui_windows().len() <= 1 {
+            let space_id = crate::workspace_threads::create_space(None);
+            if self.switch_space_to_thread(space_id, None, window) {
+                return;
+            }
+        }
+        window.close();
+        front_end().forget_known_window(window);
     }
 
     /// The sidebar Reconnect button: bring the active Space's mux domain
@@ -6674,6 +7512,35 @@ impl TermWindow {
         else {
             return;
         };
+        // This server's connection page gave up and is still on screen: try
+        // it again, so that what it was for opens once the server answers
+        // and the failure goes with it.
+        let failed_page = self
+            .space_connection_page
+            .as_ref()
+            .filter(|page| {
+                page.gave_up
+                    && page.mux_window_id == self.mux_window_id
+                    && page.domain_name == domain_name
+            })
+            .map(|page| {
+                (
+                    page.thread_id.clone(),
+                    page.orphan_candidate_window_id,
+                    page.workspaces_to_kill_after_adopt.clone(),
+                )
+            });
+        if let (Some((thread_id, orphan_candidate_window_id, workspaces_to_kill)), Some(window)) =
+            (failed_page, self.window.clone())
+        {
+            self.activate_workspace_thread_impl(
+                thread_id,
+                &window,
+                orphan_candidate_window_id,
+                workspaces_to_kill,
+            );
+            return;
+        }
         // Renamed since it connected: the old way while that connection
         // lasts, then the new one, with the Space moved over to it first.
         let domain_name = crate::ssh_hosts::connect_name_after_rename(&domain_name);
@@ -6693,7 +7560,9 @@ impl TermWindow {
                     None => crate::connect_domain_from_ssh_host(&domain_name)?,
                 };
                 if let Some(client) = domain.downcast_ref::<ClientDomain>() {
-                    if client.is_reconnect_suspended() {
+                    // Parked, or still trying on its own: either way, try
+                    // again now.
+                    if client.is_reconnect_suspended() || client.is_reconnecting() {
                         client.resume_reconnect();
                         return anyhow::Ok(());
                     }
@@ -7047,6 +7916,7 @@ impl TermWindow {
                     | Alert::IconTitleChanged(_)
                     | Alert::Progress(_)
                     | Alert::SetUserVar { .. }
+                    | Alert::CommandFinished { .. }
                     | Alert::Bell,
             }
             | MuxNotification::PaneFocused(pane_id)
@@ -7102,7 +7972,8 @@ impl TermWindow {
                     return true;
                 }
             }
-            MuxNotification::PaneLabelChanged { pane_id, .. } => {
+            MuxNotification::PaneLabelChanged { pane_id, .. }
+            | MuxNotification::PageChanged(pane_id) => {
                 let mux = Mux::get();
                 match mux.resolve_pane_id(pane_id) {
                     Some((_domain_id, window_id, _tab_id)) if window_id == mux_window_id => {
@@ -7124,7 +7995,7 @@ impl TermWindow {
                 // contents with (or remove) the opaque handoff surface.
             }
             MuxNotification::Alert {
-                alert: Alert::ToastNotification { .. } | Alert::CommandFinished { .. },
+                alert: Alert::ToastNotification { .. },
                 ..
             }
             | MuxNotification::PaneExited { .. }
@@ -7203,6 +8074,10 @@ impl TermWindow {
     }
 
     fn sync_current_workspace_thread(&mut self) {
+        // Which thread the Space is on is for the window with its sidebar.
+        if self.dedicated_thread.is_some() {
+            return;
+        }
         let Some(workspace) = self.current_mux_workspace() else {
             return;
         };
@@ -7301,6 +8176,9 @@ impl TermWindow {
         preferred_thread: Option<String>,
         window: &Window,
     ) -> bool {
+        if self.dedicated_thread.is_some() {
+            return false;
+        }
         // Navigating elsewhere cancels the earlier window-opening intent.
         self.remote_open_intent = None;
         if self.workspace_sidebar_swipe.pending_switch_target() != Some(space_id.as_str()) {
@@ -7329,7 +8207,7 @@ impl TermWindow {
         self.clear_right_sidebar_text_focus();
         self.set_content_view_active(false);
         self.remember_workspace_sidebar_scroll();
-        self.active_space_id = space_id.clone();
+        self.previous_space_id = Some(std::mem::replace(&mut self.active_space_id, space_id.clone()));
         self.refresh_active_space_note_vault_flag();
         self.sync_content_view_surfaces_with_mux();
         self.workspace_sidebar_scroll_offset = self.remembered_workspace_sidebar_scroll();
@@ -7343,7 +8221,7 @@ impl TermWindow {
         let target_thread = preferred_thread
             .or_else(|| crate::workspace_threads::ensure_active_thread_for_space(&space_id));
         if let Some(thread_id) = target_thread {
-            self.activate_workspace_thread(thread_id, window);
+            self.show_thread_or_its_page(thread_id, window);
         } else {
             // Nothing to adopt; settle the reflow immediately.
             self.consume_pending_sidebar_reflow();
@@ -7768,11 +8646,11 @@ impl TermWindow {
         self.invalidate_window();
     }
 
-    /// Rebuild the cursor's blink state from the style chosen in Settings.
-    /// `config_was_reloaded` does this too; this is the direct route, for the
-    /// settings window, which writes the choice to its own file and never
-    /// touches the configuration.
-    pub(crate) fn refresh_cursor_blink(&mut self) {
+    /// Rebuild the cursor's blink state and shape from the style chosen in
+    /// Settings. `config_was_reloaded` does this too; this is the direct
+    /// route, for the settings window, which writes the choice to its own
+    /// file and never touches the configuration.
+    pub(crate) fn refresh_cursor_style(&mut self) {
         let (ease_in, ease_out) = crate::native_settings::cursor_blink_eases(&self.config);
         *self.cursor_blink_state.borrow_mut() = ColorEase::new(
             self.config.cursor_blink_rate,
@@ -7782,6 +8660,7 @@ impl TermWindow {
             None,
         );
         self.cursor_blinks_by_default = crate::native_settings::cursor_blinks_by_default();
+        self.cursor_shape_choice = crate::native_settings::cursor_shape_choice();
         self.invalidate_window();
     }
 
@@ -8064,6 +8943,7 @@ impl TermWindow {
             None,
         );
         self.cursor_blinks_by_default = crate::native_settings::cursor_blinks_by_default();
+        self.cursor_shape_choice = crate::native_settings::cursor_shape_choice();
         *self.blink_state.borrow_mut() = ColorEase::new(
             config.text_blink_rate,
             config.text_blink_ease_in,
@@ -8250,7 +9130,9 @@ impl TermWindow {
         // The terminal bar is part of the terminal, and the top panes' nav
         // bars rise into its band: only the window tab row is outside.
         let left = self.workspace_sidebar_width() as f32 + border.left.get() as f32;
-        let top = border.top.get() as f32 + self.tab_bar_pixel_height().unwrap_or(0.0);
+        let top = border.top.get() as f32
+            + self.window_tab_row_layout_height()
+            + self.window_tab_reveal_offset();
         let right = self.terminal_viewport_right();
         let bottom = (self.dimensions.pixel_height as f32 - border.bottom.get() as f32).max(top);
         euclid::rect(left, top, (right - left).max(0.0), (bottom - top).max(0.0))
@@ -8755,6 +9637,42 @@ impl TermWindow {
         self.show_term_context_menu(&window, euclid::point2(x as isize, y as isize), items);
     }
 
+    /// The icon menu of the Remote Hosts form, at `x`, `y`: every kind of
+    /// machine a host can be shown as, `current` ticked. `host_id` is the
+    /// host the form edits, empty for a new one.
+    pub(crate) fn show_remote_host_icon_menu(
+        &mut self,
+        host_id: String,
+        current: Option<crate::ssh_hosts::HostIcon>,
+        x: f32,
+        y: f32,
+    ) {
+        use crate::ssh_hosts::HostIcon;
+        use crate::termwindow::content_view::RemoteHostCommand;
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        self.begin_context_menu_application_actions();
+        let current = current.unwrap_or(HostIcon::Server);
+        let items = HostIcon::ALL
+            .iter()
+            .copied()
+            .map(|icon| {
+                self.context_menu_application_item_with_icon(
+                    crate::ssh_hosts::host_icon_name(icon),
+                    crate::ssh_hosts::host_menu_icon(Some(icon)),
+                    ContextMenuApplicationAction::RemoteHost {
+                        host_id: host_id.clone(),
+                        command: RemoteHostCommand::SetIcon(icon),
+                    },
+                    true,
+                )
+                .checked(icon == current)
+            })
+            .collect();
+        self.show_term_context_menu(&window, euclid::point2(x as isize, y as isize), items);
+    }
+
     /// Open the SSH hosts page on a blank host form. Unlike
     /// `toggle_ssh_hosts_view` this never closes an open page: it is reached
     /// from a menu entry worded as an action, and an action that sometimes
@@ -8898,12 +9816,16 @@ impl TermWindow {
             ClipboardPasteSource::Clipboard => ::window::Clipboard::Clipboard,
             ClipboardPasteSource::PrimarySelection => ::window::Clipboard::PrimarySelection,
         };
+        let target = self.active_content_view().map(|view| view.paste_target());
         let future = window.get_clipboard(clipboard);
         promise::spawn::spawn(async move {
             if let Ok(clip) = future.await {
                 window.notify(TermWindowNotif::Apply(Box::new(move |myself| {
+                    // Only where this paste was started: a clipboard can
+                    // answer after the focus has moved on.
                     let resp = myself
                         .content_view_mut_by_id(view_id)
+                        .filter(|v| Some(v.paste_target()) == target)
                         .map(|v| v.on_paste(&clip));
                     if let Some(resp) = resp {
                         myself.handle_content_response_for(view_id, resp);
@@ -9186,6 +10108,14 @@ impl TermWindow {
             ),
             None => window,
         }
+    }
+
+    /// The ground of a page in the terminal's place: as see-through as the
+    /// terminal's, so that going between them changes nothing behind.
+    pub(crate) fn content_view_ground(&self) -> LinearRgba {
+        self.terminal_shade
+            .unwrap_or(self.chrome().window_bg)
+            .mul_alpha(self.terminal_ground_opacity(self.config.window_background_opacity))
     }
 
     fn dark_interface(&self) -> bool {
@@ -9598,6 +10528,11 @@ impl TermWindow {
             if self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id) {
                 continue;
             }
+            // A page has no output to present and no rows to wait for: its
+            // plugin's frames ask for the paints it needs.
+            if pos.pane.is_page() {
+                continue;
+            }
             let pane_id = pos.pane.pane_id();
             let current = mux.pane_output_generation(pane_id);
             let presented = self
@@ -9731,6 +10666,7 @@ impl TermWindow {
             cell_size,
         );
         win.set_text_cursor_position(r);
+        self.text_cursor_rect = Some(r);
     }
 
     fn activate_window(&mut self, window_idx: usize) -> anyhow::Result<()> {
@@ -9949,6 +10885,7 @@ impl TermWindow {
             InlineTabRenameTarget::WindowTab(tab_id),
             initial_title,
         ));
+        self.reveal_window_tab_row_for_rename();
         self.update_title_impl();
     }
 
@@ -9988,6 +10925,19 @@ impl TermWindow {
     }
 
     fn prompt_rename_space(&mut self, space_id: String) {
+        // The name is edited in the sidebar's header: from the Library, go
+        // back to that Space's sidebar first.
+        if self.library_open() {
+            let Some(window) = self.window.clone() else {
+                return;
+            };
+            if space_id != self.active_space_id
+                && !self.switch_space_to_thread(space_id.clone(), None, &window)
+            {
+                return;
+            }
+            self.close_library(&window);
+        }
         let initial_title = crate::workspace_threads::active_space_name(&space_id)
             .unwrap_or_else(|| "Space".to_string());
         self.inline_tab_rename = Some(InlineTabRename::new(
@@ -10869,9 +11819,34 @@ impl TermWindow {
     ) -> anyhow::Result<PerformAssignmentResult> {
         use KeyAssignment::*;
 
+        self.interrupt_thread_numbers(matches!(assignment, ActivateWorkspaceThreadByIndex(_)));
+
         if let Some(modal) = self.get_modal() {
             if modal.perform_assignment(assignment, self) {
                 return Ok(PerformAssignmentResult::Handled);
+            }
+        }
+
+        if self.elsewhere_page.is_some() {
+            // Whether to quit is asked in a terminal, and there is none here.
+            if matches!(assignment, QuitApplication | QuitAndStopSessionServer) {
+                self.hand_to_thread_on_page(assignment.clone());
+                return Ok(PerformAssignmentResult::Handled);
+            }
+            if thread_window::needs_a_terminal(assignment) {
+                return Ok(PerformAssignmentResult::Handled);
+            }
+        }
+        if self.dedicated_thread.is_some() {
+            match thread_window::own_window_assignment(assignment) {
+                thread_window::OwnWindowAssignment::Perform => {}
+                thread_window::OwnWindowAssignment::HandOn => {
+                    self.hand_on_assignment(assignment.clone());
+                    return Ok(PerformAssignmentResult::Handled);
+                }
+                thread_window::OwnWindowAssignment::Ignore => {
+                    return Ok(PerformAssignmentResult::Handled);
+                }
             }
         }
 
@@ -10912,6 +11887,29 @@ impl TermWindow {
                     return Ok(PerformAssignmentResult::Handled);
                 }
                 _ => {}
+            }
+        }
+
+        // The pane holds a plugin's page. A field of the sidebar's, or a view
+        // over the terminal's area, had the clipboard first, above; here
+        // copy and paste are the page's field's, as its keys are; and what
+        // else is done to a terminal's text has nothing to be done to.
+        if pane.is_page() {
+            if let Some(page) = self.plugin_page_in_focus(pane) {
+                match assignment {
+                    CopyTo(destination) => {
+                        self.copy_from_plugin_page(page, *destination);
+                        return Ok(PerformAssignmentResult::Handled);
+                    }
+                    PasteFrom(source) => {
+                        self.paste_into_plugin_page(page, *source);
+                        return Ok(PerformAssignmentResult::Handled);
+                    }
+                    _ => {}
+                }
+            }
+            if matches!(assignment, CopyTo(_)) || ui::plugin_panel::is_about_a_terminal(assignment) {
+                return Ok(PerformAssignmentResult::Handled);
             }
         }
 
@@ -11793,6 +12791,7 @@ impl TermWindow {
                 crate::settings_window::show_from(self.mux_window_id, &self.active_space_id);
             }
             FocusPluginPanel(plugin) => self.focus_plugin_panel(plugin),
+            PluginAction(name) => self.do_plugin_action(name),
             CheckForUpdates => {
                 crate::settings_window::show_update_page_from(
                     self.mux_window_id,
@@ -11807,6 +12806,11 @@ impl TermWindow {
             }
             ToggleLiveOverview => {
                 self.toggle_live_overview_view();
+            }
+            ToggleLibrary => {
+                if let Some(window) = window.as_ref() {
+                    self.toggle_library(window);
+                }
             }
             OpenThreadSearch => {
                 self.open_thread_search();
@@ -11847,6 +12851,11 @@ impl TermWindow {
             } => {
                 if let Some(window) = self.window.as_ref().cloned() {
                     self.switch_space_to_thread(space_id.clone(), Some(thread_id.clone()), &window);
+                }
+            }
+            ActivateWorkspaceThreadByIndex(index) => {
+                if let Some(window) = self.window.as_ref().cloned() {
+                    self.activate_numbered_thread(*index, &window);
                 }
             }
             PromptInputLine(args) => self.show_prompt_input_line(args),
@@ -11955,13 +12964,21 @@ impl TermWindow {
         if let Some(link) = self.current_highlight.as_ref().cloned() {
             let window = GuiWin::new(self);
             let pane = MuxPane(pane.pane_id());
+            // Where a link that asks first puts its menu.
+            let anchor = self
+                .current_mouse_event
+                .as_ref()
+                .map(|event| event.coords)
+                .unwrap_or_else(|| ::window::Point::new(0, 0));
 
             async fn open_uri(
                 lua: Option<Rc<mlua::Lua>>,
                 window: GuiWin,
                 pane: MuxPane,
                 link: String,
+                anchor: ::window::Point,
             ) -> anyhow::Result<()> {
+                let term_window = window.window.clone();
                 let default_click = match lua {
                     Some(lua) => {
                         let args = lua.pack_multi((window, pane, link.clone()))?;
@@ -11975,14 +12992,20 @@ impl TermWindow {
                     None => true,
                 };
                 if default_click {
-                    log::info!("clicking {}", link);
-                    wezterm_open_url::open_url(&link);
+                    if link_open::classify(&link) == link_open::LinkOpen::Direct {
+                        log::info!("opening terminal link");
+                        wezterm_open_url::open_url(&link);
+                    } else {
+                        term_window.notify(TermWindowNotif::Apply(Box::new(move |myself| {
+                            myself.open_terminal_link(link, anchor);
+                        })));
+                    }
                 }
                 Ok(())
             }
 
             promise::spawn::spawn(config::with_lua_config_on_main_thread(move |lua| {
-                open_uri(lua, window, pane, link.uri().to_string())
+                open_uri(lua, window, pane, link.uri().to_string(), anchor)
             }))
             .detach();
         }
@@ -12642,6 +13665,7 @@ impl Drop for TermWindow {
             }
         }
         self.close_plugin_panel();
+        self.close_plugin_pages();
         self.clear_gui_recovery_intent();
         gpu_debug(format!(
             "drop main_window backend={} size={}x{} dpi={}",

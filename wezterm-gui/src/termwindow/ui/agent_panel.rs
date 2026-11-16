@@ -5,13 +5,17 @@
 //! probes.
 
 use crate::agent_status::{self, AgentIcon, AgentPanelAction, ProgramReport, ProgramReportState};
+use crate::tab_icons::RgbExt as _;
 use crate::native_settings::NativeThreadStatus;
 use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::right_sidebar::{
     right_sidebar_file_row_metrics, sidebar_row_element_visible, FILE_SCROLL_FADE_HEIGHT,
+    REMOTE_EMPTY_DETAIL_GAP, REMOTE_EMPTY_ICON_GAP, REMOTE_EMPTY_ICON_SIZE,
 };
-use crate::termwindow::ui::tokens::{SIDEBAR_ICON_GAP, SIDEBAR_INSET, SIDEBAR_ROW_RADIUS};
+use crate::termwindow::ui::tokens::{
+    SIDEBAR_ICON_GAP, SIDEBAR_INSET, SIDEBAR_ROW_RADIUS, TAB_ICON_GLYPH_RATIO,
+};
 use crate::termwindow::{TermWindow, TermWindowNotif, UIItem, UIItemType};
 use crate::ui::UiPalette;
 use crate::utilsprites::RenderMetrics;
@@ -19,7 +23,7 @@ use anyhow::Context;
 use mux::pane::PaneId;
 use mux::Mux;
 use std::borrow::Borrow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use wezterm_client::domain::FrontendRecoverySlot;
@@ -85,7 +89,6 @@ impl TermWindow {
         content_top: usize,
         content_width: usize,
         status: Option<&str>,
-        has_agents: bool,
     ) -> anyhow::Result<()> {
         let cell_height = ui_metrics.cell_size.height as usize;
         let button_height = self.agents_toolbar_button_height(cell_height);
@@ -107,13 +110,13 @@ impl TermWindow {
 
         // The line to the left of that button, only when there is something
         // to say: a reload acknowledgement while it lives, because it is the
-        // answer to the click that just happened, or why the list is empty.
-        // A running count would only repeat the group headings, cut short.
+        // answer to the click that just happened, or that detection is off.
+        // An empty list says so in the panel's middle instead. A running
+        // count would only repeat the group headings, cut short.
         let detection_on = agent_status::enabled();
         let line = match status {
             Some(status) => status.to_string(),
             None if !detection_on => crate::i18n::tr("right-agents-detection-off"),
-            None if !has_agents => crate::i18n::tr("right-agents-none"),
             None => String::new(),
         };
         if status.is_some() {
@@ -141,6 +144,96 @@ impl TermWindow {
                 height: button_height,
                 item_type: UIItemType::RightSidebarAgent(AgentPanelAction::OpenSettings),
             });
+        }
+        Ok(())
+    }
+
+    /// The panel with nothing in it: the tab's icon, a title and a line on
+    /// what shows up here, centred like the remote Files panel's empty state.
+    /// Agents are not all that lands in this list -- a program reporting its
+    /// progress does too -- so the words do not say "agent" alone.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_agents_empty_state(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        font_size: f64,
+        content_x: usize,
+        content_top: usize,
+        content_width: usize,
+        content_bottom: usize,
+    ) -> anyhow::Result<()> {
+        // The card titles' semibold, so the title reads as one.
+        let title_font = self
+            .fonts
+            .title_font_with_size_and_weight(font_size, 600)
+            .context("agents empty state title font")?;
+        let title_metrics = RenderMetrics::with_font_metrics(&title_font.metrics());
+        let title_h = title_metrics.cell_size.height as usize;
+        let line_h = ui_metrics.cell_size.height as usize;
+        let icon_size = self.ui_px(REMOTE_EMPTY_ICON_SIZE);
+        let icon_gap = self.ui_px(REMOTE_EMPTY_ICON_GAP);
+        let detail_gap = self.ui_px(REMOTE_EMPTY_DETAIL_GAP);
+        // Narrower than the panel, so the explanation sets as a short block
+        // instead of running edge to edge.
+        let text_width = content_width
+            .saturating_sub(self.ui_px(SIDEBAR_INSET) * 4)
+            .max(1);
+
+        let title = crate::i18n::tr("right-agents-empty-title");
+        let detail = crate::i18n::tr("right-agents-empty-detail");
+        let (title_lines, detail_lines) = {
+            let wrap = |font: &Rc<LoadedFont>, text: &str| {
+                wrap_at_line_breaks(text, |line| {
+                    self.sidebar_text_width(font, line).unwrap_or(f32::MAX) <= text_width as f32
+                })
+            };
+            (wrap(&title_font, &title), wrap(ui_font, &detail))
+        };
+
+        let block_h = icon_size
+            + icon_gap
+            + title_lines.len() * title_h
+            + detail_gap
+            + detail_lines.len() * line_h;
+        // Centre in the panel, but never above its top edge when short.
+        let available = content_bottom.saturating_sub(content_top);
+        let mut y = content_top + available.saturating_sub(block_h) / 2;
+
+        let icon_x = content_x + content_width.saturating_sub(icon_size) / 2;
+        // Faint, like the line under the title: the title is what reads first.
+        self.paint_sidebar_icon(layers, SvgIcon::Eye, icon_x, y, icon_size, chrome.muted_text)?;
+        y += icon_size + icon_gap;
+
+        for line in &title_lines {
+            self.paint_remote_files_centered_text(
+                layers,
+                &title_font,
+                title_metrics,
+                line,
+                content_x,
+                y,
+                content_width,
+                foreground,
+            )?;
+            y += title_h;
+        }
+        y += detail_gap;
+        for line in &detail_lines {
+            self.paint_remote_files_centered_text(
+                layers,
+                ui_font,
+                ui_metrics,
+                line,
+                content_x,
+                y,
+                content_width,
+                chrome.muted_text,
+            )?;
+            y += line_h;
         }
         Ok(())
     }
@@ -187,11 +280,7 @@ impl TermWindow {
             self.right_sidebar_agents_list = None;
             self.right_sidebar_agents_fitted.clear();
             self.right_sidebar_agents_open_subtasks.clear();
-            // Nothing but the toolbar: an empty-state card here is a large
-            // bordered box explaining that a list is empty, which the
-            // toolbar line already says in one row. The panel reads as
-            // quiet rather than broken.
-            return self.paint_agents_toolbar(
+            self.paint_agents_toolbar(
                 layers,
                 ui_font,
                 ui_metrics,
@@ -202,8 +291,24 @@ impl TermWindow {
                 content_top,
                 content_width,
                 status.as_deref(),
-                has_agents,
-            );
+            )?;
+            // With detection off the toolbar line says so and leads to the
+            // switch; there is nothing to wait for, so no empty state.
+            if agent_status::enabled() {
+                self.paint_agents_empty_state(
+                    layers,
+                    ui_font,
+                    ui_metrics,
+                    chrome,
+                    foreground,
+                    font_size,
+                    content_x,
+                    content_top,
+                    content_width,
+                    content_bottom,
+                )?;
+            }
+            return Ok(());
         }
 
         // The view menu's choices: what is hidden, then how the rest is
@@ -273,6 +378,11 @@ impl TermWindow {
         };
         // Its colours are blended once a frame, not once a glyph: steps this
         // fine are closer than the eye tells apart across a band this narrow.
+        // How each server the agents run on is reached, asked once a frame.
+        let mut reach: HashMap<
+            mux::domain::DomainId,
+            crate::termwindow::ui::sidebar::SpaceConnectionState,
+        > = HashMap::new();
         let shimmer_ramp: [LinearRgba; SHIMMER_RAMP_STEPS] = std::array::from_fn(|step| {
             crate::ui::color::mix(
                 muted_fg,
@@ -380,6 +490,9 @@ impl TermWindow {
                 muted_fg,
             )?;
         }
+        // Grouped by state, the heading over a row already names its state.
+        let under_state_heading =
+            view.group_by() == crate::native_settings::AgentsGroupBy::State;
         // The walk starts at the first entry that reaches into view and
         // stops below it, so the rows above and below cost nothing.
         let first = list.ends.partition_point(|&end| end as f32 <= scroll);
@@ -522,7 +635,7 @@ impl TermWindow {
             let icon_y = title_mid.saturating_sub(icon_size / 2);
             let brand = brand_of(agent);
             if visible(icon_y, icon_size) {
-                self.paint_agent_mark(layers, brand, icon_x, icon_y, icon_size, muted_fg)?;
+                self.paint_agent_mark(layers, agent, icon_x, icon_y, icon_size, muted_fg)?;
             }
 
             let shown = agent.shown_state();
@@ -590,7 +703,8 @@ impl TermWindow {
             // Under the title: what it is doing, then where. The state icon
             // already says the state, so the words only stand in for it
             // when there is no icon, or nothing else to put on the line --
-            // and for Idle, whose check differs from Done's only in colour.
+            // and for Idle, whose check differs from Done's only in colour,
+            // unless the heading over it says Idle already.
             let mut line_y = title_y + cell_height + line_gap;
             if let Some(report) = agent.report.as_ref().filter(|_| layout.message) {
                 if visible(line_y, cell_height) {
@@ -646,7 +760,7 @@ impl TermWindow {
             // The thread's human name, resolved once per snapshot -- never the
             // internal workspace id, and never a per-frame store walk.
             let place_line = if has_state_icon
-                && shown != agent_status::ShownState::Idle
+                && (shown != agent_status::ShownState::Idle || under_state_heading)
                 && !agent.place.is_empty()
             {
                 agent.place.clone()
@@ -659,14 +773,77 @@ impl TermWindow {
                 }
             };
             if visible(line_y, cell_height) {
+                // Where it runs, before the words: this device or a server,
+                // with a light on it while that machine is reached -- green,
+                // or amber while it is being reached again -- and crossed
+                // out when it is not.
+                use crate::termwindow::ui::sidebar::SpaceConnectionState as Reach;
+                let local = agent.machine.is_empty();
+                let reached = Mux::get().get_pane(agent.pane_id).map(|pane| {
+                    let domain_id = pane.domain_id();
+                    *reach
+                        .entry(domain_id)
+                        .or_insert_with(|| self.machine_reach(domain_id))
+                });
+                let machine_icon = match (local, reached == Some(Reach::Disconnected)) {
+                    (true, false) => SvgIcon::Laptop,
+                    (true, true) => SvgIcon::LaptopOff,
+                    (false, false) => SvgIcon::Server,
+                    (false, true) => SvgIcon::ServerOff,
+                };
+                let machine_size = (cell_height * 4 / 5).max(1);
+                let machine_y = line_y + (cell_height - machine_size) / 2;
+                self.paint_sidebar_icon(
+                    layers,
+                    machine_icon,
+                    text_x,
+                    machine_y,
+                    machine_size,
+                    muted_fg,
+                )?;
+                let light = match reached {
+                    Some(Reach::Connected) => Some(crate::thread_marks::FINISHED_COLOR),
+                    Some(Reach::Connecting | Reach::Reconnecting) => {
+                        Some(crate::thread_marks::WAITING_COLOR)
+                    }
+                    Some(Reach::Disconnected) | None => None,
+                };
+                if let Some(color) = light {
+                    // On the drawing's own corner -- the laptop's screen, the
+                    // server's top box -- as a light sits on a device; in
+                    // 24ths of the icon, as lucide draws them.
+                    let (corner_x, corner_y) = if local {
+                        (19.5, 5.5)
+                    } else {
+                        (21.0, 3.0)
+                    };
+                    let dot = (machine_size * 2 / 5).max(3) as f32;
+                    let center_x = text_x as f32 + machine_size as f32 * corner_x / 24.0;
+                    let center_y = machine_y as f32 + machine_size as f32 * corner_y / 24.0;
+                    self.fill_rounded_rectangle(
+                        layers,
+                        2,
+                        euclid::rect(
+                            (center_x - dot / 2.0).round(),
+                            (center_y - dot / 2.0).round(),
+                            dot,
+                            dot,
+                        ),
+                        color,
+                        dot / 2.0,
+                    )
+                    .context("agent machine dot")?;
+                }
+                // A full gap: the dot stands out past the icon's edge.
+                let label_x = text_x + machine_size + metrics.icon_gap;
                 self.paint_agent_text(
                     layers,
                     ui_font,
                     ui_metrics,
                     &place_line,
-                    text_x,
+                    label_x,
                     line_y,
-                    text_width,
+                    text_right.saturating_sub(label_x),
                     muted_fg,
                 )?;
             }
@@ -908,7 +1085,6 @@ impl TermWindow {
             content_top,
             content_width,
             status.as_deref(),
-            has_agents,
         )?;
         if scrolled {
             let fade_height = self
@@ -925,6 +1101,27 @@ impl TermWindow {
         }
 
         Ok(())
+    }
+
+    /// How the server a pane lives on is reached: a pane of this process
+    /// always is. Read as the panel paints, which asks for no frame of its
+    /// own: a light that changes shows at the next.
+    fn machine_reach(
+        &self,
+        domain_id: mux::domain::DomainId,
+    ) -> crate::termwindow::ui::sidebar::SpaceConnectionState {
+        use crate::termwindow::ui::sidebar::SpaceConnectionState;
+        let Some(domain) = Mux::get().get_domain(domain_id) else {
+            return SpaceConnectionState::Disconnected;
+        };
+        if domain
+            .downcast_ref::<wezterm_client::domain::ClientDomain>()
+            .is_none()
+        {
+            return SpaceConnectionState::Connected;
+        }
+        let remote = !crate::local_sessions::is_host_domain_id(domain_id);
+        self.domain_reach(domain.domain_name(), remote)
     }
 
     /// An open sub-task list lasts as long as its sub-tasks, so the next
@@ -1100,23 +1297,87 @@ impl TermWindow {
         Ok(fitted)
     }
 
-    /// An agent's mark: its brand's when it has one, a robot when not.
+    /// A program's mark: its brand's when it has one, otherwise the card its
+    /// pane's tab shows, so a program reporting its status without a logo of
+    /// its own -- a build, a download -- looks the same in both places.
     pub(crate) fn paint_agent_mark(
         &self,
         layers: &mut TripleLayerQuadAllocator,
-        brand: Option<AgentIcon>,
+        agent: &agent_status::AgentPaneStatus,
         x: usize,
         y: usize,
         size: usize,
         mono: LinearRgba,
     ) -> anyhow::Result<()> {
-        match brand {
+        self.paint_agent_mark_faded(layers, agent, x, y, size, mono, 1.0)
+    }
+
+    /// `paint_agent_mark`, `alpha` of the way there, for a mark fading in
+    /// or out with what it stands beside. `mono` carries its own alpha.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_agent_mark_faded(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        agent: &agent_status::AgentPaneStatus,
+        x: usize,
+        y: usize,
+        size: usize,
+        mono: LinearRgba,
+        alpha: f32,
+    ) -> anyhow::Result<()> {
+        match brand_of(agent) {
             Some(AgentIcon::Color(brand)) => {
-                self.paint_sidebar_brand_icon(layers, brand, x, y, size)
+                self.paint_sidebar_brand_icon_faded(layers, brand, x, y, size, alpha)
             }
             Some(AgentIcon::Mono(icon)) => self.paint_sidebar_icon(layers, icon, x, y, size, mono),
-            None => self.paint_sidebar_icon(layers, SvgIcon::Bot, x, y, size, mono),
+            None => self.paint_pane_card_faded(layers, agent.pane_id, x, y, size, alpha),
         }
+    }
+
+    /// The card `pane_id`'s tab shows, `size` pixels square, `alpha` of the
+    /// way there: the terminal's when the pane is not in this process.
+    pub(crate) fn paint_pane_card_faded(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        pane_id: PaneId,
+        x: usize,
+        y: usize,
+        size: usize,
+        alpha: f32,
+    ) -> anyhow::Result<()> {
+        if alpha <= 0.001 {
+            return Ok(());
+        }
+        let icon = Mux::get()
+            .get_pane(pane_id)
+            .map(|pane| crate::tab_icons::resolve(pane.as_ref()))
+            .unwrap_or_else(|| crate::tab_icons::catalog().terminal_card().resolved());
+        let gl_state = self.render_state.as_ref().unwrap();
+        let ctx = crate::ui::draw::DrawContext::new(gl_state, self.dimensions, &self.render_metrics);
+        crate::tab_icons::draw_plate_faded(
+            &ctx,
+            layers,
+            1,
+            x as f32,
+            y as f32,
+            size as f32,
+            icon.circle,
+            self.chrome().is_dark(),
+            alpha,
+        )
+        .context("program card")?;
+        let glyph = ((size as f32 * TAB_ICON_GLYPH_RATIO).round() as usize).clamp(1, size.max(1));
+        crate::tab_icons::draw_glyph(
+            &ctx,
+            layers,
+            2,
+            &icon.glyph,
+            (x + (size - glyph) / 2) as f32,
+            (y + (size - glyph) / 2) as f32,
+            glyph as f32,
+            icon.glyph_color.linear().mul_alpha(alpha),
+        )
+        .context("program card glyph")
     }
 
     /// A progress bar: its track, and the share done over it once that is
@@ -1248,8 +1509,8 @@ impl TermWindow {
 
     /// The view menu: what to show (by state, and by machine once there is
     /// more than one), how to group and order it, and which parts of a
-    /// program's report to show -- the same four switches as Settings ›
-    /// Agents, ticked and without icons -- and reloading the detection rules.
+    /// program's report to show, ticked and without icons -- and reloading
+    /// the detection rules.
     fn agents_view_options_menu_items(&mut self) -> Vec<window::ContextMenuItem> {
         use crate::native_settings::{AgentStatusPart, AgentsGroupBy, AgentsSortBy};
         use crate::termwindow::ContextMenuApplicationAction as Action;
@@ -1546,7 +1807,7 @@ impl TermWindow {
 
     /// Whether activating `workspace`'s thread here would hand it to another
     /// window already showing it: the check `activate_workspace_thread` makes.
-    fn workspace_shown_elsewhere(&self, workspace: &str) -> bool {
+    pub(crate) fn workspace_shown_elsewhere(&self, workspace: &str) -> bool {
         crate::workspace_threads::window_to_show_in_workspace(workspace).is_some_and(|target| {
             target != self.mux_window_id
                 && crate::frontend::front_end()
@@ -2168,9 +2429,45 @@ fn agent_row_visible_band(
     })
 }
 
+/// `text` as lines that each `fits`, broken where Unicode allows: between
+/// words, and between the characters of a script written without spaces, so
+/// Chinese and Japanese wrap as evenly as English and no line starts with
+/// "，". A piece too wide for a line on its own is left whole.
+fn wrap_at_line_breaks(text: &str, mut fits: impl FnMut(&str) -> bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line_start = 0;
+    let mut last_break = 0;
+    for (at, _) in unicode_linebreak::linebreaks(text) {
+        if last_break > line_start && !fits(text[line_start..at].trim_end()) {
+            lines.push(text[line_start..last_break].trim_end().to_string());
+            line_start = last_break;
+        }
+        last_break = at;
+    }
+    if line_start < text.len() {
+        lines.push(text[line_start..].trim_end().to_string());
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{agent_row_visible_band, AgentRowBand, ShimmerBand};
+    use super::{agent_row_visible_band, wrap_at_line_breaks, AgentRowBand, ShimmerBand};
+
+    #[test]
+    fn chinese_wraps_between_characters_and_never_starts_a_line_with_a_comma() {
+        // Eight characters a line, whatever the script.
+        let lines = wrap_at_line_breaks("在终端里运行程序，它们会显示在这里。", |line| {
+            line.chars().count() <= 8
+        });
+        assert_eq!(lines, ["在终端里运行程", "序，它们会显示在", "这里。"]);
+    }
+
+    #[test]
+    fn english_wraps_between_words() {
+        let lines = wrap_at_line_breaks("show up here once they run", |line| line.len() <= 12);
+        assert_eq!(lines, ["show up here", "once they", "run"]);
+    }
 
     const H: usize = 52;
     const TOP: usize = 100;

@@ -495,6 +495,14 @@ pub(crate) struct RemoteTransfer {
     /// empty; every retryable remote transfer must have both `source` and
     /// `origin`.
     pub origin: Option<RemoteOperationOrigin>,
+    /// Where a download landed. Set when the destination is known — at start
+    /// for a single file, once the tree has been reserved for a folder — so
+    /// the finished card can open it. `None` for every other kind of transfer.
+    pub destination: Option<PathBuf>,
+    /// The remote path an upload will occupy, when it is known. Used by the
+    /// finished card for "Uploaded to …" and Copy Path; `None` for downloads
+    /// and for a folder upload that never got as far as naming itself.
+    pub remote_destination: Option<RemotePath>,
 }
 
 impl RemoteTransfer {
@@ -669,7 +677,11 @@ pub(crate) trait RemoteFileBackend: Send + Sync {
         overwrite: bool,
     ) -> TransferFuture {
         let _ = (local, remote, progress, overwrite);
-        Box::pin(async { Err(TransferFailure::new("This connection cannot upload files")) })
+        Box::pin(async {
+            Err(TransferFailure::new(crate::i18n::tr(
+                "remote-files-cannot-upload",
+            )))
+        })
     }
 
     /// Create a remote directory, treating "it is already a directory" as
@@ -682,7 +694,7 @@ pub(crate) trait RemoteFileBackend: Send + Sync {
     /// told apart from a permission problem.
     fn create_directory(&self, remote: RemotePath) -> RemoteFuture<()> {
         let _ = remote;
-        Box::pin(async { Err("This connection cannot create directories".to_string()) })
+        Box::pin(async { Err(crate::i18n::tr("remote-files-cannot-create-folders")) })
     }
 
     /// Fetch `remote` into `local`, returning the number of bytes written.
@@ -694,9 +706,9 @@ pub(crate) trait RemoteFileBackend: Send + Sync {
     ) -> TransferFuture {
         let _ = (remote, local, progress);
         Box::pin(async {
-            Err(TransferFailure::new(
-                "This connection cannot download files",
-            ))
+            Err(TransferFailure::new(crate::i18n::tr(
+                "remote-files-cannot-download",
+            )))
         })
     }
 
@@ -714,9 +726,9 @@ pub(crate) trait RemoteFileBackend: Send + Sync {
     ) -> TransferFuture {
         let _ = (remote, sink, progress);
         Box::pin(async {
-            Err(TransferFailure::new(
-                "This connection cannot download files",
-            ))
+            Err(TransferFailure::new(crate::i18n::tr(
+                "remote-files-cannot-download",
+            )))
         })
     }
 
@@ -734,7 +746,7 @@ pub(crate) trait RemoteFileBackend: Send + Sync {
     /// `upload_file`: only a backend that can actually delete should claim to.
     fn remove_file(&self, remote: RemotePath) -> RemoteFuture<()> {
         let _ = remote;
-        Box::pin(async { Err("This connection cannot delete files".to_string()) })
+        Box::pin(async { Err(crate::i18n::tr("remote-files-cannot-delete-files")) })
     }
 
     /// Delete an EMPTY remote directory. Recursion is the caller's job: the
@@ -742,7 +754,7 @@ pub(crate) trait RemoteFileBackend: Send + Sync {
     /// its per-directory round trips and its cancellation points.
     fn remove_directory(&self, remote: RemotePath) -> RemoteFuture<()> {
         let _ = remote;
-        Box::pin(async { Err("This connection cannot delete folders".to_string()) })
+        Box::pin(async { Err(crate::i18n::tr("remote-files-cannot-delete-folders")) })
     }
 
     /// Rename `from` to `to` WITHOUT overwriting: a `to` that already exists
@@ -751,7 +763,7 @@ pub(crate) trait RemoteFileBackend: Send + Sync {
     /// check followed by a potentially-overwriting rename.
     fn rename(&self, from: RemotePath, to: RemotePath) -> RemoteFuture<()> {
         let _ = (from, to);
-        Box::pin(async { Err("This connection cannot rename".to_string()) })
+        Box::pin(async { Err(crate::i18n::tr("remote-files-cannot-rename")) })
     }
 
     /// Create a remote directory, failing if ANYTHING already has that name.
@@ -759,7 +771,7 @@ pub(crate) trait RemoteFileBackend: Send + Sync {
     /// "New Folder" must mint something new, never adopt a neighbour.
     fn create_directory_exclusive(&self, remote: RemotePath) -> RemoteFuture<()> {
         let _ = remote;
-        Box::pin(async { Err("This connection cannot create directories".to_string()) })
+        Box::pin(async { Err(crate::i18n::tr("remote-files-cannot-create-folders")) })
     }
 
     /// Runs `command`, a line for the remote user's shell, keeping at most
@@ -768,13 +780,13 @@ pub(crate) trait RemoteFileBackend: Send + Sync {
     /// default refuses, as the other operations beyond reading do.
     fn run(&self, command: String, limit: usize, wait: Duration) -> RemoteFuture<RemoteRun> {
         let _ = (command, limit, wait);
-        Box::pin(async { Err("This connection cannot run programs".to_string()) })
+        Box::pin(async { Err(crate::i18n::tr("remote-files-cannot-run")) })
     }
 
     /// What is at `path`, a link not followed: `None` when nothing is.
     fn stat(&self, path: String) -> RemoteFuture<Option<RemoteStat>> {
         let _ = path;
-        Box::pin(async { Err("This connection cannot look at files".to_string()) })
+        Box::pin(async { Err(crate::i18n::tr("remote-files-cannot-look")) })
     }
 
     /// Every file under `root` for search, listed on the remote host by
@@ -808,16 +820,34 @@ const REMOTE_LISTING_GRACE_SECS: u64 = 15;
 /// A listing given up on. The remote may ignore the hangup sent after it, in
 /// which case its reader stays blocked until the connection goes, so this is
 /// not retried as the query changes.
-pub(crate) const REMOTE_LISTING_TIMED_OUT: &str = "The remote file listing timed out";
-const REMOTE_LISTING_EXEC_FAILED: &str = "Unable to run the remote file listing";
-const REMOTE_LISTING_READ_FAILED: &str = "Reading the remote file listing failed";
+/// These three are told apart by their words. A failure is kept while the
+/// language may change, so it is recognized in every language.
+pub(crate) fn remote_listing_timed_out() -> String {
+    crate::i18n::tr("remote-files-listing-timed-out")
+}
+pub(crate) fn remote_listing_is_timed_out(message: &str) -> bool {
+    thinkterm_i18n::tr_every_locale("remote-files-listing-timed-out")
+        .iter()
+        .any(|text| message == text)
+}
+fn remote_listing_failed_with(message: &str, id: &str) -> bool {
+    thinkterm_i18n::tr_every_locale(id)
+        .iter()
+        .any(|text| message.starts_with(text.as_str()))
+}
+fn remote_listing_exec_failed() -> String {
+    crate::i18n::tr("remote-files-listing-exec-failed")
+}
+fn remote_listing_read_failed() -> String {
+    crate::i18n::tr("remote-files-listing-read-failed")
+}
 
 /// Whether a listing failure came from the connection itself rather than
 /// from what the remote printed. Only those may retire the pooled connection:
 /// the remote's own words, a stray "broken pipe" among them, must not.
 pub(crate) fn remote_listing_failure_is_transport(message: &str) -> bool {
-    message.starts_with(REMOTE_LISTING_EXEC_FAILED)
-        || message.starts_with(REMOTE_LISTING_READ_FAILED)
+    remote_listing_failed_with(message, "remote-files-listing-exec-failed")
+        || remote_listing_failed_with(message, "remote-files-listing-read-failed")
 }
 
 /// Quote `value` for a POSIX shell: the command line an ssh exec runs goes
@@ -963,9 +993,11 @@ fn interpret_remote_listing(
     }
     let detail = stderr.trim();
     Err(if detail.is_empty() {
-        "The remote host did not return a file listing".to_string()
+        crate::i18n::tr("remote-files-listing-empty")
     } else {
-        format!("The remote host could not list files: {detail}")
+        let mut args = fluent_bundle::FluentArgs::new();
+        args.set("detail", detail.to_string());
+        crate::i18n::tr_args("remote-files-listing-refused", &args)
     })
 }
 
@@ -990,11 +1022,11 @@ fn run_remote_listing(
     let read = (&mut stdout)
         .take(REMOTE_LISTING_MAX_BYTES + 1)
         .read_to_end(&mut out)
-        .map_err(|err| format!("{REMOTE_LISTING_READ_FAILED}: {err}"));
+        .map_err(|err| format!("{}: {err}", remote_listing_read_failed()));
     if read.is_err() || out.len() as u64 > REMOTE_LISTING_MAX_BYTES {
         let _ = child.kill();
         drain_remote(stdout);
-        let failed = read.and(Err("The remote file listing is too large".to_string()));
+        let failed = read.and(Err(crate::i18n::tr("remote-files-listing-too-large")));
         return (failed, true);
     }
     let err = stderr.join().unwrap_or_default();
@@ -1338,7 +1370,7 @@ impl RemoteFileBackend for SftpRemoteFileBackend {
             } = session
                 .exec(&command, None)
                 .await
-                .map_err(|err| format!("{REMOTE_LISTING_EXEC_FAILED}: {err:#}"))?;
+                .map_err(|err| format!("{}: {err:#}", remote_listing_exec_failed()))?;
             // The remote walk stops itself at its time limit, but only between
             // entries; one stuck on a dead mount must not hold the search.
             let mut killer = portable_pty::ChildKiller::clone_killer(&child);
@@ -1349,7 +1381,7 @@ impl RemoteFileBackend for SftpRemoteFileBackend {
                 ))
                 .await;
                 let _ = killer.kill();
-                (Err(REMOTE_LISTING_TIMED_OUT.to_string()), true)
+                (Err(remote_listing_timed_out()), true)
             };
             let (listing, killed) = smol::future::or(listing, timeout).await;
             close_remote_exec(stdin, killed);
@@ -1953,7 +1985,9 @@ impl RemoteFileConnector for SshRemoteFileConnector {
                     SessionEvent::HostVerificationFailed(failed) => {
                         return Err(format!("SSH host verification failed: {failed}"));
                     }
-                    SessionEvent::Error(err) => return Err(format!("SSH error: {err}")),
+                    SessionEvent::Error(err) | SessionEvent::AuthenticationRefused(err) => {
+                        return Err(format!("SSH error: {err}"))
+                    }
                     SessionEvent::Authenticated => {
                         let backend: Arc<dyn RemoteFileBackend> = Arc::new(SftpRemoteFileBackend {
                             sftp: session.sftp(),

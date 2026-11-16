@@ -154,6 +154,12 @@ impl Process {
             // server with `--prefer-mux`.
             .env_remove("WEZTERM_PANE")
             .env_remove("WEZTERM_UNIX_SOCKET");
+        // The command line shipped beside the host, which reaches the
+        // terminal beside a panel (`Env::terminal`): a plugin need not
+        // find it on a PATH ThinkTerm was started with.
+        if let Some(cli) = cli_program() {
+            command.env("THINKTERM_CLI", cli);
+        }
         #[cfg(windows)]
         {
             // The host has no console; a console program would open one.
@@ -531,6 +537,18 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
         builder.mode(0o700);
     }
     builder.create(dir)
+}
+
+/// The `thinkterm` program beside this one, whose `cli` a plugin runs.
+fn cli_program() -> Option<PathBuf> {
+    let name = if cfg!(windows) {
+        "thinkterm.exe"
+    } else {
+        "thinkterm"
+    };
+    let exe = std::env::current_exe().ok()?;
+    let exe = exe.canonicalize().unwrap_or(exe);
+    Some(exe.with_file_name(name)).filter(|cli| cli.is_file())
 }
 
 #[cfg(test)]

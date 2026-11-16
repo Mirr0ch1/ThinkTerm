@@ -29,6 +29,7 @@ rangeset.workspace = true
 smol.workspace = true
 termwiz.workspace = true
 thinkterm-proto.workspace = true
+thinkterm-reverse-access = { path = "../thinkterm-reverse-access" }
 thinkterm-session.workspace = true
 thinkterm-update.workspace = true
 thiserror.workspace = true
@@ -41,6 +42,9 @@ wezterm-uds.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[target."cfg(unix)".dependencies]
+nix = { workspace = true, features = ["user"] }
 
 [target."cfg(windows)".dependencies]
 winapi = { workspace=true, features = [

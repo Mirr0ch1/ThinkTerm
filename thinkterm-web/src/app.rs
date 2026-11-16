@@ -23,6 +23,7 @@ use thinkterm_render::pipeline::GpuTexture;
 use thinkterm_render::quad::HeapQuadAllocator;
 use thinkterm_render::vertex::Vertex;
 use thinkterm_session::pane::PaneSession;
+use crate::plugin_panel::ViewPlace;
 use thinkterm_plugin_channel::registry as plugins_api;
 use thinkterm_snippets::wire as snippets_wire;
 use wezterm_term::color::ColorPalette;
@@ -142,6 +143,14 @@ fn tab_places(layout: &codec::ListPanesResponse, pane_id: PaneId) -> Option<Vec<
         return Some(vec![Place { left: 0, top: 0, ..place(zoomed) }]);
     }
     (!entries.is_empty()).then(|| entries.iter().map(place).collect())
+}
+
+/// The tab that holds `pane_id`, and whether a pane of it is zoomed.
+fn tab_of(layout: &codec::ListPanesResponse, pane_id: PaneId) -> Option<(TabId, bool)> {
+    let tab = crate::layout::tab_containing(layout, pane_id)?;
+    let (_, tab_id) = tab.window_and_tab_ids()?;
+    let zoomed = crate::layout::leaves(tab).iter().any(|entry| entry.is_zoomed_pane);
+    Some((tab_id, zoomed))
 }
 
 /// A pane's whole screen, for a thumbnail with the terminal's shape: every
@@ -266,6 +275,8 @@ pub struct ThreadView {
     pub project_id: String,
     pub status: crate::tree::Status,
     pub dot: crate::tree::Dot,
+    /// A program in it stopped on an error (`ThreadRow::failed`).
+    pub failed: bool,
     pub live: bool,
     pub pinned: bool,
     pub unread: bool,
@@ -387,6 +398,53 @@ struct Hit {
     y_off: isize,
 }
 
+/// The rows a pane that holds a plugin's page shows where the page is not
+/// drawn over them: `rows` of `cols` cells, with the page's name and, under
+/// it, where to see it, in the middle. The name keeps to a line, cut to the
+/// width there is; the rest is broken into as many lines as it takes, where
+/// a plugin's own text is broken, and the last of them go when there are
+/// more than there are rows.
+fn page_placeholder(title: &str, cols: usize, rows: usize) -> Vec<termwiz::surface::Line> {
+    use termwiz::cell::{unicode_column_width, CellAttributes};
+    use termwiz::surface::{Line, SEQ_ZERO};
+    let wide = |c: char| unicode_column_width(c.encode_utf8(&mut [0; 4]), None);
+    let centred = |text: &str| {
+        let mut shown = String::new();
+        let mut width = 0;
+        for c in text.chars() {
+            if width + wide(c) > cols {
+                break;
+            }
+            width += wide(c);
+            shown.push(c);
+        }
+        let indent = " ".repeat((cols - width) / 2);
+        Line::from_text(&format!("{indent}{shown}"), &CellAttributes::default(), SEQ_ZERO, None)
+    };
+    let mut said = vec![title.to_string()];
+    if cols > 0 {
+        said.extend(thinkterm_plugin_panel::wrap::cells(&tr("plugin-page-placeholder"), cols, wide));
+    }
+    let top = rows.saturating_sub(said.len()) / 2;
+    (0..rows)
+        .map(|row| match row.checked_sub(top).and_then(|at| said.get(at)) {
+            Some(text) => centred(text),
+            None => Line::with_width(cols, SEQ_ZERO),
+        })
+        .collect()
+}
+
+/// A plugin's page the browser page shows in the place of a pane.
+struct PluginPage {
+    /// The room the page gave it, its fonts and theme.
+    env: thinkterm_plugin_panel::Env,
+    /// Whether its plugin ran, by the list of plugins as last looked at.
+    usable: bool,
+    /// The view, once the pane is known to be a page and the way to the
+    /// plugin host is there.
+    model: Option<crate::plugin_panel::PanelModel>,
+}
+
 pub struct PaneCell<P: Platform, L: Link> {
     pub session: Arc<PaneSession<AppHost<P, L>>>,
     pub scroll_from_bottom: usize,
@@ -396,6 +454,11 @@ pub struct PaneCell<P: Platform, L: Link> {
     /// which is the only position stepped mode ever holds and the only
     /// one either end of the scrollback allows.
     pub scroll_px: f32,
+    /// The part of a row a wheel has moved without yet making a notch for
+    /// the program that has the screen, and when the wheel last moved
+    /// (`viewport::wheel_notches`).
+    pub wheel_kept: f64,
+    pub wheel_at: f64,
     pub selection: Option<Selection>,
     /// The pane's own colours (OSC 4/10/11), pushed as `SetApplicationPalette`,
     /// exactly as they arrived. `None` means the base palette shows through.
@@ -419,6 +482,8 @@ impl<P: Platform, L: Link> PaneCell<P, L> {
             session,
             scroll_from_bottom: 0,
             scroll_px: 0.0,
+            wheel_kept: 0.0,
+            wheel_at: f64::NEG_INFINITY,
             selection: None,
             application: None,
             palette: ColorPalette::default(),
@@ -486,6 +551,11 @@ pub struct Inner<P: Platform, L: Link> {
     server_palette: Option<ColorPalette>,
     /// A scheme this browser picked, which outranks the server's.
     chosen_palette: Option<ColorPalette>,
+    /// The appearance's own scheme, for a server whose configuration chose
+    /// none -- a light one on a light screen, as the desktop takes its
+    /// light default then -- and the scheme such a server's palette is
+    /// besides the built-in one (`settings::server_chose_none`).
+    fallback_palette: Option<(ColorPalette, Option<ColorPalette>)>,
     /// The background last published on the canvas as `data-bg`.
     published_bg: Option<String>,
     /// Word/line selection extends by units; the pointer is down.
@@ -506,6 +576,18 @@ pub struct Inner<P: Platform, L: Link> {
     claimed_layout: Option<crate::layout::TabLayout>,
     /// When `claimed_layout` was claimed, on the platform's clock.
     claimed_at: f64,
+    /// A zoom asked of the server and drawn already (`zoom_ahead`): the
+    /// tab, the pane zoomed or none, and when. A listing that still says
+    /// otherwise is the server's word from before it heard, and is let
+    /// pass, until one agrees or `ZOOM_PATIENCE_MS` is up.
+    zoom_ahead: Option<(TabId, Option<PaneId>, f64)>,
+    /// The tab this client zoomed to show one pane at a time
+    /// (`Platform::one_pane`) and the pane it shows so: put back as it
+    /// was when the client leaves the tab.
+    one_pane_tab: Option<(TabId, PaneId)>,
+    /// The tab last asked to show its focused pane alone, and when: not
+    /// asked again at every listing while the server makes up its mind.
+    one_pane_asked: Option<(TabId, f64)>,
     /// A divider claim on the wire, and the step that arrived meanwhile
     /// to send when it answers: one round trip at a time, the newest
     /// position wins.
@@ -542,6 +624,13 @@ pub struct Inner<P: Platform, L: Link> {
     /// says after enough of them.
     reconnect_delay: f64,
     reconnect_pending: bool,
+    /// Bumped to drop an attempt waiting its turn (`reconnect_now`).
+    reconnect_epoch: u64,
+    /// An attempt is on the wire.
+    reconnect_running: bool,
+    /// Asked to hurry while an attempt was on the wire: if it fails, the
+    /// next one goes at once.
+    reconnect_hurry: bool,
     /// The cursor blink's phase, while `cursor_blink` is on: shown, or not.
     blink_shown: bool,
     /// The blink's tick runs once started; it does nothing while off.
@@ -627,6 +716,10 @@ pub struct Inner<P: Platform, L: Link> {
     /// once it has: the page gives it room while it is asked for.
     plugin_extended: Option<crate::plugin_panel::PanelModel>,
     plugin_extended_env: Option<thinkterm_plugin_panel::Env>,
+    /// The plugins' pages on show, each in the place of a pane, by pane:
+    /// one for as long as the page says it shows that pane's place, so as
+    /// many as there are page panes on the screen.
+    plugin_pages: std::collections::HashMap<PaneId, PluginPage>,
     /// Numbers the page's openings of plugin panels.
     plugin_panel_views: u64,
     snippets: crate::snippets::SnippetsModel,
@@ -640,6 +733,25 @@ pub struct Inner<P: Platform, L: Link> {
     /// Counts the lingers after the last need, so only the latest lets the
     /// way to the host go.
     plugin_pipe_linger: u64,
+    /// How the frames for the plugin host go to the server and back.
+    plugin_line: PluginLine<L>,
+    /// Numbers the times that was found out, so what an earlier line says
+    /// once another has taken its place is nobody's.
+    plugin_line_found: u64,
+}
+
+/// How the frames for the plugin host go to the server and back.
+enum PluginLine<L> {
+    /// Not found out since the connection was made, or let go since.
+    Unknown,
+    /// A connection of their own is being opened ([`Link::beside`]): the
+    /// frames sent meanwhile, in the order they go.
+    Opening(Vec<(Vec<u8>, FrameFor)>),
+    /// On a connection of their own.
+    Own(L),
+    /// With everything else: there is no opening one of their own from
+    /// here, or it did not open.
+    Shared,
 }
 
 /// One pane's own font: its scale over the page's size, and what draws it.
@@ -751,6 +863,13 @@ impl<P: Platform, L: Link> Inner<P, L> {
     /// The base palette every pane draws from: this browser's pick, else
     /// the server's configured scheme, else the stock palette.
     pub fn configured(&self) -> ColorPalette {
+        if self.chosen_palette.is_none() {
+            if let Some((fallback, unchosen)) = &self.fallback_palette {
+                if crate::settings::server_chose_none(self.server_palette.as_ref(), unchosen.as_ref()) {
+                    return fallback.clone();
+                }
+            }
+        }
         crate::settings::configured_palette(
             self.chosen_palette.as_ref(),
             self.server_palette.as_ref(),
@@ -833,6 +952,9 @@ impl<P: Platform, L: Link> App<P, L> {
             drag_layout: None,
             claimed_layout: None,
             claimed_at: 0.0,
+            zoom_ahead: None,
+            one_pane_tab: None,
+            one_pane_asked: None,
             divider_claim_busy: false,
             divider_claim_next: None,
             preview_epoch: 0,
@@ -849,6 +971,9 @@ impl<P: Platform, L: Link> App<P, L> {
             disconnected: None,
             reconnect_delay: RECONNECT_MIN_MS,
             reconnect_pending: false,
+            reconnect_epoch: 0,
+            reconnect_running: false,
+            reconnect_hurry: false,
             blink_shown: true,
             blink_ticking: false,
             reconnect_attempts: 0,
@@ -863,6 +988,7 @@ impl<P: Platform, L: Link> App<P, L> {
             settings: crate::settings::WebSettings::default(),
             server_palette: None,
             chosen_palette: None,
+            fallback_palette: None,
             published_bg: None,
             quads: HeapQuadAllocator::default(),
             vertices: Vec::new(),
@@ -897,12 +1023,15 @@ impl<P: Platform, L: Link> App<P, L> {
             plugin_panel_env: None,
             plugin_extended: None,
             plugin_extended_env: None,
+            plugin_pages: Default::default(),
             plugin_panel_views: 0,
             snippets: Default::default(),
             plugin_list: Default::default(),
             plugin_calls: Default::default(),
             plugin_pipe: false,
             plugin_pipe_linger: 0,
+            plugin_line: PluginLine::Unknown,
+            plugin_line_found: 0,
         };
         let app = Rc::new(Self {
             platform: setup.platform,
@@ -1231,6 +1360,7 @@ impl<P: Platform, L: Link> App<P, L> {
                 project_id: t.project_id.clone(),
                 status: t.status,
                 dot: t.dot,
+                failed: t.failed,
                 live: t.live,
                 pinned: t.pinned,
                 unread: t.unread,
@@ -1716,6 +1846,21 @@ impl<P: Platform, L: Link> App<P, L> {
                 self.refresh_layout_soon();
                 self.refresh_session_soon();
             }
+            // What a page says of itself changed: its view opens with it
+            // from now on, and its tab's title comes with the next listing.
+            Pdu::PageChanged(codec::PageChanged { pane_id, page }) => {
+                drop(inner);
+                let kept = {
+                    let mut inner = self.inner.borrow_mut();
+                    let kept = inner.layout.as_mut().and_then(|layout| layout.pane_pages.get_mut(&pane_id));
+                    kept.map(|kept| *kept = page).is_some()
+                };
+                if kept {
+                    self.plugins_follow();
+                    Self::notify(&self.inner.borrow());
+                }
+                self.refresh_layout_soon();
+            }
             // Sent once per connection, before the first line change: a
             // program's OSC 4/10/11 colours. Dropping it would leave the
             // page on the stock palette for good.
@@ -1819,6 +1964,7 @@ impl<P: Platform, L: Link> App<P, L> {
             inner.snippets.connection_lost();
             inner.plugin_list.connection_lost();
             inner.plugin_pipe = false;
+            Self::forget_plugin_line(&mut inner);
             inner.plugin_calls.lost("the connection to the server closed");
             // Opened again as soon as the connection is back.
             let now = inner.platform.monotonic_ms();
@@ -1827,6 +1973,11 @@ impl<P: Platform, L: Link> App<P, L> {
             }
             if let Some(extended) = inner.plugin_extended.as_mut() {
                 extended.lost(now);
+            }
+            for page in inner.plugin_pages.values_mut() {
+                if let Some(model) = page.model.as_mut() {
+                    model.lost(now);
+                }
             }
             // The connection that just died settles its own backoff here:
             // one that held for a while earns the short delay back, one
@@ -1868,21 +2019,42 @@ impl<P: Platform, L: Link> App<P, L> {
         let Some(reason) = inner.disconnected.clone() else {
             return;
         };
+        let mut args = thinkterm_i18n::FluentArgs::new();
+        args.set("reason", reason);
         let text = if inner.reconnect_attempts >= RECONNECT_DOUBT_AFTER {
-            format!(
-                "still trying to reconnect after {} attempts ({reason}). \
-                 The link may have expired, or the server may be down.",
-                inner.reconnect_attempts
-            )
+            args.set("n", inner.reconnect_attempts);
+            thinkterm_i18n::tr_args("web-toast-still-reconnecting", &args)
         } else {
-            format!("connection lost ({reason}); reconnecting…")
+            thinkterm_i18n::tr_args("web-toast-reconnecting", &args)
         };
         Self::set_status(&inner, &text);
     }
 
+    /// Try again at once, without the wait the failures before earned: the
+    /// device came back to the app, or its network changed, and what failed
+    /// then may work now. Nothing while the connection is up; with an
+    /// attempt on the wire, the next goes at once if this one fails.
+    pub fn reconnect_now(self: &Rc<Self>) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            if inner.disconnected.is_none() {
+                return;
+            }
+            if inner.reconnect_running {
+                inner.reconnect_hurry = true;
+                return;
+            }
+            // The attempt waiting its turn is dropped for this one.
+            inner.reconnect_epoch += 1;
+            inner.reconnect_pending = false;
+            inner.reconnect_delay = RECONNECT_MIN_MS;
+        }
+        self.schedule_reconnect(0.0);
+    }
+
     /// Come back and try again. `0.0` means as soon as the browser will.
     fn schedule_reconnect(self: &Rc<Self>, delay_ms: f64) {
-        {
+        let epoch = {
             let mut inner = self.inner.borrow_mut();
             if inner.reconnect_pending || inner.disconnected.is_none() {
                 return;
@@ -1890,28 +2062,47 @@ impl<P: Platform, L: Link> App<P, L> {
             if !inner.settings.auto_reconnect {
                 // Asked not to: the remark stays, sticky, until a reconnect
                 // is asked for.
-                let reason = inner.disconnected.clone().unwrap_or_default();
-                Self::set_status(&inner, &format!("connection lost ({reason})"));
+                let mut args = thinkterm_i18n::FluentArgs::new();
+                args.set("reason", inner.disconnected.clone().unwrap_or_default());
+                Self::set_status(
+                    &inner,
+                    &thinkterm_i18n::tr_args("web-toast-connection-lost", &args),
+                );
                 return;
             }
             inner.reconnect_pending = true;
-        }
+            inner.reconnect_epoch
+        };
         let weak = Rc::downgrade(self);
         self.platform.set_timeout(
             delay_ms.max(0.0),
             Box::new(move || {
                 // A client the page has closed does not come back.
                 let Some(app) = weak.upgrade().filter(|app| !app.retired.get()) else { return };
-                app.inner.borrow_mut().reconnect_pending = false;
+                {
+                    let mut inner = app.inner.borrow_mut();
+                    // Put aside for an attempt made sooner.
+                    if inner.reconnect_epoch != epoch {
+                        return;
+                    }
+                    inner.reconnect_pending = false;
+                }
                 let task = Rc::clone(&app).try_reconnect();
                 app.spawn(task);
             }),
         );
     }
 
+    /// One attempt, marked as on the wire while it is.
+    async fn try_reconnect(self: Rc<Self>) {
+        self.inner.borrow_mut().reconnect_running = true;
+        Rc::clone(&self).reconnect_attempt().await;
+        self.inner.borrow_mut().reconnect_running = false;
+    }
+
     /// One attempt: reopen the socket, redo the handshake on the same pane,
     /// and refetch everything on screen.
-    async fn try_reconnect(self: Rc<Self>) {
+    async fn reconnect_attempt(self: Rc<Self>) {
         let (link, pane_id, tab_id, size, nav_rows) = {
             let inner = self.inner.borrow();
             if inner.disconnected.is_none() {
@@ -1945,23 +2136,29 @@ impl<P: Platform, L: Link> App<P, L> {
                 // being asked again, and neither will one whose protocol
                 // this bundle cannot speak. Retrying either one for ever
                 // would only hide the reason.
-                let permanent = err.downcast_ref::<crate::attach::NoPanes>().is_some()
-                    || err.to_string().contains("update the server or the bundle");
+                let mismatch = err.downcast_ref::<crate::attach::ProtocolMismatch>();
+                let permanent = err.downcast_ref::<crate::attach::NoPanes>().is_some() || mismatch.is_some();
                 if permanent {
                     // Nothing will read this socket again, and the server
                     // keeps a registered client and a TCP session for as
                     // long as one is open. Hand it back.
                     link.shutdown();
                     let inner = self.inner.borrow();
-                    Self::set_status(&inner, &format!("{err:#}"));
+                    let text = mismatch
+                        .and_then(|mismatch| inner.platform.protocol_mismatch_text(mismatch))
+                        .unwrap_or_else(|| format!("{err:#}"));
+                    Self::set_status(&inner, &text);
                     log::error!("not reconnecting: {err:#}");
                     return;
                 }
                 let delay = {
                     let mut inner = self.inner.borrow_mut();
                     inner.reconnect_attempts += 1;
-                    inner.reconnect_delay =
-                        (inner.reconnect_delay * 2.0).clamp(RECONNECT_MIN_MS, RECONNECT_MAX_MS);
+                    inner.reconnect_delay = if std::mem::take(&mut inner.reconnect_hurry) {
+                        RECONNECT_MIN_MS
+                    } else {
+                        (inner.reconnect_delay * 2.0).clamp(RECONNECT_MIN_MS, RECONNECT_MAX_MS)
+                    };
                     inner.reconnect_delay
                 };
                 log::warn!("reconnect failed, retrying in {delay:.0} ms: {err:#}");
@@ -1979,6 +2176,7 @@ impl<P: Platform, L: Link> App<P, L> {
             let mut inner = self.inner.borrow_mut();
             inner.disconnected = None;
             inner.reconnect_attempts = 0;
+            inner.reconnect_hurry = false;
             // The backoff is *not* reset here. A server that accepts and
             // then drops -- one restarting in a loop, a proxy closing idle
             // sockets -- would otherwise be hammered at the minimum delay
@@ -2162,6 +2360,16 @@ impl<P: Platform, L: Link> App<P, L> {
         // After the chords: a key from a page that does not hold the
         // terminal asks for it, like a click on the desktop takes it back,
         // and is typed once the server hands it over.
+        // A page has no terminal to type in: its fields are the browser
+        // page's own, and take their keys before these. What comes here is
+        // the page's, which has the keyboard while its pane is in focus:
+        // its plugin hears the keys it takes.
+        if Self::focused_is_page(&inner) {
+            let pane = inner.focused_pane;
+            drop(inner);
+            self.page_key(pane, key, mods);
+            return true;
+        }
         if inner.link.lease().needs_claim() {
             inner.after_take_over = Some(AfterTakeOver::Key(key, mods, shift));
             drop(inner);
@@ -2230,7 +2438,7 @@ impl<P: Platform, L: Link> App<P, L> {
     /// Text the IME composed: bytes, not a paste, so no bracketing.
     pub fn text(&self, text: &str) {
         let mut inner = self.inner.borrow_mut();
-        if inner.disconnected.is_some() || !Self::may_type(&inner) {
+        if inner.disconnected.is_some() || Self::focused_is_page(&inner) || !Self::may_type(&inner) {
             return;
         }
         let platform = Rc::clone(&inner.platform);
@@ -2244,12 +2452,37 @@ impl<P: Platform, L: Link> App<P, L> {
     }
 
     pub fn paste(&self, text: &str) {
+        let pane = self.inner.borrow().focused_pane;
+        self.paste_into(pane, text);
+    }
+
+    /// The pane typing goes to.
+    pub fn focused_pane(&self) -> PaneId {
+        self.inner.borrow().focused_pane
+    }
+
+    /// The running server attached to now (`Lease::server_id`): another
+    /// one after a reconnect to a server that started anew.
+    pub fn server_id(&self) -> Option<String> {
+        self.inner.borrow().link.lease().server_id.clone()
+    }
+
+    /// Paste into `pane`, focused or not, while it is on show here; a pane
+    /// that is not -- closed, or of another tab now -- is left alone
+    /// rather than the text landing in whichever one has the focus.
+    pub fn paste_into(&self, pane: PaneId, text: &str) {
         let mut inner = self.inner.borrow_mut();
-        if inner.disconnected.is_some() || !Self::may_type(&inner) {
+        let is_page = inner
+            .layout
+            .as_ref()
+            .is_some_and(|layout| layout.pane_pages.contains_key(&pane));
+        if inner.disconnected.is_some() || is_page || !Self::may_type(&inner) {
             return;
         }
         let platform = Rc::clone(&inner.platform);
-        let cell = inner.focused_mut();
+        let Some(cell) = inner.panes.get_mut(&pane) else {
+            return;
+        };
         cell.scroll_from_bottom = 0;
         cell.scroll_px = 0.0;
         let start = cell.session.paste(text);
@@ -2721,11 +2954,34 @@ impl<P: Platform, L: Link> App<P, L> {
         }
     }
 
+    /// A key pressed while the page in pane `pane` is the pane in focus
+    /// and none of its fields has the keyboard.
+    fn page_key(self: &Rc<Self>, pane: PaneId, key: KeyCode, mods: Modifiers) {
+        let Some(name) = crate::keymap::dom_name(&key) else {
+            return;
+        };
+        let mods = thinkterm_plugin_panel::Mods {
+            shift: mods.contains(Modifiers::SHIFT),
+            ctrl: mods.contains(Modifiers::CTRL),
+            alt: mods.contains(Modifiers::ALT),
+            cmd: mods.contains(Modifiers::SUPER),
+        };
+        let sends = {
+            let mut inner = self.inner.borrow_mut();
+            match inner.plugin_pages.get_mut(&pane).and_then(|page| page.model.as_mut()) {
+                Some(model) => model.page_key(&name, mods),
+                None => return,
+            }
+        };
+        self.send_panel_frames(sends, ViewPlace::Page(pane as u64));
+        Self::notify(&self.inner.borrow());
+    }
+
     /// Focus a pane that is on the page. `advise` tells the server, so
     /// the desktop follows: a click does when the page is following, a
     /// focus push (which came from the server) never does.
     pub fn focus_pane(self: &Rc<Self>, pane_id: PaneId, advise: bool) {
-        let link = {
+        let (link, left) = {
             let mut inner = self.inner.borrow_mut();
             if !inner.panes.contains_key(&pane_id) {
                 return;
@@ -2735,14 +2991,27 @@ impl<P: Platform, L: Link> App<P, L> {
                 self.mark_seen(pane_id);
                 return;
             }
+            // A page the focus leaves gives up the keyboard it had as the
+            // pane in focus; one of its fields keeps its own, which the
+            // browser page moves.
+            let left = inner.focused_pane;
+            let blurred = inner
+                .plugin_pages
+                .get_mut(&left)
+                .and_then(|page| page.model.as_mut())
+                .filter(|model| model.has_keyboard_itself())
+                .map(|model| (left, model.blur()));
             inner.focused_pane = pane_id;
             inner.selecting = false;
             inner.drag_pane = None;
             inner.ime_anchor = None;
             inner.platform.set_title(inner.title());
             Self::render_strip(&inner);
-            (inner.link.clone(), inner.configured())
+            ((inner.link.clone(), inner.configured()), blurred)
         };
+        if let Some((pane, sends)) = left {
+            self.send_panel_frames(sends, ViewPlace::Page(pane as u64));
+        }
         self.refresh_status();
         self.request_frame();
         if advise {
@@ -3103,12 +3372,25 @@ impl<P: Platform, L: Link> App<P, L> {
             return false;
         }
         let smooth = inner.settings.scroll_mode.is_smooth();
+        let now = inner.platform.monotonic_ms();
         let Some(cell) = inner.panes.get_mut(&hit.pane_id) else {
             return false;
         };
         let session = Arc::clone(&cell.session);
         if session.is_alt_screen() || session.is_mouse_grabbed() {
-            let button = if lines < 0.0 { MouseButton::WheelUp(notches) } else { MouseButton::WheelDown(notches) };
+            // A program hears whole notches only. A finger or a trackpad
+            // hands over a few pixels at a time, so the parts of a row are
+            // kept until they make one, as the desktop keeps them: rounded
+            // up each time, a slow drag ran many rows ahead of the hand.
+            let rested = now - cell.wheel_at >= crate::viewport::WHEEL_REST_MS;
+            cell.wheel_at = now;
+            let (whole, kept) = crate::viewport::wheel_notches(cell.wheel_kept, lines, rested);
+            cell.wheel_kept = kept;
+            if whole == 0 {
+                return true;
+            }
+            let notches = whole.unsigned_abs() as usize;
+            let button = if whole < 0 { MouseButton::WheelUp(notches) } else { MouseButton::WheelDown(notches) };
             let dims = Self::shown_dims(&session);
             let visible = visible_rows(&dims, rows_shown, cell.scroll_from_bottom);
             let event = MouseEvent {
@@ -3245,9 +3527,21 @@ impl<P: Platform, L: Link> App<P, L> {
                     }
                     let shown = Self::shown_in(inner, p);
                     json.push_str(&format!(
-                        "{{\"id\":{},\"left\":{},\"top\":{},\"cols\":{},\"rows\":{},\"content\":[{},{}],\"shown\":[{},{}]}}",
+                        "{{\"id\":{},\"left\":{},\"top\":{},\"cols\":{},\"rows\":{},\"content\":[{},{}],\"shown\":[{},{}]",
                         p.pane_id, p.frame.left, p.frame.top, p.frame.cols, p.frame.rows, p.content.0, p.content.1, shown.0, shown.1
                     ));
+                    // A pane that holds a plugin's page: whose, and how far
+                    // under the frame's top its room starts, in CSS px, for
+                    // the page to be drawn there.
+                    let page = inner.layout.as_ref().and_then(|listed| listed.pane_pages.get(&p.pane_id));
+                    if let Some(page) = page {
+                        json.push_str(&format!(
+                            ",\"page\":{{\"plugin\":{},\"offset\":{:.2}}}",
+                            serde_json::Value::from(page.plugin.as_str()),
+                            Self::content_offset(inner, p) as f64 / dpr,
+                        ));
+                    }
+                    json.push('}');
                 }
                 json.push_str("],\"dividers\":[");
                 for (i, d) in layout.dividers.iter().enumerate() {
@@ -3354,6 +3648,10 @@ impl<P: Platform, L: Link> App<P, L> {
     /// split, when there is something to tell apart; a page on a phone
     /// keeps the bar, as the desktop does (`Platform::bare_lone_pane`).
     fn nav_rows_for(inner: &Inner<P, L>, panes: usize) -> usize {
+        if inner.platform.one_pane() {
+            // One pane at a time: there is nothing to tell apart.
+            return 0;
+        }
         if inner.platform.is_mobile()
             && (!inner.settings.pane_bars || (panes <= 1 && inner.platform.bare_lone_pane()))
         {
@@ -3391,34 +3689,7 @@ impl<P: Platform, L: Link> App<P, L> {
                 .into_iter()
                 .zip(&layout.panes)
             {
-                let members = place
-                    .stack
-                    .iter()
-                    .map(|m| {
-                        // The page's own copy of a drawn pane's title is fresher.
-                        let raw = inner
-                            .panes
-                            .get(&m.pane_id)
-                            .map(|c| c.title.as_str())
-                            .unwrap_or(&m.title);
-                        let (title, busy) = crate::navbar::display_title(raw);
-                        let busy = busy || inner.tree.agents.get(&m.pane_id) == Some(&thinkterm_proto::AgentState::Working);
-                        // A label someone gave the pane names it, as it is
-                        // in the desktop's pane bar.
-                        let title = inner
-                            .layout
-                            .as_ref()
-                            .and_then(|layout| layout.pane_labels.get(&m.pane_id).cloned())
-                            .unwrap_or(title);
-                        crate::navbar::CapsuleView {
-                            pane_id: m.pane_id,
-                            title,
-                            busy,
-                            current: m.pane_id == place.pane_id,
-                            icon: Self::pane_icon(inner, m.pane_id),
-                        }
-                    })
-                    .collect();
+                let members = Self::capsules(inner, place);
                 let focused = place.pane_id == inner.focused_pane;
                 views.push(crate::navbar::NavView {
                     rect,
@@ -3430,6 +3701,77 @@ impl<P: Platform, L: Link> App<P, L> {
             }
         }
         views
+    }
+
+    /// The panes sharing `place`'s frame, as a bar or a list names them.
+    fn capsules(inner: &Inner<P, L>, place: &crate::layout::PanePlacement) -> Vec<crate::navbar::CapsuleView> {
+        place
+            .stack
+            .iter()
+            .map(|m| {
+                // The page's own copy of a drawn pane's title is fresher.
+                let raw = inner
+                    .panes
+                    .get(&m.pane_id)
+                    .map(|c| c.title.as_str())
+                    .unwrap_or(&m.title);
+                let (title, busy) = crate::navbar::display_title(raw);
+                let busy = busy || inner.tree.agents.get(&m.pane_id) == Some(&thinkterm_proto::AgentState::Working);
+                // A label someone gave the pane names it, as it is
+                // in the desktop's pane bar.
+                let title = inner
+                    .layout
+                    .as_ref()
+                    .and_then(|layout| layout.pane_labels.get(&m.pane_id).cloned())
+                    .unwrap_or(title);
+                crate::navbar::CapsuleView {
+                    pane_id: m.pane_id,
+                    title,
+                    busy,
+                    current: m.pane_id == place.pane_id,
+                    icon: Self::pane_icon(inner, m.pane_id),
+                    page: inner
+                        .layout
+                        .as_ref()
+                        .and_then(|layout| crate::chrome::page_icon(layout, m.pane_id)),
+                }
+            })
+            .collect()
+    }
+
+    /// Every pane of the tab on show where its split puts it, drawn or
+    /// not: a client that shows one pane at a time (`Platform::one_pane`)
+    /// lists them to switch between, and draws the split as a map.
+    pub fn panes_view(&self) -> crate::views::PanesView {
+        let inner = self.inner.borrow();
+        let Some(current) = &inner.tab_layout else {
+            return crate::views::PanesView::default();
+        };
+        // The split behind a zoomed pane, at the tab's size.
+        let whole = inner
+            .layout
+            .as_ref()
+            .and_then(|listed| crate::layout::tab_containing(listed, inner.focused_pane))
+            .and_then(|node| crate::layout::with_zoom(node, current.size, 0, None));
+        let layout = whole.as_ref().unwrap_or(current);
+        crate::views::PanesView {
+            cols: layout.cols,
+            rows: layout.rows,
+            zoomed: current.zoomed,
+            panes: layout
+                .panes
+                .iter()
+                .map(|place| crate::views::PaneBox {
+                    pane_id: place.pane_id,
+                    left: place.frame.left,
+                    top: place.frame.top,
+                    cols: place.frame.cols,
+                    rows: place.frame.rows,
+                    focused: place.stack.iter().any(|m| m.pane_id == inner.focused_pane),
+                    members: Self::capsules(&inner, place),
+                })
+                .collect(),
+        }
     }
 
     /// The sidebar's rows from the model, with the pending delete shown.
@@ -3448,7 +3790,30 @@ impl<P: Platform, L: Link> App<P, L> {
     /// Every Space with its projects and threads: the TUI's sidebar tree.
     pub fn tree_view(&self) -> crate::tree::TreeView {
         let inner = self.inner.borrow();
-        inner.tree.tree(inner.tab_id, &inner.workspace, Self::deleting(&inner))
+        let mut tree = inner.tree.tree(inner.tab_id, &inner.workspace, Self::deleting(&inner));
+        // What each thread runs, for the cards its row leads with.
+        if let Some(cards) = Self::tab_icons(&inner) {
+            let threads = tree
+                .spaces
+                .iter_mut()
+                .flat_map(|space| space.projects.iter_mut())
+                .flat_map(|project| project.threads.iter_mut());
+            for thread in threads {
+                for pane in Self::thread_panes(&inner, &thread.id) {
+                    let icon = Self::pane_icon(&inner, pane);
+                    if let Some(icon) = icon.filter(|icon| !thread.icons.contains(icon)) {
+                        thread.icons.push(icon);
+                    }
+                }
+                // As the desktop's row has them: agents first, then other
+                // programs, the terminal last, each in the order met.
+                thread.icons.sort_by_key(|icon| cards.row_rank(icon));
+                if thread.icons.is_empty() {
+                    thread.icons.extend(cards.terminal().map(str::to_string));
+                }
+            }
+        }
+        tree
     }
 
     /// Ask the server for its tree, its session view and the agents in
@@ -4017,6 +4382,24 @@ impl<P: Platform, L: Link> App<P, L> {
             Self::set_status(&inner, &tr("web-toast-no-panes"));
             return;
         };
+        // A zoom drawn ahead of the server: a listing from before the server
+        // heard of it would put the tab back for a moment. It is let pass,
+        // and the server asked again; one that agrees, another tab, or the
+        // patience running out ends the wait.
+        {
+            let mut inner = self.inner.borrow_mut();
+            if let Some((tab, zoomed, at)) = inner.zoom_ahead {
+                let waiting = tab == layout.tab_id
+                    && tab == inner.tab_id
+                    && inner.platform.monotonic_ms() - at < Self::ZOOM_PATIENCE_MS;
+                if waiting && layout.zoomed != zoomed {
+                    drop(inner);
+                    self.refresh_layout_soon();
+                    return;
+                }
+                inner.zoom_ahead = None;
+            }
+        }
         let (link, tab_changed) = {
             let mut inner = self.inner.borrow_mut();
             if inner.switching || inner.disconnected.is_some() {
@@ -4093,23 +4476,8 @@ impl<P: Platform, L: Link> App<P, L> {
             (fresh, changed, first_layout)
         };
         self.mark_focused_program_status_seen();
-        // A pane's first push comes when something asks after it: one
-        // liveness poll each, and the answer is not waited for.
         self.sync_frame_control();
-        for pane_id in fresh {
-            let link = link.clone();
-            self.spawn(async move {
-                let _ = thinkterm_session::host::request(
-                    &link,
-                    Pdu::GetPaneRenderChanges(codec::GetPaneRenderChanges { pane_id }),
-                    |pdu| match pdu {
-                        Pdu::LivenessResponse(_) | Pdu::UnitResponse(_) => Ok(()),
-                        other => Err(other),
-                    },
-                )
-                .await;
-            });
-        }
+        self.ask_after(fresh);
         if tab_changed || first_layout {
             self.match_desktop_cell();
             self.resize();
@@ -4131,6 +4499,14 @@ impl<P: Platform, L: Link> App<P, L> {
             self.refresh_status();
             self.request_frame();
         }
+        if tab_changed {
+            // The tab left behind goes back to its split.
+            let left = self.inner.borrow().one_pane_tab.is_some_and(|(left, _)| left != tab_id);
+            if left {
+                self.leave_one_pane();
+            }
+        }
+        self.keep_one_pane();
         // The page holds the terminal it shows: taken at this window's
         // shape as soon as a tab is on screen, and taken back by the
         // desktop only when someone interacts there.
@@ -4157,6 +4533,91 @@ impl<P: Platform, L: Link> App<P, L> {
         if claim {
             self.take_over_with(true);
         }
+    }
+
+    /// A pane's first push comes when something asks after it: one
+    /// liveness poll for each of `panes`, new to the page, and the answer
+    /// is not waited for.
+    fn ask_after(self: &Rc<Self>, panes: Vec<PaneId>) {
+        let link = self.inner.borrow().link.clone();
+        for pane_id in panes {
+            let link = link.clone();
+            self.spawn(async move {
+                let _ = thinkterm_session::host::request(
+                    &link,
+                    Pdu::GetPaneRenderChanges(codec::GetPaneRenderChanges { pane_id }),
+                    |pdu| match pdu {
+                        Pdu::LivenessResponse(_) | Pdu::UnitResponse(_) => Ok(()),
+                        other => Err(other),
+                    },
+                )
+                .await;
+            });
+        }
+    }
+
+    /// How long a zoom drawn ahead of the server waits for a listing that
+    /// agrees with it, before the page takes the server's word instead:
+    /// long enough for the request and the listing after it over a slow
+    /// connection, short enough that a zoom the server never made does not
+    /// stay on screen.
+    const ZOOM_PATIENCE_MS: f64 = 4_000.0;
+
+    /// Draw the tab as a zoom just asked for will leave it -- pane
+    /// `pane_id` alone at the tab's size, or the split it hid back --
+    /// without waiting for the server: the request is one trip there and
+    /// back, and the listing that shows what came of it another. Each
+    /// pane keeps its rows at the grid its new frame gives it
+    /// (`preview_panes`) until the server's own arrive. Returns the panes
+    /// new to the page; `None` when there is nothing to go by -- no
+    /// listing yet, a lone pane, a pane behind another in a stack -- and
+    /// the server's listing shows the zoom when it comes.
+    fn zoom_ahead(inner: &mut Inner<P, L>, pane_id: PaneId, zoom: bool) -> Option<Vec<PaneId>> {
+        let current = inner.tab_layout.as_ref()?;
+        let (tab_id, tab) = (current.tab_id, current.size);
+        // A lone pane has nothing to hide; a tab showing another pane
+        // alone has, and the zoom moves.
+        if zoom && current.panes.len() < 2 && current.zoomed.is_none_or(|zoomed| zoomed == pane_id) {
+            return None;
+        }
+        let node = crate::layout::tab_containing(inner.layout.as_ref()?, pane_id)?;
+        if node.window_and_tab_ids().map(|(_, tab_id)| tab_id) != Some(tab_id) {
+            return None;
+        }
+        let nav_rows = Self::nav_rows_for(inner, crate::layout::leaves(node).len());
+        let mut ahead = crate::layout::with_zoom(node, tab, nav_rows, zoom.then_some(pane_id))?;
+        let panes = Self::native_panes(inner, &ahead);
+        for place in &mut ahead.panes {
+            if let Some(pane) = panes.iter().find(|pane| pane.pane_id == place.pane_id) {
+                place.content = (pane.size.cols, pane.size.rows);
+                place.size = pane.size;
+            }
+        }
+        // A grid claimed for the window gives way: the zoom is drawn.
+        inner.claimed_layout = None;
+        let fresh = Self::apply_layout(inner, ahead, pane_id);
+        // The panes that were on show keep their rows, at their new width.
+        let resized: Vec<(PaneId, TerminalSize)> = panes
+            .iter()
+            .filter(|pane| !fresh.contains(&pane.pane_id))
+            .filter(|pane| {
+                inner.panes.get(&pane.pane_id).is_some_and(|cell| {
+                    let dims = cell.session.dimensions();
+                    (dims.cols, dims.viewport_rows) != (pane.size.cols, pane.size.rows)
+                })
+            })
+            .map(|pane| (pane.pane_id, pane.size))
+            .collect();
+        Self::preview_panes(inner, &resized);
+        // What a keystroke would claim follows the drawn layout.
+        {
+            let mut lease = inner.link.lease_mut();
+            lease.native = panes;
+            lease.native_root = Some(tab);
+        }
+        inner.zoom_ahead = Some((tab_id, zoom.then_some(pane_id), inner.platform.monotonic_ms()));
+        Self::render_strip(inner);
+        Some(fresh)
     }
 
     /// Make `inner.panes` match `layout`, focusing `want` if it is drawn
@@ -4308,6 +4769,7 @@ impl<P: Platform, L: Link> App<P, L> {
             self.inner.borrow_mut().closing_tab = None;
         }
         match click {
+            Click::Pane(pane_id) if self.inner.borrow().platform.one_pane() => self.zoom_to(pane_id),
             Click::Pane(pane_id) => {
                 let hidden = self
                     .inner
@@ -4353,16 +4815,13 @@ impl<P: Platform, L: Link> App<P, L> {
                     );
                 }
             }
+            // That pane, by its id. Not by focusing it and closing the pane
+            // in focus: one not drawn here -- behind another in its stack,
+            // or another of a tab shown one pane at a time -- cannot be
+            // focused, and the one in focus would go in its place.
             Click::ClosePane(pane_id) => {
-                let (focused, following) = {
-                    let inner = self.inner.borrow();
-                    (inner.focused_pane, inner.following)
-                };
-                if pane_id != focused {
-                    self.inner.borrow_mut().closing_since = None;
-                    self.focus_pane(pane_id, following);
-                }
-                self.on_chrome_click(Click::Close);
+                self.inner.borrow_mut().closing_since = None;
+                self.act("web-act-close-pane", Pdu::KillPane(codec::KillPane { pane_id }), |_, _| {});
             }
             Click::Follow => {
                 let mut inner = self.inner.borrow_mut();
@@ -4648,11 +5107,13 @@ impl<P: Platform, L: Link> App<P, L> {
         inner
             .open_subtasks
             .retain(|pane| tree.agent_report(*pane).is_some_and(|r| !r.children.is_empty()));
+        let shared: &Inner<P, L> = inner;
         let rows = crate::agents::rows(
-            &inner.tree,
-            inner.window_id,
-            |pane| inner.panes.get(&pane).map(|c| crate::navbar::display_title(&c.title).0),
-            |pane| inner.open_subtasks.contains(&pane),
+            &shared.tree,
+            shared.window_id,
+            |pane| shared.panes.get(&pane).map(|c| crate::navbar::display_title(&c.title).0),
+            |pane| Self::pane_icon(shared, pane),
+            |pane| shared.open_subtasks.contains(&pane),
         );
         let summary = crate::agents::summary(&rows);
         let tabs = Self::panel_tabs(&inner);
@@ -4695,11 +5156,12 @@ impl<P: Platform, L: Link> App<P, L> {
     }
 
     /// Something on the page needs the plugin list, or no longer does:
-    /// `who` is `settings` or `panel`.
+    /// `who` is `settings`, `panel` or `palette`.
     pub fn plugins_want(self: &Rc<Self>, who: &str, on: bool) {
         let who = match who {
             "settings" => "settings",
             "panel" => "panel",
+            "palette" => "palette",
             _ => return,
         };
         self.inner.borrow_mut().plugin_list.want(who, on);
@@ -4716,6 +5178,7 @@ impl<P: Platform, L: Link> App<P, L> {
     fn plugin_pipe_needed(inner: &Inner<P, L>) -> bool {
         Self::snippets_wanted(inner)
             || inner.plugin_panel.is_some()
+            || !inner.plugin_pages.is_empty()
             || inner.plugin_list.wanted()
             || inner.plugin_calls.waiting()
     }
@@ -4725,7 +5188,7 @@ impl<P: Platform, L: Link> App<P, L> {
     /// server's way to the plugin host is let go a while after nothing needs
     /// it any more.
     fn plugins_follow(self: &Rc<Self>) {
-        let (ask_snippets, closing, sends, extended_sends, panel_later) = {
+        let (ask_snippets, closing, sends, extended_sends, page_sends, panel_later) = {
             let inner = &mut *self.inner.borrow_mut();
             if !Self::snippets_offered(inner) && inner.right_panel == "snippets" {
                 inner.right_panel = "agents".to_string();
@@ -4739,7 +5202,12 @@ impl<P: Platform, L: Link> App<P, L> {
             }
             let (closing, sends, panel_later) = Self::follow_plugin_panel(inner);
             let (closing_extended, extended_sends) = Self::follow_plugin_extended(inner);
-            let closing: Vec<Vec<u8>> = closing.into_iter().chain(closing_extended).collect();
+            let (closing_pages, page_sends, pages_later) = Self::follow_plugin_pages(inner);
+            let closing: Vec<Vec<u8>> = closing.into_iter().chain(closing_extended).chain(closing_pages).collect();
+            let panel_later = match (panel_later, pages_later) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
             let snippets_wanted = Self::snippets_wanted(inner);
             let mut ask_snippets = false;
             if !snippets_wanted {
@@ -4749,13 +5217,16 @@ impl<P: Platform, L: Link> App<P, L> {
                 inner.snippets.open();
                 ask_snippets = true;
             }
-            (ask_snippets, closing, sends, extended_sends, panel_later)
+            (ask_snippets, closing, sends, extended_sends, page_sends, panel_later)
         };
         for frame in closing {
             self.send_plugin_frame(frame, FrameFor::Nobody);
         }
-        self.send_panel_frames(sends, false);
-        self.send_panel_frames(extended_sends, true);
+        self.send_panel_frames(sends, ViewPlace::Panel);
+        self.send_panel_frames(extended_sends, ViewPlace::Extended);
+        for (pane, sends) in page_sends {
+            self.send_panel_frames(sends, ViewPlace::Page(pane as u64));
+        }
         if let Some(delay) = panel_later {
             self.wake_plugin_panel(delay);
         }
@@ -4859,6 +5330,105 @@ impl<P: Platform, L: Link> App<P, L> {
         }
     }
 
+    /// Opens the page of each pane the browser page shows a plugin's page
+    /// in the place of, as the pane's page says -- which plugin, opened
+    /// with what -- and closes one whose pane is no longer a page, or is
+    /// another's now: the frames that close, those for each page on show,
+    /// and how long until one waiting to be opened again is.
+    #[allow(clippy::type_complexity)]
+    fn follow_plugin_pages(inner: &mut Inner<P, L>) -> (Vec<Vec<u8>>, Vec<(PaneId, Vec<Vec<u8>>)>, Option<f64>) {
+        let mut closing = Vec::new();
+        let mut sends = Vec::new();
+        let mut later: Option<f64> = None;
+        let connected = inner.disconnected.is_none();
+        let now = inner.platform.monotonic_ms();
+        let specs = inner.layout.as_ref().map(|layout| &layout.pane_pages);
+        let mut gone = Vec::new();
+        for (pane, page) in inner.plugin_pages.iter_mut() {
+            let spec = specs.and_then(|specs| specs.get(pane));
+            // Another page than the one open, or none: the open one goes.
+            let other = page
+                .model
+                .as_ref()
+                .is_some_and(|model| !spec.is_some_and(|spec| model.is_page_of(&spec.plugin, &spec.id)));
+            if other {
+                let model = page.model.take().expect("checked above");
+                if !model.waiting() && connected {
+                    closing.push(model.close());
+                }
+            }
+            let Some(spec) = spec else {
+                // Listed before the pane was, perhaps: it stays until the
+                // browser page takes the place away, unless a layout says
+                // the pane is no page.
+                if specs.is_some() {
+                    gone.push(*pane);
+                }
+                continue;
+            };
+            if !connected {
+                continue;
+            }
+            // Where the server says it was opened from, which a server
+            // started anew says afresh: the page it restored has no
+            // terminal, whatever pane has that one's number now.
+            let (cwd, terminal) = Self::origin_of(spec);
+            if page.env.cwd != cwd || page.env.terminal != terminal {
+                page.env.cwd = cwd;
+                page.env.terminal = terminal;
+                if let Some(model) = page.model.as_mut() {
+                    model.set_env(page.env.clone());
+                    let (told, wait) = model.tell_env(now);
+                    if !told.is_empty() {
+                        sends.push((*pane, told));
+                    }
+                    if let Some(wait) = wait {
+                        later = Some(later.map_or(wait, |sooner| sooner.min(wait)));
+                    }
+                }
+            }
+            // One the host would not serve is asked for again once its
+            // plugin is heard to run: switched on, or let run, since.
+            let usable = inner.plugin_list.usable(&spec.plugin) == Some(true);
+            let now_usable = usable && !std::mem::replace(&mut page.usable, usable);
+            // The same page, which its plugin may have changed: what it
+            // opens with now is what it is opened with again.
+            if let Some(model) = page.model.as_mut() {
+                model.set_page_args(&spec.args);
+                if now_usable {
+                    model.serve_again(now);
+                }
+            }
+            match page.model.as_mut() {
+                Some(model) => match model.again_in(now) {
+                    Some(wait) if wait > 0.0 => later = Some(later.map_or(wait, |sooner| sooner.min(wait))),
+                    Some(_) => {
+                        inner.plugin_panel_views += 1;
+                        sends.push((*pane, model.reopen(inner.plugin_panel_views, None, now)));
+                    }
+                    None => {}
+                },
+                None => {
+                    inner.plugin_panel_views += 1;
+                    let (model, open) = crate::plugin_panel::PanelModel::open_page(
+                        &spec.plugin,
+                        inner.plugin_panel_views,
+                        &spec.id,
+                        &spec.args,
+                        page.env.clone(),
+                        now,
+                    );
+                    page.model = Some(model);
+                    sends.push((*pane, open));
+                }
+            }
+        }
+        for pane in gone {
+            inner.plugin_pages.remove(&pane);
+        }
+        (closing, sends, later)
+    }
+
     /// Comes back to the plugin panel after `delay_ms`, to tell its plugin a
     /// size or to open it again. A timer already set for sooner will do.
     fn wake_plugin_panel(self: &Rc<Self>, delay_ms: f64) {
@@ -4885,17 +5455,33 @@ impl<P: Platform, L: Link> App<P, L> {
     /// What the host said about the page's panel `view`, or its extended
     /// view.
     fn plugin_panel_heard(self: &Rc<Self>, view: u64, event: thinkterm_plugin_channel::wire::PanelEvent) {
-        let (sends, closing, extended_sends, again) = {
+        let (sends, closing, extended_sends, page_sends, again, asked) = {
             let inner = &mut *self.inner.borrow_mut();
             let now = inner.platform.monotonic_ms();
             if let Some(panel) = inner.plugin_panel.as_mut().filter(|panel| panel.view() == view) {
                 let sends = panel.heard(event, now);
                 let again = panel.again_in(now);
+                let asked = panel.take_page_asked().map(|args| (panel.plugin().to_string(), args, None));
                 // Its extended view follows what it drew.
                 let (closing, extended_sends) = Self::follow_plugin_extended(inner);
-                (sends, closing, extended_sends, again)
+                (sends, closing, extended_sends, None, again, asked)
             } else if let Some(extended) = inner.plugin_extended.as_mut().filter(|extended| extended.view() == view) {
-                (Vec::new(), None, extended.heard(event, now), None)
+                let sends = extended.heard(event, now);
+                let asked = extended.take_page_asked().map(|args| (extended.plugin().to_string(), args, None));
+                (Vec::new(), None, sends, None, None, asked)
+            } else if let Some((pane, model)) = inner
+                .plugin_pages
+                .iter_mut()
+                .find_map(|(pane, page)| Some((*pane, page.model.as_mut().filter(|model| model.view() == view)?)))
+            {
+                let sends = model.heard(event, now);
+                let again = model.again_in(now);
+                let asked = model.take_page_asked().map(|args| (model.plugin().to_string(), args, Some(pane)));
+                let change = model.take_page_change();
+                if let Some(change) = change {
+                    Self::change_page(inner, pane, change);
+                }
+                (Vec::new(), None, Vec::new(), Some((pane, sends)), again, asked)
             } else {
                 // An opening the page has let go of since.
                 return;
@@ -4904,35 +5490,173 @@ impl<P: Platform, L: Link> App<P, L> {
         if let Some(frame) = closing {
             self.send_plugin_frame(frame, FrameFor::Nobody);
         }
-        self.send_panel_frames(sends, false);
-        self.send_panel_frames(extended_sends, true);
+        self.send_panel_frames(sends, ViewPlace::Panel);
+        self.send_panel_frames(extended_sends, ViewPlace::Extended);
+        if let Some((pane, sends)) = page_sends {
+            self.send_panel_frames(sends, ViewPlace::Page(pane as u64));
+        }
         if let Some(delay) = again {
             self.wake_plugin_panel(delay);
         }
         Self::notify(&self.inner.borrow());
+        // Its plugin asked, in answer to a press in it, for its page: beside
+        // the page that asked, wherever the focus is by now.
+        if let Some((plugin, args, beside)) = asked {
+            self.open_page_beside(&plugin, &args.to_string(), beside);
+        }
+    }
+
+    /// Tells the server what the plugin of the page in pane `pane` changed
+    /// of it, `change`: the server keeps the page, and tells every client
+    /// -- this one too -- what it is now. Sent whatever the page is here,
+    /// which a change made just before this one has not reached yet: the
+    /// server drops one that changes nothing.
+    fn change_page(inner: &Inner<P, L>, pane: PaneId, change: thinkterm_plugin_panel::PageChange) {
+        if !inner.layout.as_ref().is_some_and(|layout| layout.pane_pages.contains_key(&pane)) {
+            return;
+        }
+        let edit = thinkterm_proto::PageEdit {
+            title: change.title,
+            icon: change.icon,
+            args: change.args.map(|args| args.to_string()),
+        };
+        let link = inner.link.clone();
+        let pdu = Pdu::ChangePage(codec::ChangePage { pane_id: pane, edit });
+        inner.platform.spawn(Box::pin(async move {
+            if let Err(err) = thinkterm_session::host::request(&link, pdu, Ok).await {
+                log::warn!("the page of pane {pane} is not changed as its plugin asked: {err:#}");
+            }
+        }));
+    }
+
+    /// Opens plugin `plugin`'s page with `args`, JSON or nothing, in a tab
+    /// of the window this tab is in, of the domain the pane in focus is of:
+    /// the server's plugin of that name draws it.
+    pub fn open_page(self: &Rc<Self>, plugin: &str, args: &str) {
+        self.open_page_beside(plugin, args, None);
+    }
+
+    /// [`open_page`](Self::open_page), beside pane `beside` -- the page
+    /// that asked for it, which the new one is opened from the same place
+    /// as -- or with none, the pane in focus.
+    fn open_page_beside(self: &Rc<Self>, plugin: &str, args: &str, beside: Option<PaneId>) {
+        let (window_id, workspace, size, pane_id, page) = {
+            let inner = self.inner.borrow();
+            let size = inner
+                .link
+                .lease()
+                .canonical_size
+                .or_else(|| inner.tab_layout.as_ref().map(|l| l.size))
+                .unwrap_or_default();
+            let (title, icon) = inner.plugin_list.page_of(plugin).unwrap_or_default();
+            // Its id, and where the user is, the server gives it.
+            let page = thinkterm_proto::PageSpec {
+                plugin: plugin.to_string(),
+                args: args.to_string(),
+                title,
+                icon,
+                ..Default::default()
+            };
+            let pane_id = beside.or(inner.panes.contains_key(&inner.focused_pane).then_some(inner.focused_pane));
+            (inner.window_id, inner.workspace.clone(), size, pane_id, page)
+        };
+        self.act(
+            "web-act-new-tab",
+            Pdu::SpawnPage(codec::SpawnPage {
+                page,
+                place: codec::PagePlace::Tab { window_id: Some(window_id), workspace, pane_id },
+                size,
+            }),
+            |app, answer| {
+                if let Pdu::SpawnPageResponse(spawned) = answer {
+                    app.switch_to_pane(spawned.pane_id, false);
+                }
+            },
+        );
+    }
+
+    /// The browser page no longer shows the place of pane `pane`, whose
+    /// page it showed: the page is closed.
+    pub fn plugin_page_gone(self: &Rc<Self>, pane: PaneId) {
+        let closing = {
+            let inner = &mut *self.inner.borrow_mut();
+            let connected = inner.disconnected.is_none();
+            inner
+                .plugin_pages
+                .remove(&pane)
+                .and_then(|page| page.model)
+                .filter(|model| !model.waiting() && connected)
+                .map(|model| model.close())
+        };
+        if let Some(frame) = closing {
+            self.send_plugin_frame(frame, FrameFor::Nobody);
+        }
+        self.linger_plugin_pipe();
+        Self::notify(&self.inner.borrow());
+    }
+
+    /// Whether the pane in focus holds a plugin's page: nothing typed is
+    /// its terminal's, for it has none.
+    fn focused_is_page(inner: &Inner<P, L>) -> bool {
+        inner
+            .layout
+            .as_ref()
+            .is_some_and(|layout| layout.pane_pages.contains_key(&inner.focused_pane))
     }
 
     /// How much room the page gives a plugin panel, or its extended view,
     /// its fonts and theme: an `Env`, which says whether the page has room
     /// for an extended view. The first opens the view on show.
-    pub fn plugin_panel_env(self: &Rc<Self>, extended: bool, mut env: thinkterm_plugin_panel::Env) {
+    pub fn plugin_panel_env(self: &Rc<Self>, place: ViewPlace, mut env: thinkterm_plugin_panel::Env) {
         {
             let inner = &mut *self.inner.borrow_mut();
             env.locale = thinkterm_i18n::current_locale().to_string();
             env.cwd = Self::focused_cwd(inner);
+            env.terminal = Self::focused_terminal(inner);
             // Its fields are the page's own; the keyboard comes to a panel
-            // through them, and no key of the page's gives it.
-            env.features = vec![thinkterm_plugin_panel::feature::FIELDS.to_string()];
-            if extended {
-                env.can_extend = false;
-                inner.plugin_extended_env = Some(env.clone());
-                if let Some(extended) = inner.plugin_extended.as_mut() {
-                    extended.set_env(env);
+            // through them, and no key of the page's gives it. A plugin's
+            // page has it while its pane is in focus.
+            env.features = vec![
+                thinkterm_plugin_panel::feature::FIELDS.to_string(),
+                thinkterm_plugin_panel::feature::WRAP.to_string(),
+            ];
+            if matches!(place, ViewPlace::Page(_)) {
+                env.features.push(thinkterm_plugin_panel::feature::KEYS.to_string());
+            }
+            // A page is told where it was opened from, not where the user
+            // is now.
+            if let ViewPlace::Page(pane) = place {
+                (env.cwd, env.terminal) = Self::page_origin(inner, pane as PaneId);
+            }
+            match place {
+                ViewPlace::Extended => {
+                    env.can_extend = false;
+                    inner.plugin_extended_env = Some(env.clone());
+                    if let Some(extended) = inner.plugin_extended.as_mut() {
+                        extended.set_env(env);
+                    }
                 }
-            } else {
-                inner.plugin_panel_env = Some(env.clone());
-                if let Some(panel) = inner.plugin_panel.as_mut() {
-                    panel.set_env(env);
+                ViewPlace::Panel => {
+                    inner.plugin_panel_env = Some(env.clone());
+                    if let Some(panel) = inner.plugin_panel.as_mut() {
+                        panel.set_env(env);
+                    }
+                }
+                ViewPlace::Page(pane) => {
+                    env.can_extend = false;
+                    env.close = None;
+                    match inner.plugin_pages.entry(pane as PaneId) {
+                        std::collections::hash_map::Entry::Occupied(mut page) => {
+                            let page = page.get_mut();
+                            page.env = env.clone();
+                            if let Some(model) = page.model.as_mut() {
+                                model.set_env(env);
+                            }
+                        }
+                        std::collections::hash_map::Entry::Vacant(page) => {
+                            page.insert(PluginPage { env, usable: false, model: None });
+                        }
+                    }
                 }
             }
         }
@@ -4946,16 +5670,32 @@ impl<P: Platform, L: Link> App<P, L> {
         let moved = {
             let inner = &mut *self.inner.borrow_mut();
             let cwd = Self::focused_cwd(inner);
+            let terminal = Self::focused_terminal(inner);
             let locale = thinkterm_i18n::current_locale();
             let mut moved = false;
+            // A page stays where it was opened from: only its language
+            // follows the browser page's.
+            for page in inner.plugin_pages.values_mut() {
+                if page.env.locale != locale {
+                    page.env.locale = locale.to_string();
+                    if let Some(model) = page.model.as_mut() {
+                        model.set_env(page.env.clone());
+                    }
+                    moved = true;
+                }
+            }
             let views = [
                 (&mut inner.plugin_panel_env, &mut inner.plugin_panel),
                 (&mut inner.plugin_extended_env, &mut inner.plugin_extended),
             ];
             for (env, model) in views {
+                // The pane in focus not known for the moment, the one told
+                // stays.
+                let terminal = terminal.clone().or_else(|| env.as_ref().and_then(|env| env.terminal.clone()));
                 match env.as_mut() {
-                    Some(env) if env.cwd != cwd || env.locale != locale => {
+                    Some(env) if env.cwd != cwd || env.terminal != terminal || env.locale != locale => {
                         env.cwd = cwd.clone();
+                        env.terminal = terminal;
                         env.locale = locale.to_string();
                         if let Some(model) = model.as_mut() {
                             model.set_env(env.clone());
@@ -4970,6 +5710,37 @@ impl<P: Platform, L: Link> App<P, L> {
         if moved {
             self.plugin_panel_tell_env();
         }
+    }
+
+    /// Where the page in pane `pane` was opened from, as the server keeps
+    /// it: the directory then, and the terminal by the number the server
+    /// gave it -- as `thinkterm cli` on the server's machine, where the
+    /// page's plugin runs, reaches it.
+    fn page_origin(
+        inner: &Inner<P, L>,
+        pane: PaneId,
+    ) -> (Option<String>, Option<thinkterm_plugin_panel::Terminal>) {
+        match inner.layout.as_ref().and_then(|layout| layout.pane_pages.get(&pane)) {
+            Some(page) => Self::origin_of(page),
+            None => (None, None),
+        }
+    }
+
+    /// Where `page` was opened from, as a view's `env` says it.
+    fn origin_of(page: &thinkterm_proto::PageSpec) -> (Option<String>, Option<thinkterm_plugin_panel::Terminal>) {
+        let cwd = (!page.cwd.is_empty()).then(|| page.cwd.clone());
+        let terminal = page.terminal.map(|pane| thinkterm_plugin_panel::Terminal { pane, socket: None });
+        (cwd, terminal)
+    }
+
+    /// The pane in focus as `thinkterm cli` on the server's machine reaches
+    /// it, where the plugins the page reaches run: by the number the server
+    /// gave it, through the server, which the page knows no path for.
+    fn focused_terminal(inner: &Inner<P, L>) -> Option<thinkterm_plugin_panel::Terminal> {
+        inner.panes.contains_key(&inner.focused_pane).then(|| thinkterm_plugin_panel::Terminal {
+            pane: inner.focused_pane as u64,
+            socket: None,
+        })
     }
 
     /// The directory of the pane in focus, as a path on the server's
@@ -4994,7 +5765,7 @@ impl<P: Platform, L: Link> App<P, L> {
     /// still to be told and the last was told long enough ago; comes back
     /// when that is, if it is not.
     fn plugin_panel_tell_env(self: &Rc<Self>) {
-        let (sends, extended_sends, later) = {
+        let (sends, extended_sends, page_sends, later) = {
             let inner = &mut *self.inner.borrow_mut();
             let now = inner.platform.monotonic_ms();
             if inner.disconnected.is_some() {
@@ -5003,14 +5774,26 @@ impl<P: Platform, L: Link> App<P, L> {
             let (sends, later) = inner.plugin_panel.as_mut().map_or((Vec::new(), None), |panel| panel.tell_env(now));
             let (extended_sends, extended_later) =
                 inner.plugin_extended.as_mut().map_or((Vec::new(), None), |extended| extended.tell_env(now));
-            let later = match (later, extended_later) {
+            let sooner = |a: Option<f64>, b: Option<f64>| match (a, b) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             };
-            (sends, extended_sends, later)
+            let mut later = sooner(later, extended_later);
+            let mut page_sends = Vec::new();
+            for (pane, page) in inner.plugin_pages.iter_mut() {
+                if let Some(model) = page.model.as_mut() {
+                    let (sends, page_later) = model.tell_env(now);
+                    later = sooner(later, page_later);
+                    page_sends.push((*pane, sends));
+                }
+            }
+            (sends, extended_sends, page_sends, later)
         };
-        self.send_panel_frames(sends, false);
-        self.send_panel_frames(extended_sends, true);
+        self.send_panel_frames(sends, ViewPlace::Panel);
+        self.send_panel_frames(extended_sends, ViewPlace::Extended);
+        for (pane, sends) in page_sends {
+            self.send_panel_frames(sends, ViewPlace::Page(pane as u64));
+        }
         if let Some(delay) = later {
             self.wake_plugin_panel(delay);
         }
@@ -5018,15 +5801,24 @@ impl<P: Platform, L: Link> App<P, L> {
 
     /// The plugin panel on show, or its extended view: JSON `PanelView`, or
     /// `null`.
-    pub fn plugin_panel_view(&self, extended: bool) -> Option<crate::plugin_panel::PanelView> {
+    pub fn plugin_panel_view(&self, place: ViewPlace) -> Option<crate::plugin_panel::PanelView> {
         let inner = self.inner.borrow();
-        Self::plugin_view(&inner, extended).map(|panel| panel.view_json())
+        Self::plugin_view(&inner, place).map(|panel| panel.view_json())
     }
 
     /// Changes when `plugin_panel_view` would.
-    pub fn plugin_panel_revision(&self, extended: bool) -> u64 {
+    pub fn plugin_panel_revision(&self, place: ViewPlace) -> u64 {
         let inner = self.inner.borrow();
-        Self::plugin_view(&inner, extended).map_or(0, |panel| (panel.view() << 32) | (panel.revision() & 0xffff_ffff))
+        Self::plugin_view(&inner, place).map_or(0, |panel| (panel.view() << 32) | (panel.revision() & 0xffff_ffff))
+    }
+
+    /// Changes when any plugin's page on show is to be painted anew, opens
+    /// or goes: the page then asks each for its own revision.
+    pub fn plugin_pages_revision(&self) -> u64 {
+        let inner = self.inner.borrow();
+        inner.plugin_pages.values().filter_map(|page| page.model.as_ref()).fold(0u64, |sum, model| {
+            sum.wrapping_add((model.view() << 32) | (model.revision() & 0xffff_ffff))
+        })
     }
 
     /// Whether the page is to give the plugin panel on show room beside
@@ -5079,14 +5871,14 @@ impl<P: Platform, L: Link> App<P, L> {
 
     /// The pointer over the plugin panel, or its extended view, in its
     /// units. True when the page is to paint it again.
-    pub fn plugin_panel_pointer(&self, extended: bool, x: f32, y: f32) -> bool {
+    pub fn plugin_panel_pointer(&self, place: ViewPlace, x: f32, y: f32) -> bool {
         let mut inner = self.inner.borrow_mut();
-        Self::plugin_view_mut(&mut inner, extended).is_some_and(|panel| panel.pointer(x, y))
+        Self::plugin_view_mut(&mut inner, place).is_some_and(|panel| panel.pointer(x, y))
     }
 
-    pub fn plugin_panel_leave(&self, extended: bool) -> bool {
+    pub fn plugin_panel_leave(&self, place: ViewPlace) -> bool {
         let mut inner = self.inner.borrow_mut();
-        Self::plugin_view_mut(&mut inner, extended).is_some_and(|panel| panel.leave())
+        Self::plugin_view_mut(&mut inner, place).is_some_and(|panel| panel.leave())
     }
 
     /// A press in the plugin panel, or its extended view. True when it went
@@ -5094,7 +5886,7 @@ impl<P: Platform, L: Link> App<P, L> {
     #[allow(clippy::too_many_arguments)]
     pub fn plugin_panel_click(
         self: &Rc<Self>,
-        extended: bool,
+        place: ViewPlace,
         x: f32,
         y: f32,
         button: thinkterm_plugin_panel::Button,
@@ -5103,80 +5895,88 @@ impl<P: Platform, L: Link> App<P, L> {
     ) -> bool {
         let sends = {
             let mut inner = self.inner.borrow_mut();
-            match Self::plugin_view_mut(&mut inner, extended) {
+            match Self::plugin_view_mut(&mut inner, place) {
                 Some(panel) => panel.click(x, y, button, count, mods),
                 None => return false,
             }
         };
         let sent = !sends.is_empty();
-        self.send_panel_frames(sends, extended);
+        self.send_panel_frames(sends, place);
         sent
     }
 
     /// Whether the plugin panel, or its extended view, has the keyboard: one
     /// of its fields is the page's field with it.
-    pub fn plugin_panel_has_keyboard(&self, extended: bool) -> bool {
-        Self::plugin_view(&self.inner.borrow(), extended).is_some_and(|panel| panel.has_keyboard())
+    pub fn plugin_panel_has_keyboard(&self, place: ViewPlace) -> bool {
+        Self::plugin_view(&self.inner.borrow(), place).is_some_and(|panel| panel.has_keyboard())
     }
 
     /// The user put the keyboard in field `id` of the plugin panel, or its
     /// extended view: pressed in it, or tabbed to it. The other view lets go
     /// of it.
-    pub fn plugin_panel_field_focus(self: &Rc<Self>, extended: bool, id: &str) {
+    pub fn plugin_panel_field_focus(self: &Rc<Self>, place: ViewPlace, id: &str) {
         let (sends, others) = {
             let mut inner = self.inner.borrow_mut();
-            let others = match Self::plugin_view_mut(&mut inner, !extended) {
-                Some(other) if other.has_keyboard() => other.blur(),
-                _ => Vec::new(),
-            };
-            let sends = match Self::plugin_view_mut(&mut inner, extended) {
+            let pages: Vec<ViewPlace> = inner.plugin_pages.keys().map(|pane| ViewPlace::Page(*pane as u64)).collect();
+            let others: Vec<(ViewPlace, Vec<Vec<u8>>)> = [ViewPlace::Panel, ViewPlace::Extended]
+                .into_iter()
+                .chain(pages)
+                .filter(|other| *other != place)
+                .filter_map(|other| match Self::plugin_view_mut(&mut inner, other) {
+                    Some(view) if view.has_keyboard() => Some((other, view.blur())),
+                    _ => None,
+                })
+                .collect();
+            let sends = match Self::plugin_view_mut(&mut inner, place) {
                 Some(panel) => panel.focus_field(id),
                 None => Vec::new(),
             };
             (sends, others)
         };
-        self.send_panel_frames(others, !extended);
-        self.send_panel_frames(sends, extended);
+        for (other, sends) in others {
+            self.send_panel_frames(sends, other);
+        }
+        self.send_panel_frames(sends, place);
     }
 
     /// What field `id` of the plugin panel, or its extended view, holds now
     /// the user edited it: what the page's field is to hold instead, when
     /// the panel's takes less.
-    pub fn plugin_panel_field_text(self: &Rc<Self>, extended: bool, id: &str, text: &str) -> Option<String> {
+    pub fn plugin_panel_field_text(self: &Rc<Self>, place: ViewPlace, id: &str, text: &str) -> Option<String> {
         let (sends, held) = {
             let mut inner = self.inner.borrow_mut();
-            match Self::plugin_view_mut(&mut inner, extended) {
+            match Self::plugin_view_mut(&mut inner, place) {
                 Some(panel) => panel.edit_field(id, text),
                 None => return None,
             }
         };
-        self.send_panel_frames(sends, extended);
+        self.send_panel_frames(sends, place);
         held
     }
 
     /// The user submitted field `id` of the plugin panel, or its extended
     /// view.
-    pub fn plugin_panel_field_submit(self: &Rc<Self>, extended: bool, id: &str) {
+    pub fn plugin_panel_field_submit(self: &Rc<Self>, place: ViewPlace, id: &str) {
         let sends = {
             let mut inner = self.inner.borrow_mut();
-            match Self::plugin_view_mut(&mut inner, extended) {
+            match Self::plugin_view_mut(&mut inner, place) {
                 Some(panel) => panel.submit_field(id),
                 None => return,
             }
         };
-        self.send_panel_frames(sends, extended);
+        self.send_panel_frames(sends, place);
     }
 
     /// The keyboard went from the plugin panel, or its extended view.
-    pub fn plugin_panel_blur(self: &Rc<Self>, extended: bool) {
+    pub fn plugin_panel_blur(self: &Rc<Self>, place: ViewPlace) {
         let sends = {
             let mut inner = self.inner.borrow_mut();
-            match Self::plugin_view_mut(&mut inner, extended) {
+            match Self::plugin_view_mut(&mut inner, place) {
                 Some(panel) if panel.has_keyboard() => panel.blur(),
                 _ => return,
             }
         };
-        self.send_panel_frames(sends, extended);
+        self.send_panel_frames(sends, place);
     }
 
     /// A key the page's field with the keyboard does not use, in the plugin
@@ -5184,47 +5984,49 @@ impl<P: Platform, L: Link> App<P, L> {
     /// it was the panel's, for the page to keep it to itself.
     pub fn plugin_panel_key(
         self: &Rc<Self>,
-        extended: bool,
+        place: ViewPlace,
         key: &str,
         mods: thinkterm_plugin_panel::Mods,
     ) -> bool {
         let (taken, sends) = {
             let mut inner = self.inner.borrow_mut();
-            match Self::plugin_view_mut(&mut inner, extended) {
+            match Self::plugin_view_mut(&mut inner, place) {
                 Some(panel) => panel.key(key, mods),
                 None => return false,
             }
         };
-        self.send_panel_frames(sends, extended);
+        self.send_panel_frames(sends, place);
         taken
     }
 
     /// The wheel over the plugin panel, or its extended view, `dy` of its
     /// units down. True when something in it scrolled, and the page is to
     /// paint it again.
-    pub fn plugin_panel_wheel(self: &Rc<Self>, extended: bool, x: f32, y: f32, dx: f32, dy: f32) -> bool {
+    pub fn plugin_panel_wheel(self: &Rc<Self>, place: ViewPlace, x: f32, y: f32, dx: f32, dy: f32) -> bool {
         let (moved, sends) = {
             let mut inner = self.inner.borrow_mut();
-            match Self::plugin_view_mut(&mut inner, extended) {
+            match Self::plugin_view_mut(&mut inner, place) {
                 Some(panel) => panel.wheel(x, y, dx, dy),
                 None => return false,
             }
         };
-        self.send_panel_frames(sends, extended);
+        self.send_panel_frames(sends, place);
         moved
     }
 
-    fn plugin_view(inner: &Inner<P, L>, extended: bool) -> Option<&crate::plugin_panel::PanelModel> {
-        match extended {
-            true => inner.plugin_extended.as_ref(),
-            false => inner.plugin_panel.as_ref(),
+    fn plugin_view(inner: &Inner<P, L>, place: ViewPlace) -> Option<&crate::plugin_panel::PanelModel> {
+        match place {
+            ViewPlace::Extended => inner.plugin_extended.as_ref(),
+            ViewPlace::Panel => inner.plugin_panel.as_ref(),
+            ViewPlace::Page(pane) => inner.plugin_pages.get(&(pane as PaneId))?.model.as_ref(),
         }
     }
 
-    fn plugin_view_mut(inner: &mut Inner<P, L>, extended: bool) -> Option<&mut crate::plugin_panel::PanelModel> {
-        match extended {
-            true => inner.plugin_extended.as_mut(),
-            false => inner.plugin_panel.as_mut(),
+    fn plugin_view_mut(inner: &mut Inner<P, L>, place: ViewPlace) -> Option<&mut crate::plugin_panel::PanelModel> {
+        match place {
+            ViewPlace::Extended => inner.plugin_extended.as_mut(),
+            ViewPlace::Panel => inner.plugin_panel.as_mut(),
+            ViewPlace::Page(pane) => inner.plugin_pages.get_mut(&(pane as PaneId))?.model.as_mut(),
         }
     }
 
@@ -5263,11 +6065,28 @@ impl<P: Platform, L: Link> App<P, L> {
             if close {
                 inner.plugin_pipe = false;
                 inner.plugin_list.connection_lost();
+                // The frames' own connection is let go with it, and the
+                // server's way to the host goes with that.
+                if !matches!(inner.plugin_line, PluginLine::Shared) {
+                    Self::forget_plugin_line(inner);
+                    return;
+                }
             }
             close
         };
         if close {
+            // An empty frame closes it.
             self.send_plugin_frame(Vec::new(), FrameFor::Nobody);
+        }
+    }
+
+    /// Lets the frames' own connection go, if there is one or one is being
+    /// opened, and forgets how they went: found out again at the next
+    /// frame. Whatever it says after this is nobody's.
+    fn forget_plugin_line(inner: &mut Inner<P, L>) {
+        inner.plugin_line_found += 1;
+        if let PluginLine::Own(line) = std::mem::replace(&mut inner.plugin_line, PluginLine::Unknown) {
+            line.shutdown();
         }
     }
 
@@ -5358,11 +6177,12 @@ impl<P: Platform, L: Link> App<P, L> {
         done
     }
 
-    /// One frame for the plugin host, through the server, on the wire now
-    /// and so behind every frame sent before it. The call it carries, if
-    /// any, fails when the server cannot pass it on.
+    /// One frame for the plugin host, through the server, behind every
+    /// frame sent before it: on the frames' own connection, which the first
+    /// of them opens, or with everything else where there is none. The call
+    /// it carries, if any, fails when the server cannot pass it on.
     fn send_plugin_frame(self: &Rc<Self>, data: Vec<u8>, sender: FrameFor) {
-        let answer = {
+        let (answer, open) = {
             let inner = &mut *self.inner.borrow_mut();
             if inner.disconnected.is_some() {
                 // A panel hears of it from `on_close`.
@@ -5374,8 +6194,114 @@ impl<P: Platform, L: Link> App<P, L> {
             // A frame opens the server's way to the host; an empty one
             // closes it.
             inner.plugin_pipe = !data.is_empty();
-            inner.link.request(Pdu::PluginFrame(codec::PluginFrame { data }))
+            match &mut inner.plugin_line {
+                PluginLine::Own(line) => (Some(line.request(Pdu::PluginFrame(codec::PluginFrame { data }))), None),
+                PluginLine::Shared => (Some(inner.link.request(Pdu::PluginFrame(codec::PluginFrame { data }))), None),
+                PluginLine::Opening(waiting) => {
+                    waiting.push((data, sender));
+                    (None, None)
+                }
+                PluginLine::Unknown => {
+                    inner.plugin_line = PluginLine::Opening(vec![(data, sender)]);
+                    inner.plugin_line_found += 1;
+                    (None, Some((inner.link.beside(), inner.plugin_line_found)))
+                }
+            }
         };
+        if let Some(answer) = answer {
+            self.plugin_frame_sent(answer, sender);
+        }
+        if let Some((opening, found)) = open {
+            let app = Rc::clone(self);
+            self.spawn(async move {
+                let line = opening.await;
+                app.plugin_line_is(line, found);
+            });
+        }
+    }
+
+    /// How the frames go is found out: on the connection opened for them,
+    /// or with everything else. Those that waited for it go, in order.
+    fn plugin_line_is(self: &Rc<Self>, line: anyhow::Result<Option<L>>, found: u64) {
+        let line = line.unwrap_or_else(|err| {
+            log::warn!("plugin frames go with the terminals': a connection of their own did not open: {err:#}");
+            None
+        });
+        let waiting = {
+            let inner = &mut *self.inner.borrow_mut();
+            // Let go, or the connection it was to be beside went, while it
+            // opened.
+            if inner.plugin_line_found != found || !matches!(inner.plugin_line, PluginLine::Opening(_)) {
+                if let Some(line) = line {
+                    line.shutdown();
+                }
+                return;
+            }
+            let to = match &line {
+                Some(line) => PluginLine::Own(line.clone()),
+                None => PluginLine::Shared,
+            };
+            match std::mem::replace(&mut inner.plugin_line, to) {
+                PluginLine::Opening(waiting) => waiting,
+                _ => Vec::new(),
+            }
+        };
+        if let Some(line) = &line {
+            let weak = Rc::downgrade(self);
+            line.set_push_handler(Box::new(move |pdu| {
+                if let (Pdu::PluginFrame(codec::PluginFrame { data }), Some(app)) = (pdu, weak.upgrade()) {
+                    app.plugin_line_heard(found, Some(data));
+                }
+            }));
+            let weak = Rc::downgrade(self);
+            line.set_close_handler(Box::new(move |why| {
+                if let Some(app) = weak.upgrade() {
+                    log::warn!("the plugin frames' connection closed: {why}");
+                    app.plugin_line_heard(found, None);
+                }
+            }));
+            // Nothing of the terminals' is wanted on it: said before the
+            // first frame, which is what makes it a client to the server.
+            let quiet = line.request(Pdu::SubscribeEvents(codec::SubscribeEvents {}));
+            self.spawn(async move {
+                if let Err(err) = quiet.await {
+                    log::warn!("the plugin frames' connection: {err:#}");
+                }
+            });
+        }
+        for (data, sender) in waiting {
+            let frame = Pdu::PluginFrame(codec::PluginFrame { data });
+            let answer = match &line {
+                Some(line) => line.request(frame),
+                None => self.inner.borrow().link.request(frame),
+            };
+            self.plugin_frame_sent(answer, sender);
+        }
+    }
+
+    /// The frames' own connection, the `found`th, brought a frame, or --
+    /// `None` -- closed: then the host is as good as gone, and what is
+    /// asked of it again opens another.
+    fn plugin_line_heard(self: &Rc<Self>, found: u64, data: Option<Vec<u8>>) {
+        {
+            let inner = &mut *self.inner.borrow_mut();
+            if inner.plugin_line_found != found {
+                return;
+            }
+            if data.is_none() {
+                Self::forget_plugin_line(inner);
+            }
+        }
+        self.plugin_frame(data.unwrap_or_default());
+    }
+
+    /// What became of a frame that went to the server: who sent it hears
+    /// when the server could not pass it on.
+    fn plugin_frame_sent(
+        self: &Rc<Self>,
+        answer: crate::platform::LocalFuture<Result<Pdu, thinkterm_session::host::LinkError>>,
+        sender: FrameFor,
+    ) {
         let app = Rc::clone(self);
         self.spawn(async move {
             let refused = match answer.await {
@@ -5396,11 +6322,11 @@ impl<P: Platform, L: Link> App<P, L> {
     /// Sends frames for the page's plugin panel, or its extended view: one
     /// that does not reach the host has the view say why, and a panel open
     /// again in a while.
-    fn send_panel_frames(self: &Rc<Self>, frames: Vec<Vec<u8>>, extended: bool) {
+    fn send_panel_frames(self: &Rc<Self>, frames: Vec<Vec<u8>>, place: ViewPlace) {
         if frames.is_empty() {
             return;
         }
-        let view = Self::plugin_view(&self.inner.borrow(), extended).map(|panel| panel.view());
+        let view = Self::plugin_view(&self.inner.borrow(), place).map(|panel| panel.view());
         for frame in frames {
             self.send_plugin_frame(frame, view.map_or(FrameFor::Nobody, FrameFor::Panel));
         }
@@ -5418,8 +6344,12 @@ impl<P: Platform, L: Link> App<P, L> {
             if let Some(extended) = inner.plugin_extended.as_mut().filter(|extended| extended.view() == view) {
                 extended.unsent(why, now);
             }
+            let page = inner
+                .plugin_pages
+                .values_mut()
+                .find_map(|page| page.model.as_mut().filter(|model| model.view() == view));
             let panel = inner.plugin_panel.as_mut().filter(|panel| panel.view() == view);
-            panel.and_then(|panel| panel.unsent(why, now))
+            panel.or(page).and_then(|view| view.unsent(why, now))
         };
         if let Some(delay) = later {
             self.wake_plugin_panel(delay);
@@ -5491,7 +6421,15 @@ impl<P: Platform, L: Link> App<P, L> {
                 if let Some(extended) = inner.plugin_extended.as_mut() {
                     extended.lost(at);
                 }
-                let again = (snippets_again || panel_again || inner.plugin_list.wanted()).then_some(delay);
+                let mut pages_again = false;
+                for page in inner.plugin_pages.values_mut() {
+                    if let Some(model) = page.model.as_mut() {
+                        model.lost(at);
+                        pages_again |= model.waiting();
+                    }
+                }
+                let again =
+                    (snippets_again || panel_again || pages_again || inner.plugin_list.wanted()).then_some(delay);
                 inner.plugin_calls.lost("the plugin host went away");
                 again
             };
@@ -5727,6 +6665,24 @@ impl<P: Platform, L: Link> App<P, L> {
         Self::notify(&self.inner.borrow());
     }
 
+    /// The scheme to draw in when nothing was picked here and the server's
+    /// configuration chose none (`Inner::fallback_palette`), and the scheme
+    /// such a server's palette may be besides the built-in one; none to
+    /// draw the server's palette whatever it is.
+    pub fn set_fallback_palette(self: &Rc<Self>, fallback: Option<(ColorPalette, Option<ColorPalette>)>) {
+        let changed = {
+            let mut inner = self.inner.borrow_mut();
+            if inner.fallback_palette == fallback {
+                return;
+            }
+            inner.fallback_palette = fallback;
+            inner.recompute_palettes()
+        };
+        self.repaint_palettes(&changed);
+        self.advise_palette();
+        Self::notify(&self.inner.borrow());
+    }
+
     /// The pane in use takes the scheme on the server too -- on show only:
     /// telling a host's server which pane has focus moves its desktop's tab
     /// when the desktop follows the page. A scheme chosen off show is told
@@ -5766,16 +6722,26 @@ impl<P: Platform, L: Link> App<P, L> {
 
     /// One preference changed on the page.
     pub fn set_setting(self: &Rc<Self>, key: &str, value: &str) -> Result<(), String> {
-        let (language, font, scheme) = {
+        let (language, font, scheme, redial) = {
             let mut inner = self.inner.borrow_mut();
+            let was_redialing = inner.settings.auto_reconnect;
             inner.settings.set(key, value)?;
             (
                 inner.settings.language.clone(),
                 inner.settings.font,
                 inner.settings.terminal_scheme.clone(),
+                !was_redialing && inner.settings.auto_reconnect,
             )
         };
         match key {
+            // Turned on with the connection lost: the redial it asks for
+            // starts now, not at the next network change or return.
+            "auto-reconnect" => {
+                if redial {
+                    self.reconnect_now();
+                }
+                Self::notify(&self.inner.borrow());
+            }
             "language" => self.apply_language(&language),
             "font" => self.set_font_mode(font),
             // Back to the desktop's scheme: the colours the page sends with
@@ -5950,12 +6916,75 @@ impl<P: Platform, L: Link> App<P, L> {
             }
         }
         entries.extend(crate::palette::commands());
+        // What the server's plugins do when asked by name, as last heard.
+        entries.extend(inner.plugin_list.actions().into_iter().map(|(name, title)| Entry {
+            id: format!("plugin:{name}"),
+            title,
+            subtitle: String::new(),
+            icon: "puzzle",
+            accessory: String::new(),
+            group: Group::Commands,
+            terms: name.replace(['-', '.'], " "),
+        }));
         crate::palette::results(query, entries, &inner.recent)
     }
 
     /// The page's remembered picks, given back at boot.
     pub fn set_recent(&self, ids: Vec<String>) {
         self.inner.borrow_mut().recent = ids;
+    }
+
+    /// Does the action named `name` -- a plugin's id, a "." and the
+    /// action's -- of a plugin on the server's machine: opens its page, or
+    /// calls it with where the user is added to what its manifest says to
+    /// call it with. False for one the list as last heard does not have.
+    pub fn plugin_action(self: &Rc<Self>, name: &str) -> bool {
+        let found = {
+            let inner = self.inner.borrow();
+            inner.plugin_list.action(name).map(|(plugin, does)| {
+                let at = Self::action_at(&inner, &plugin);
+                (plugin, does, at)
+            })
+        };
+        let Some((plugin, does, at)) = found else {
+            return false;
+        };
+        match does {
+            plugins_api::Does::Page(args) => self.open_page(&plugin, &args.to_string()),
+            plugins_api::Does::Call(body) => {
+                let call = self.plugin_call(&plugin, at.added_to(body));
+                let name = name.to_string();
+                self.spawn(async move {
+                    if let Err(why) = call.await {
+                        log::warn!("plugin action {name}: {why}");
+                    }
+                });
+            }
+        }
+        true
+    }
+
+    /// Where the user is, for an action of plugin `plugin`: at the pane in
+    /// focus. A page is no terminal, so at one, at the terminal it was
+    /// opened from, in its directory then -- and, to the page's own plugin,
+    /// at the page.
+    fn action_at(inner: &Inner<P, L>, plugin: &str) -> thinkterm_plugin_panel::At {
+        let page = inner.layout.as_ref().and_then(|layout| layout.pane_pages.get(&inner.focused_pane));
+        let Some(page) = page else {
+            return thinkterm_plugin_panel::At {
+                cwd: Self::focused_cwd(inner),
+                remote: None,
+                terminal: Self::focused_terminal(inner),
+                page: None,
+            };
+        };
+        let (cwd, terminal) = Self::page_origin(inner, inner.focused_pane);
+        thinkterm_plugin_panel::At {
+            cwd,
+            remote: None,
+            terminal,
+            page: (page.plugin == plugin).then(|| page.id.clone()),
+        }
     }
 
     /// Do what a palette pick asks. `page` names what only the page can
@@ -5988,6 +7017,7 @@ impl<P: Platform, L: Link> App<P, L> {
                 Err(_) => outcome.handled = false,
             },
             ("space", id) => outcome.handled = self.set_space(id),
+            ("plugin", name) => outcome.handled = self.plugin_action(name),
             ("cmd", "new-thread") => self.on_side_click(SideClick::NewThread(None)),
             ("cmd", "new-tab") => self.new_tab(),
             ("cmd", "split-right") => self.split(None, thinkterm_proto::SplitDirection::Horizontal),
@@ -6167,23 +7197,245 @@ impl<P: Platform, L: Link> App<P, L> {
         }
     }
 
-    /// Zoom the focused pane to the whole tab, or back.
+    /// Zoom the focused pane to the whole tab, or back. A pane named may
+    /// be another tab's -- a tab's menu names the one its tab shows: that
+    /// tab is zoomed and comes on show, as the desktop's menu has it, and
+    /// the one that was on show is left as it is.
     pub fn toggle_zoom(self: &Rc<Self>, pane: Option<PaneId>) {
         let pane_id = self.target_pane(pane);
-        let (tab_id, zoomed) = {
+        let (tab_id, zoomed, shown, link) = {
             let inner = self.inner.borrow();
-            let zoomed = inner.tab_layout.as_ref().is_some_and(|l| l.zoomed.is_some());
-            (inner.tab_id, zoomed)
+            let elsewhere = inner
+                .layout
+                .as_ref()
+                .and_then(|listed| tab_of(listed, pane_id))
+                .filter(|(tab_id, _)| *tab_id != inner.tab_id);
+            match elsewhere {
+                Some((tab_id, zoomed)) => (tab_id, zoomed, false, inner.link.clone()),
+                None => {
+                    let zoomed = inner.tab_layout.as_ref().is_some_and(|l| l.zoomed.is_some());
+                    (inner.tab_id, zoomed, true, inner.link.clone())
+                }
+            }
         };
-        self.act(
-            "web-act-zoom-pane",
-            Pdu::SetPaneZoomed(codec::SetPaneZoomed {
+        self.set_zoom(tab_id, pane_id, !zoomed, shown, link);
+    }
+
+    /// Show `pane_id` alone at its tab's size, whichever pane the tab
+    /// showed so before: a tap on one of `panes_view`'s where a tab shows
+    /// one pane at a time. A pane that is not the tab's on show -- another
+    /// tab's, one behind another in a stack -- is switched to as any
+    /// other, and shown alone when its tab comes (`keep_one_pane`).
+    pub fn zoom_to(self: &Rc<Self>, pane_id: PaneId) {
+        // The tab on show holds it, and in front of its stack or not.
+        let here = {
+            let inner = self.inner.borrow();
+            inner.tab_layout.as_ref().zip(inner.layout.as_ref()).and_then(|(current, listed)| {
+                let node = crate::layout::tab_containing(listed, pane_id)?;
+                let (_, tab_id) = node.window_and_tab_ids()?;
+                let whole = crate::layout::with_zoom(node, current.size, 0, None)?;
+                let front = whole.panes.iter().any(|place| place.pane_id == pane_id);
+                (tab_id == inner.tab_id).then(|| (tab_id, front, inner.link.clone()))
+            })
+        };
+        match here {
+            Some((tab_id, true, link)) => {
+                self.inner.borrow_mut().one_pane_asked = None;
+                self.set_zoom(tab_id, pane_id, true, true, link)
+            }
+            // Behind another in its stack: the server brings it to the
+            // front, then shows it alone.
+            // Not if the client left the tab, or the screen, meanwhile: that
+            // put the tab back as it was (`leave_one_pane`), and nothing
+            // would after. Nor if it has room for the split again.
+            Some((tab_id, false, link)) => self.act(
+                "web-act-activate-pane",
+                Pdu::ActivatePaneInStack(codec::ActivatePaneInStack { pane_id }),
+                move |app, _| {
+                    let still = {
+                        let inner = app.inner.borrow();
+                        inner.tab_id == tab_id && inner.platform.shown() && inner.platform.one_pane()
+                    };
+                    if still {
+                        app.set_zoom(tab_id, pane_id, true, true, link.clone());
+                    }
+                },
+            ),
+            None => self.switch_to_pane(pane_id, true),
+        }
+    }
+
+    /// The client's shape changed between one pane at a time and the
+    /// split whole (`Platform::one_pane`): the grid is laid out again,
+    /// with or without the bars, and the tab zoomed or put back.
+    pub fn one_pane_changed(self: &Rc<Self>) {
+        let on = {
+            let mut inner = self.inner.borrow_mut();
+            inner.cols = 0;
+            inner.one_pane_asked = None;
+            inner.platform.one_pane()
+        };
+        self.resize();
+        if on {
+            self.keep_one_pane();
+        } else {
+            self.leave_one_pane();
+        }
+        Self::notify(&self.inner.borrow());
+        self.request_frame();
+    }
+
+    /// Where a tab shows one pane at a time: the focused pane alone, once
+    /// a listing shows the tab on screen with its panes side by side -- at
+    /// first sight, after a split, after someone unzoomed it elsewhere.
+    fn keep_one_pane(self: &Rc<Self>) {
+        let ask = {
+            let mut inner = self.inner.borrow_mut();
+            // Asked and answered: the tab on show is zoomed, by the
+            // server's word. A split of it after, or a return to it, is
+            // shown one pane at a time at once, not once the wait is up.
+            let answered = inner.zoom_ahead.is_none()
+                && inner.one_pane_asked.is_some_and(|(asked, _)| {
+                    inner
+                        .tab_layout
+                        .as_ref()
+                        .is_some_and(|layout| layout.tab_id == asked && layout.zoomed.is_some())
+                });
+            if answered {
+                inner.one_pane_asked = None;
+            }
+            // A tab another device holds is that device's to shape: this
+            // one shows it as it is until it is taken (`take_over_with`).
+            let wanted = inner.platform.one_pane()
+                && inner.platform.shown()
+                && inner.disconnected.is_none()
+                && inner.zoom_ahead.is_none()
+                && inner.drag_divider.is_none()
+                && !inner.link.lease().needs_claim();
+            let now = inner.platform.monotonic_ms();
+            let split = inner
+                .tab_layout
+                .as_ref()
+                .filter(|layout| wanted && layout.zoomed.is_none() && layout.panes.len() > 1)
+                .map(|layout| layout.tab_id)
+                // Asked a moment ago: the server's answer is on its way.
+                .filter(|tab_id| {
+                    !inner
+                        .one_pane_asked
+                        .is_some_and(|(asked, at)| asked == *tab_id && now - at < Self::ONE_PANE_PATIENCE_MS)
+                });
+            split.map(|tab_id| {
+                inner.one_pane_asked = Some((tab_id, now));
+                (tab_id, inner.focused_pane, inner.link.clone())
+            })
+        };
+        if let Some((tab_id, pane_id, link)) = ask {
+            self.set_zoom(tab_id, pane_id, true, true, link);
+        }
+    }
+
+    /// The tab this client zoomed to show one pane at a time and the pane
+    /// it shows so, to be put back when the client leaves it: for the App
+    /// made after this one's connection ended, on the same server, which
+    /// finds the tab zoomed and cannot tell who zoomed it.
+    pub fn one_pane_zoomed(&self) -> Option<(TabId, PaneId)> {
+        self.inner.borrow().one_pane_tab
+    }
+
+    /// That of the App before this one, on the same server
+    /// (`one_pane_zoomed`): put back by this one when it leaves the tab --
+    /// or at once, where this one does not show that tab one pane at a
+    /// time now (made off screen, attached to another tab, with room for
+    /// the split), as nothing would put it back after.
+    pub fn keep_one_pane_zoomed(self: &Rc<Self>, zoomed: (TabId, PaneId)) {
+        let here = {
+            let mut inner = self.inner.borrow_mut();
+            if inner.one_pane_tab.is_some() {
+                return;
+            }
+            inner.one_pane_tab = Some(zoomed);
+            inner.platform.shown() && inner.platform.one_pane() && inner.tab_id == zoomed.0
+        };
+        if !here {
+            self.leave_one_pane();
+        }
+    }
+
+    /// How long a tab asked to show one pane is left to do so before it is
+    /// asked again: longer than a zoom drawn ahead waits for its listing.
+    const ONE_PANE_PATIENCE_MS: f64 = 6_000.0;
+
+    /// The tab this client zoomed to show one pane at a time goes back to
+    /// its split: the client is leaving it -- for another tab, or off
+    /// screen -- and whoever looks at it next sees it as they left it.
+    pub fn leave_one_pane(self: &Rc<Self>) {
+        let Some((tab_id, pane_id)) = self.inner.borrow_mut().one_pane_tab.take() else {
+            return;
+        };
+        // Split again for whoever looks next: when this client is back it
+        // asks anew, at once.
+        {
+            let mut inner = self.inner.borrow_mut();
+            if inner.one_pane_asked.is_some_and(|(asked, _)| asked == tab_id) {
+                inner.one_pane_asked = None;
+            }
+        }
+        let link = self.inner.borrow().link.clone();
+        self.spawn(async move {
+            let pdu = Pdu::SetPaneZoomed(codec::SetPaneZoomed {
                 containing_tab_id: tab_id,
                 pane_id,
-                zoomed: !zoomed,
-            }),
-            |_, _| {},
-        );
+                zoomed: false,
+            });
+            if let Err(err) = thinkterm_session::host::request(&link, pdu, Ok).await {
+                log::warn!("web-act-zoom-pane: {err:#}");
+            }
+        });
+    }
+
+    /// Ask the server to zoom `pane_id` of `tab_id`, or to unzoom it,
+    /// drawing it at once when the tab is the one on show (`shown`).
+    fn set_zoom(self: &Rc<Self>, tab_id: TabId, pane_id: PaneId, zoom: bool, shown: bool, link: L) {
+        // On screen at once; the server hears of it meanwhile.
+        let fresh = match shown {
+            true => Self::zoom_ahead(&mut self.inner.borrow_mut(), pane_id, zoom),
+            false => None,
+        };
+        if let Some(fresh) = fresh {
+            self.sync_frame_control();
+            self.ask_after(fresh);
+            self.refresh_status();
+            self.request_frame();
+        }
+        {
+            // What this client zoomed for want of room is its to put back:
+            // the tab on show. Another tab's zoom, asked of it from here,
+            // is that tab's own, and the one this client keeps stays kept.
+            let mut inner = self.inner.borrow_mut();
+            if inner.platform.one_pane() && shown {
+                inner.one_pane_tab = zoom.then_some((tab_id, pane_id));
+            }
+        }
+        let app = Rc::clone(self);
+        self.spawn(async move {
+            let pdu = Pdu::SetPaneZoomed(codec::SetPaneZoomed {
+                containing_tab_id: tab_id,
+                pane_id,
+                zoomed: zoom,
+            });
+            if let Err(err) = thinkterm_session::host::request(&link, pdu, Ok).await {
+                log::warn!("web-act-zoom-pane: {err:#}");
+                let mut inner = app.inner.borrow_mut();
+                // Nothing came of it: the server's layout again.
+                inner.zoom_ahead = None;
+                Self::set_status(&inner, &failed("web-act-zoom-pane", &err));
+            } else if !shown && !app.inner.borrow().panes.contains_key(&pane_id) {
+                // Its tab, listed again as it is now.
+                return app.switch_to_pane(pane_id, false);
+            }
+            app.refresh_layout();
+            app.platform.focus_input();
+        });
     }
 
     /// Close the focused pane, ending its program.
@@ -6324,6 +7576,8 @@ impl<P: Platform, L: Link> App<P, L> {
                 }
                 None => {}
             }
+            // The tab is this client's to shape now.
+            app.keep_one_pane();
         });
     }
 
@@ -6348,6 +7602,7 @@ impl<P: Platform, L: Link> App<P, L> {
         inner.link.set_push_handler(Box::new(|_| {}));
         inner.link.set_close_handler(Box::new(|_| {}));
         inner.link.shutdown();
+        Self::forget_plugin_line(inner);
     }
 
     /// Take the GPU state back, for a platform that keeps its device
@@ -7090,11 +8345,23 @@ impl<P: Platform, L: Link> App<P, L> {
             }
             let px = cell.scroll_px;
             let visible = visible_rows_px(&dims, rows_shown, cell.scroll_from_bottom, px);
-            let (first, lines) = session.get_lines(visible);
+            // A pane that holds a plugin's page has no rows of its own: in
+            // their place it says whose page it is and where it is drawn --
+            // what a phone's app shows, and what a browser draws the page
+            // over.
+            let page = inner
+                .layout
+                .as_ref()
+                .and_then(|listed| listed.pane_pages.get(&place.pane_id))
+                .map(|page| page.name());
+            let (first, lines) = match page {
+                Some(title) => (visible.start, page_placeholder(title, cols_shown, visible.len())),
+                None => session.get_lines(visible),
+            };
             // No cursor before the server has placed one: a fresh cell's
             // sits at the origin, which is nowhere real.
             let mut cursor = session.cursor_position();
-            if !session.has_received() {
+            if !session.has_received() || page.is_some() {
                 cursor.y = StableRowIndex::MIN;
             }
             let palette = cell.palette.clone();
@@ -7374,6 +8641,42 @@ mod tests {
     use super::grid_for;
 
     #[test]
+    fn a_page_pane_says_whose_page_it_is_in_the_middle_of_its_rows() {
+        let text = |line: &termwiz::surface::Line| line.as_str().trim_end().to_string();
+        let hint = super::tr("plugin-page-placeholder");
+        let across = hint.chars().count() + 4;
+        let rows = super::page_placeholder("Board", across, 6);
+        assert_eq!(rows.len(), 6);
+        assert_eq!(text(&rows[2]).trim_start(), "Board");
+        assert_eq!(text(&rows[2]).len() - 5, (across - 5) / 2, "centred");
+        assert_eq!(text(&rows[3]), format!("  {hint}"), "under it, centred");
+        for row in [0, 1, 4, 5] {
+            assert_eq!(text(&rows[row]), "");
+        }
+
+        // Where it is too narrow for that, the rest takes the lines it
+        // needs: none wider than there is, and nothing of it lost.
+        let rows = super::page_placeholder("Board", 12, 40);
+        let said: Vec<String> = rows.iter().map(text).filter(|line| !line.is_empty()).collect();
+        assert!(said.len() > 2, "{said:?}");
+        assert_eq!(said[0].trim_start(), "Board");
+        assert!(said.iter().all(|line| line.chars().count() <= 12), "{said:?}");
+        let unspaced = |text: &str| text.split_whitespace().collect::<String>();
+        assert_eq!(unspaced(&said[1..].join(" ")), unspaced(&hint));
+        // And with fewer rows than that, it is the last of them that go.
+        let few = super::page_placeholder("Board", 12, 2);
+        assert_eq!(text(&few[0]).trim_start(), "Board");
+        assert_eq!(text(&few[1]), text(&rows[rows.iter().position(|row| text(row).trim_start() == "Board").unwrap() + 1]));
+
+        // Wide characters are counted as the cells they take.
+        assert_eq!(text(&super::page_placeholder("看板页面", 6, 1)[0]), "看板页");
+        // One row is the name's; none is none.
+        assert_eq!(text(&super::page_placeholder("Board", 20, 1)[0]), "       Board");
+        assert!(super::page_placeholder("Board", 20, 0).is_empty());
+        assert_eq!(super::page_placeholder("Board", 0, 2).len(), 2);
+    }
+
+    #[test]
     fn a_degenerate_box_yields_no_grid() {
         assert_eq!(grid_for(0, 0, 10, 20), None);
         assert_eq!(grid_for(1, 1, 10, 20), None);
@@ -7428,6 +8731,8 @@ mod tests {
             tab_titles: Vec::new(),
             window_titles: Default::default(),
             pane_labels: Default::default(),
+            pane_machines: Default::default(),
+            pane_pages: Default::default(),
         };
         let at = |pane_id| tab_places(&layout, pane_id).map(|places| places.iter().map(|p| (p.pane, p.left, p.top)).collect::<Vec<_>>());
         assert_eq!(at(10), Some(vec![(10, 0, 0)]));
@@ -7438,6 +8743,11 @@ mod tests {
         );
         assert_eq!(at(30), Some(vec![(31, 0, 0)]), "a zoomed pane alone");
         assert_eq!(at(99), None);
+        // The tab each is in, and whether that tab is zoomed: a stack's
+        // pane behind, and the pane a zoomed one hides, are in theirs too.
+        assert_eq!(super::tab_of(&layout, 22), Some((2, false)));
+        assert_eq!(super::tab_of(&layout, 30), Some((3, true)));
+        assert_eq!(super::tab_of(&layout, 99), None);
         // Each at the size the same listing has it.
         let place = tab_places(&layout, 21).unwrap()[1];
         assert_eq!((place.cols, place.rows), (40, 12));

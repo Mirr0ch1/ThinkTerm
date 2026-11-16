@@ -7,13 +7,18 @@
 //! at the tail of the paint pass, and its own key/mouse dispatch that runs
 //! before the terminal's).
 
-use crate::commands::ExpandedCommand;
+use crate::commands::{CommandDef, ExpandedCommand};
 use config::TermConfig;
 use std::sync::Arc;
 use wezterm_term::TerminalConfiguration;
 use crate::overlay::selector::{matcher_pattern, matcher_score};
+use crate::quad::TripleLayerQuadAllocator;
 use crate::workspace_threads::{ThreadSearchEntry, WorkspaceThreadWorkStatus};
-use crate::termwindow::palette::{build_commands, format_key_label, frecency_scores, save_recent};
+use crate::inputmap::tight_chord_label;
+use crate::termwindow::palette::{
+    apply_bound_chords, build_commands, format_key_label, frecency_scores, save_recent,
+    shown_chords,
+};
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::native_settings::NativeThreadIcons;
 use crate::termwindow::ui::sidebar::ThreadRowMarks;
@@ -33,17 +38,17 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use termwiz::input::KeyCode;
+use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
 use window::{
     Appearance, Clipboard, Modifiers, MouseCursor, MouseEvent, MouseEventKind, MousePress, RectF,
-    WindowOps,
+    UIKeyCapRendering, WindowOps,
 };
 
 // Geometry in design pixels (the 2x macOS grid); convert with `ctx.px` at the
 // point of use, exactly like the context menu and the sidebars.
-const CARD_RADIUS: f32 = 28.0;
-const CARD_MIN_W: f32 = 760.0;
-const CARD_MAX_W: f32 = 1360.0;
+const CARD_RADIUS: f32 = 40.0;
+const CARD_W: f32 = 760.0;
 const CARD_MARGIN: f32 = 48.0;
 const CARD_TOP_MIN: f32 = 72.0;
 const CARD_BOTTOM_PAD: f32 = 10.0;
@@ -54,16 +59,14 @@ const LIST_TOP_PAD: f32 = 12.0;
 const SCROLLBAR_LINGER: f32 = 0.7;
 /// …and how long it takes to fade out after that.
 const SCROLLBAR_FADE: f32 = 0.25;
-const SEARCH_EXTRA_H: f32 = 48.0;
-const SEARCH_MIN_H: f32 = 96.0;
-const SEARCH_ICON_SIZE: f32 = 34.0;
-const ROW_EXTRA_H: f32 = 28.0;
-const ROW_MIN_H: f32 = 72.0;
-const ROW_RADIUS: f32 = 16.0;
-const ROW_INSET_X: f32 = 10.0;
-const ROW_INSET_Y: f32 = 3.0;
+const SEARCH_EXTRA_H: f32 = 34.0;
+const SEARCH_MIN_H: f32 = 76.0;
+const SEARCH_ICON_SIZE: f32 = 30.0;
+const ROW_EXTRA_H: f32 = 18.0;
+const ROW_MIN_H: f32 = 52.0;
+const ROW_INSET_X: f32 = 12.0;
 const PAD_X: f32 = 28.0;
-const ICON_SIZE: f32 = 30.0;
+const ICON_SIZE: f32 = 28.0;
 const ICON_SLOT: f32 = 46.0;
 const LABEL_GAP: f32 = 16.0;
 const CHEVRON_SIZE: f32 = 26.0;
@@ -71,6 +74,14 @@ const CARET_WIDTH: f32 = 3.0;
 const BACK_CHIP_ICON: f32 = 26.0;
 const BACK_CHIP_PAD_X: f32 = 14.0;
 const BACK_CHIP_GAP: f32 = 12.0;
+const FOOTER_PAD_Y: f32 = 16.0;
+const FOOTER_KEY_EXTRA_H: f32 = 8.0;
+const FOOTER_KEY_MIN_H: f32 = 36.0;
+const FOOTER_KEY_PAD_X: f32 = 12.0;
+const FOOTER_KEY_RADIUS: f32 = 12.0;
+/// A shortcut's symbols against the height of the text beside them.
+const SHORTCUT_ICON_SCALE: f32 = 0.78;
+const FOOTER_HINT_GAP: f32 = 28.0;
 /// Fraction of the window height the list may occupy.
 const LIST_MAX_FRACTION: f32 = 0.62;
 /// Search penetrates group children once the query is this long...
@@ -81,10 +92,75 @@ const PENETRATION_PER_GROUP: usize = 3;
 /// entries is slower than just showing them.
 const GROUP_FOLD_THRESHOLD: usize = 3;
 
+/// A shortcut as the palette shows it. A Mac's symbols are drawn: the font's
+/// ⌘ ⌥ ⇧ ⌃ come from different faces, at sizes and weights that do not match.
+#[derive(Debug, PartialEq)]
+enum Shortcut {
+    /// The modifiers and the key when it has a symbol too, else its name.
+    Symbols(Vec<SvgIcon>, Option<String>),
+    Text(String),
+}
+
+fn key_symbol(key: &window::KeyCode) -> Option<SvgIcon> {
+    use window::{KeyCode, PhysKeyCode};
+    Some(match key {
+        KeyCode::Char('\r') => SvgIcon::CornerDownLeft,
+        KeyCode::Char('\t') => SvgIcon::ArrowRightToLine,
+        KeyCode::LeftArrow | KeyCode::Physical(PhysKeyCode::LeftArrow) => SvgIcon::ArrowLeft,
+        KeyCode::RightArrow | KeyCode::Physical(PhysKeyCode::RightArrow) => SvgIcon::ArrowRight,
+        KeyCode::UpArrow | KeyCode::Physical(PhysKeyCode::UpArrow) => SvgIcon::ArrowUp,
+        KeyCode::DownArrow | KeyCode::Physical(PhysKeyCode::DownArrow) => SvgIcon::ArrowDown,
+        _ => return None,
+    })
+}
+
+/// One chord the way shortcuts are shown here: ⌃⌥⇧⌘, the order a Mac's menus
+/// use, on a Mac, Ctrl-Enter elsewhere.
+fn chord_shortcut(
+    key: &window::KeyCode,
+    mods: Modifiers,
+    rendering: UIKeyCapRendering,
+) -> Shortcut {
+    const SYMBOLS: [(Modifiers, SvgIcon); 4] = [
+        (Modifiers::CTRL, SvgIcon::ChevronUp),
+        (Modifiers::ALT, SvgIcon::Option),
+        (Modifiers::SHIFT, SvgIcon::ArrowBigUp),
+        (Modifiers::SUPER, SvgIcon::Command),
+    ];
+    let drawable = SYMBOLS
+        .iter()
+        .fold(mods, |rest, (modifier, _)| rest & !*modifier)
+        == Modifiers::NONE;
+    if !cfg!(target_os = "macos") || rendering != UIKeyCapRendering::AppleSymbols || !drawable {
+        return Shortcut::Text(tight_chord_label(key, mods, rendering));
+    }
+    let mut icons: Vec<SvgIcon> = SYMBOLS
+        .iter()
+        .filter(|(modifier, _)| mods.contains(*modifier))
+        .map(|(_, icon)| *icon)
+        .collect();
+    match key_symbol(key) {
+        Some(icon) => {
+            icons.push(icon);
+            Shortcut::Symbols(icons, None)
+        }
+        None => Shortcut::Symbols(icons, Some(crate::inputmap::ui_key(key, rendering))),
+    }
+}
+
+fn command_shortcut(cmd: &ExpandedCommand, config: &config::ConfigHandle) -> Option<Shortcut> {
+    if let [(mods, key)] = shown_chords(cmd, config).as_slice() {
+        return Some(chord_shortcut(key, *mods, config.ui_key_cap_rendering));
+    }
+    format_key_label(cmd, config).map(Shortcut::Text)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PaletteAction {
     Search,
     Back,
+    /// The footer's way to Settings → Keymap.
+    Keymap,
     /// Index into the current match order, not into the item list.
     Row(usize),
 }
@@ -126,6 +202,9 @@ pub(crate) struct PaletteGroup {
     aliases: &'static str,
     /// Lets a caller open the palette already drilled into one group.
     kind: PaletteGroupKind,
+    /// The command this group stands in for: the row shows its shortcut and
+    /// Settings → Keymap lists it.
+    command: Option<ExpandedCommand>,
     items: Rc<Vec<PaletteItem>>,
     /// One fuzzy haystack per child, precomputed at build time: formatting
     /// ~1000 scheme haystacks (each with a `{:?}` of the action) on every
@@ -189,6 +268,8 @@ enum EntryKind {
 
 pub(crate) struct CommandPaletteState {
     root: Vec<PaletteItem>,
+    /// What Settings → Keymap lists, by the names it lists them under.
+    keymap_commands: Vec<(String, KeyAssignment)>,
     /// Drill-down stack; empty means the root list is showing.
     stack: Vec<PaletteFrame>,
     search: TextInputState,
@@ -222,9 +303,10 @@ pub(crate) struct CommandPaletteState {
 }
 
 impl CommandPaletteState {
-    fn new(root: Vec<PaletteItem>) -> Self {
+    fn new(root: Vec<PaletteItem>, keymap_commands: Vec<(String, KeyAssignment)>) -> Self {
         Self {
             root,
+            keymap_commands,
             stack: Vec::new(),
             search: TextInputState::new(),
             selected: 0,
@@ -364,6 +446,33 @@ impl CommandPaletteState {
         }
     }
 
+    /// The name Settings → Keymap lists an entry's command under. `None`
+    /// for what it does not list: a group of its own, a thread, a theme.
+    fn keymap_name(&self, order_idx: usize) -> Option<&str> {
+        let group_command = match self.entry(order_idx)? {
+            MatchEntry::Item(idx) => match self.current_items().get(idx)? {
+                PaletteItem::Group(group) => group.command.as_ref(),
+                _ => None,
+            },
+            MatchEntry::Nested(..) => None,
+        };
+        let action = group_command
+            .map(|command| &command.action)
+            .or_else(|| self.action_for_entry(order_idx))?;
+        self.keymap_commands
+            .iter()
+            .find(|(_, known)| known == action)
+            .map(|(name, _)| name.as_str())
+    }
+
+    /// What Settings → Keymap searches for when opened from here: the
+    /// selected command, or nothing for a row it does not list.
+    fn keymap_search(&self) -> String {
+        self.keymap_name(self.selected)
+            .unwrap_or_default()
+            .to_string()
+    }
+
     fn enter_group(&mut self, item_idx: usize) {
         let (label, items, haystacks) = match self.current_items().get(item_idx) {
             Some(PaletteItem::Group(group)) => (
@@ -459,6 +568,21 @@ impl CommandPaletteState {
         self.ensure_selected_visible();
     }
 
+    /// The pointer picks the row it is on, as in a menu: there is one
+    /// highlight, and the keys act on what it shows. Unlike the keyboard it
+    /// never scrolls the list out from under itself. Reports a change.
+    fn select_under_pointer(&mut self, order_idx: usize) -> bool {
+        if self.selected == order_idx
+            || !self.matches_fresh()
+            || self.entry(order_idx).is_none()
+            || self.is_header_row(order_idx)
+        {
+            return false;
+        }
+        self.selected = order_idx;
+        true
+    }
+
     fn ensure_selected_visible(&mut self) {
         let row_h = self.layout.row_height.max(1.0);
         let pad = self.layout.top_pad;
@@ -486,10 +610,21 @@ fn item_label(item: &PaletteItem) -> &str {
     }
 }
 
+fn menu_path(cmd: &ExpandedCommand, separator: &str) -> String {
+    cmd.menubar
+        .iter()
+        .map(|name| crate::commands::menu_title(name))
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
 fn item_haystack(item: &PaletteItem) -> String {
     match item {
+        // The menu path in English as well as shown, so English words
+        // still find a command whatever the language.
         PaletteItem::Leaf(cmd) => format!(
-            "{}: {}. {} {:?}",
+            "{} {}: {}. {} {:?}",
+            menu_path(cmd, " "),
             cmd.menubar.join(" "),
             cmd.brief,
             cmd.doc,
@@ -655,16 +790,70 @@ fn family_child(mut cmd: ExpandedCommand, kind: PaletteGroupKind) -> ExpandedCom
                 _ => None,
             }
         }
-        (_, PaletteGroupKind::LaunchMenu) => cmd
-            .brief
-            .strip_suffix(" (New Tab)")
-            .map(|label| label.to_string()),
+        (KeyAssignment::SpawnCommandInNewTab(spawn), PaletteGroupKind::LaunchMenu) => {
+            Some(crate::commands::launch_menu_label(spawn))
+        }
         _ => None,
     };
     if let Some(short) = short {
+        // Still remembered by its full name: that is what the palette's
+        // order looks its score up by.
+        if cmd.english_brief.is_none() {
+            cmd.english_brief = Some(cmd.brief.clone());
+        }
         cmd.brief = short.into();
     }
     cmd
+}
+
+/// Where a command sits among the ones listed first, if it is one of them.
+fn common_rank(action: &KeyAssignment) -> Option<usize> {
+    // The built-in split, not one bound to run something of its own.
+    let current_domain = |spawn: &config::keyassignment::SpawnCommand| {
+        *spawn
+            == config::keyassignment::SpawnCommand {
+                domain: SpawnTabDomain::CurrentPaneDomain,
+                ..Default::default()
+            }
+    };
+    Some(match action {
+        KeyAssignment::CreateWorkspaceThreadInActiveProject => 0,
+        KeyAssignment::SpawnTab(SpawnTabDomain::CurrentPaneDomain) => 1,
+        KeyAssignment::SpawnWindow => 2,
+        KeyAssignment::SplitHorizontal(spawn) if current_domain(spawn) => 3,
+        KeyAssignment::SplitVertical(spawn) if current_domain(spawn) => 4,
+        KeyAssignment::CloseCurrentTab { confirm: true } => 5,
+        KeyAssignment::Search(config::keyassignment::Pattern::CurrentSelectionOrEmptyString) => 6,
+        KeyAssignment::OpenSettings => 7,
+        _ => return None,
+    })
+}
+
+/// Lift the common commands out of `leaves`: the ones used recently first,
+/// as everywhere in the palette, then in their fixed order.
+fn take_common_commands(
+    leaves: &mut Vec<PaletteItem>,
+    scores: &HashMap<String, f64>,
+) -> Vec<PaletteItem> {
+    let (mut common, rest): (Vec<_>, Vec<_>) = std::mem::take(leaves)
+        .into_iter()
+        .partition(|item| matches!(item, PaletteItem::Leaf(cmd) if common_rank(&cmd.action).is_some()));
+    *leaves = rest;
+    let key = |item: &PaletteItem| match item {
+        PaletteItem::Leaf(cmd) => (
+            scores.get(cmd.recent_key()).copied(),
+            common_rank(&cmd.action),
+        ),
+        _ => (None, None),
+    };
+    common.sort_by(|a, b| {
+        let ((a_score, a_rank), (b_score, b_rank)) = (key(a), key(b));
+        b_score
+            .partial_cmp(&a_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a_rank.cmp(&b_rank))
+    });
+    common
 }
 
 fn group_meta(kind: PaletteGroupKind) -> (&'static str, SvgIcon, &'static str) {
@@ -826,11 +1015,13 @@ fn thread_icon_style<'a>(
         count_font: &marks.count_font,
         count_metrics: &marks.count_metrics,
         count_color,
+        opacity: 1.0,
     }
 }
 
 /// A command row's icon: a thread's state indicator when it has one, else
-/// the Lucide glyph its Nerd Font name maps to.
+/// the Lucide glyph its Nerd Font name maps to. Of the commands, only the ones
+/// from `augment-command-palette` still name an icon (`build_commands`).
 fn row_icon(cmd: &ExpandedCommand, palette: &UiPalette) -> RowIcon {
     if let Some(indicator) = thread_row_indicator(cmd.icon.as_deref(), palette) {
         return indicator;
@@ -921,6 +1112,7 @@ fn thread_leaf(entry: ThreadSearchEntry, archived_suffix: &str) -> (ExpandedComm
             menubar: &[],
             icon: Some(icon.into()),
             accessory: Some(entry.space_name.into()),
+            english_brief: None,
         },
         haystack,
     )
@@ -931,11 +1123,9 @@ fn thread_leaf(entry: ThreadSearchEntry, archived_suffix: &str) -> (ExpandedComm
 fn command_palette_colors(palette: UiPalette) -> UiPalette {
     let mut palette = palette.as_menu_card();
     // The one place this card differs from a context menu: its rows carry a
-    // selection, and the menu's own dark grey reads better under one than the
-    // sidebar's does.
-    if !palette.derived && palette.is_dark() {
-        palette.selected_bg = LinearRgba::with_srgba(70, 70, 74, 255);
-    }
+    // selection, in the accent.
+    palette.selected_bg = palette.accent;
+    palette.selected_text = palette.on_accent;
     palette
 }
 
@@ -990,6 +1180,8 @@ enum PaletteOutcome {
     Keep,
     Close,
     Execute(ExpandedCommand),
+    /// Settings → Keymap, searching for this, if not empty.
+    OpenKeymap(String),
 }
 
 impl crate::TermWindow {
@@ -1010,7 +1202,8 @@ impl crate::TermWindow {
         self.finish_inline_tab_rename(true);
         self.hover_tooltip = None;
         let root = self.build_command_palette_root();
-        self.command_palette = Some(CommandPaletteState::new(root));
+        let keymap_commands = CommandDef::keymap_commands(&self.config);
+        self.command_palette = Some(CommandPaletteState::new(root, keymap_commands));
         self.invalidate_window();
     }
 
@@ -1231,7 +1424,8 @@ impl crate::TermWindow {
             })
             .unwrap_or(true);
         let mux_pane = active_pane.map(|pane| MuxPane(pane.pane_id()));
-        let commands = build_commands(GuiWin::new(self), mux_pane, filter_copy_mode);
+        let mut commands = build_commands(GuiWin::new(self), mux_pane, filter_copy_mode);
+        apply_bound_chords(&mut commands, &self.input_map);
 
         let launch_menu = self.config.launch_menu.clone();
         let scores = frecency_scores();
@@ -1263,9 +1457,21 @@ impl crate::TermWindow {
         let mut groups: Vec<PaletteItem> = Vec::new();
 
         // Find Thread: synthesized, and the sidebar's own search entry point.
-        if let Some(group) = self.build_thread_group() {
+        // It takes over the flat command of that name, shortcut included.
+        if let Some(mut group) = self.build_thread_group() {
+            let find_thread = leaves.iter().position(|item| {
+                matches!(item, PaletteItem::Leaf(cmd)
+                    if cmd.action == KeyAssignment::OpenThreadSearch)
+            });
+            if let Some(PaletteItem::Leaf(cmd)) = find_thread.map(|idx| leaves.remove(idx)) {
+                group.command = Some(cmd);
+            }
             groups.push(PaletteItem::Group(group));
         }
+
+        // What people reach for, with the shortcuts worth learning, comes
+        // before the groups.
+        groups.extend(take_common_commands(&mut leaves, &scores));
 
         // Change Theme: synthesized, no flat equivalent exists.
         groups.push(PaletteItem::Group(self.build_color_scheme_group(&scores)));
@@ -1287,9 +1493,10 @@ impl crate::TermWindow {
             };
             let (label_key, icon, aliases) = group_meta(kind);
             let current_value = match kind {
-                PaletteGroupKind::Workspace => {
-                    Mux::try_get().map(|mux| mux.active_workspace().to_string())
-                }
+                // A thread's workspace is named by its ids, which say nothing.
+                PaletteGroupKind::Workspace => Mux::try_get()
+                    .map(|mux| mux.active_workspace().to_string())
+                    .filter(|name| !crate::workspace_threads::is_thread_workspace_name(name)),
                 _ => None,
             };
             let haystacks = build_haystacks(&items);
@@ -1300,6 +1507,7 @@ impl crate::TermWindow {
                 current_value,
                 aliases,
                 kind,
+                command: None,
                 items: Rc::new(items),
                 haystacks: Rc::new(haystacks),
             }));
@@ -1347,6 +1555,7 @@ impl crate::TermWindow {
             menubar: &[],
             icon: None,
             accessory: None,
+            english_brief: None,
         }));
         for name in names {
             items.push(PaletteItem::Leaf(ExpandedCommand {
@@ -1357,6 +1566,7 @@ impl crate::TermWindow {
                 menubar: &[],
                 icon: None,
                 accessory: None,
+                english_brief: None,
             }));
         }
 
@@ -1374,13 +1584,19 @@ impl crate::TermWindow {
             ),
             aliases,
             kind: PaletteGroupKind::ColorScheme,
+            command: None,
             items: Rc::new(items),
             haystacks: Rc::new(haystacks),
         }
     }
 
     fn build_space_group(&self) -> Option<PaletteGroup> {
-        let spaces = crate::workspace_threads::spaces_for_window(self.space_owner_id);
+        // A server shown as folders is reached from its folder, as in the
+        // Space menu; the one open now still names the current value.
+        let spaces: Vec<_> = crate::workspace_threads::spaces_for_window(self.space_owner_id)
+            .into_iter()
+            .filter(|space| !space.shown_as_folders || space.is_active)
+            .collect();
         if spaces.len() < GROUP_FOLD_THRESHOLD {
             return None;
         }
@@ -1399,6 +1615,7 @@ impl crate::TermWindow {
                     menubar: &[],
                     icon: None,
                     accessory: None,
+                    english_brief: None,
                 })
             })
             .collect();
@@ -1411,6 +1628,7 @@ impl crate::TermWindow {
             current_value: current,
             aliases,
             kind: PaletteGroupKind::Space,
+            command: None,
             items: Rc::new(items),
             haystacks: Rc::new(haystacks),
         })
@@ -1460,6 +1678,7 @@ impl crate::TermWindow {
             current_value: None,
             aliases,
             kind: PaletteGroupKind::Thread,
+            command: None,
             items: Rc::new(items),
             haystacks: Rc::new(haystacks),
         })
@@ -1577,6 +1796,10 @@ impl crate::TermWindow {
                         state.invalidate_matches();
                     }
                     KeyCode::Char('v') | KeyCode::Char('V') => wants_paste = true,
+                    KeyCode::Enter => {
+                        state.ensure_matches();
+                        outcome = PaletteOutcome::OpenKeymap(state.keymap_search());
+                    }
                     KeyCode::LeftArrow if macos => state.search.caret_move_home(shift),
                     KeyCode::RightArrow if macos => state.search.caret_move_end(shift),
                     KeyCode::Backspace if macos => {
@@ -1700,6 +1923,14 @@ impl crate::TermWindow {
                 self.remove_command_palette_ui_items();
                 self.execute_palette_command(cmd);
             }
+            PaletteOutcome::OpenKeymap(name) => {
+                self.remove_command_palette_ui_items();
+                crate::settings_window::show_keymap_from(
+                    self.mux_window_id,
+                    &self.active_space_id,
+                    &name,
+                );
+            }
         }
         if let Some(text) = copy_text {
             if !text.is_empty() {
@@ -1744,7 +1975,9 @@ impl crate::TermWindow {
             MouseEventKind::Move => {
                 let hit = state.widgets.hit_test(x, y).map(|target| target.action);
                 let cursor = match hit {
-                    Some(PaletteAction::Row(_)) | Some(PaletteAction::Back) => MouseCursor::Hand,
+                    Some(PaletteAction::Row(_))
+                    | Some(PaletteAction::Back)
+                    | Some(PaletteAction::Keymap) => MouseCursor::Hand,
                     Some(PaletteAction::Search) => MouseCursor::Text,
                     None => MouseCursor::Arrow,
                 };
@@ -1752,6 +1985,11 @@ impl crate::TermWindow {
                 if state.interaction.hovered != hit {
                     state.interaction.hovered = hit;
                     context.invalidate();
+                }
+                if let Some(PaletteAction::Row(order_idx)) = hit {
+                    if state.select_under_pointer(order_idx) {
+                        context.invalidate();
+                    }
                 }
                 if state.dragging_search {
                     state.pending_caret_click = Some((x, true));
@@ -1800,6 +2038,9 @@ impl crate::TermWindow {
                         }
                         PaletteAction::Back => {
                             state.pop_frame();
+                        }
+                        PaletteAction::Keymap => {
+                            outcome = PaletteOutcome::OpenKeymap(state.keymap_search());
                         }
                         PaletteAction::Search => {}
                     }
@@ -1852,6 +2093,16 @@ impl crate::TermWindow {
                 context.set_cursor(Some(MouseCursor::Arrow));
                 context.invalidate();
             }
+            PaletteOutcome::OpenKeymap(name) => {
+                self.remove_command_palette_ui_items();
+                crate::settings_window::show_keymap_from(
+                    self.mux_window_id,
+                    &self.active_space_id,
+                    &name,
+                );
+                context.set_cursor(Some(MouseCursor::Arrow));
+                context.invalidate();
+            }
         }
         true
     }
@@ -1888,6 +2139,73 @@ impl crate::TermWindow {
         result
     }
 
+    fn shortcut_width(
+        &self,
+        font: &Rc<LoadedFont>,
+        shortcut: &Shortcut,
+        icon_size: f32,
+    ) -> anyhow::Result<f32> {
+        Ok(match shortcut {
+            Shortcut::Symbols(icons, key) => {
+                let key_w = match key {
+                    Some(key) => self.sidebar_text_width(font, key)?,
+                    None => 0.0,
+                };
+                icons.len() as f32 * icon_size + key_w
+            }
+            Shortcut::Text(text) => self.sidebar_text_width(font, text)?,
+        })
+    }
+
+    fn paint_shortcut(
+        &self,
+        ctx: &DrawContext,
+        layers: &mut TripleLayerQuadAllocator,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        shortcut: &Shortcut,
+        x: f32,
+        center_y: f32,
+        icon_size: f32,
+        color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let paint_text = |text: &str, x: f32, layers: &mut TripleLayerQuadAllocator| {
+            let width = self.sidebar_text_width(font, text)?;
+            self.paint_ui_title_text_cached(
+                layers,
+                font,
+                metrics,
+                text,
+                x as usize,
+                (center_y - metrics.cell_size.height as f32 / 2.0).round() as usize,
+                (width + ctx.px(2.0)) as usize,
+                color,
+            )?;
+            anyhow::Ok(())
+        };
+        match shortcut {
+            Shortcut::Symbols(icons, key) => {
+                let mut cursor = x;
+                for icon in icons {
+                    ctx.draw_svg_icon(
+                        layers,
+                        *icon,
+                        cursor,
+                        center_y - icon_size / 2.0,
+                        icon_size,
+                        color,
+                    )?;
+                    cursor += icon_size;
+                }
+                if let Some(key) = key {
+                    paint_text(key, cursor, layers)?;
+                }
+            }
+            Shortcut::Text(text) => paint_text(text, x, layers)?,
+        }
+        Ok(())
+    }
+
     fn paint_command_palette_impl(
         &mut self,
         state: &mut CommandPaletteState,
@@ -1912,10 +2230,15 @@ impl crate::TermWindow {
             .context("command palette font")?;
         let search_font = self
             .fonts
-            .command_palette_font_with_size(base_font_size * 1.35)
+            .command_palette_font_with_size(base_font_size * 1.1)
             .context("command palette search font")?;
+        let footer_font = self
+            .fonts
+            .command_palette_font_with_size(base_font_size * 0.9)
+            .context("command palette footer font")?;
         let list_metrics = RenderMetrics::with_font_metrics(&list_font.metrics());
         let search_metrics = RenderMetrics::with_font_metrics(&search_font.metrics());
+        let footer_metrics = RenderMetrics::with_font_metrics(&footer_font.metrics());
 
         let mut palette = command_palette_colors(self.chrome());
         // Last word to the user: the card tuning above overwrites slots the
@@ -1985,8 +2308,7 @@ impl crate::TermWindow {
         )?;
 
         // Card geometry. Spotlight sits high, not centred.
-        let mut card_w = (win_w * 0.5).max(ctx.px(CARD_MIN_W)).min(ctx.px(CARD_MAX_W));
-        card_w = card_w.min((win_w - ctx.px(CARD_MARGIN)).max(ctx.px(320.0)));
+        let card_w = ctx.px(CARD_W).min((win_w - ctx.px(CARD_MARGIN)).max(ctx.px(320.0)));
         let card_x = ((win_w - card_w) / 2.0).round().max(0.0);
         let card_y = (win_h * 0.16).max(ctx.px(CARD_TOP_MIN)).round();
 
@@ -1995,8 +2317,11 @@ impl crate::TermWindow {
         let row_h =
             (list_metrics.cell_size.height as f32 + ctx.px(ROW_EXTRA_H)).max(ctx.px(ROW_MIN_H));
 
+        let footer_cell_h = footer_metrics.cell_size.height as f32;
+        let key_h = (footer_cell_h + ctx.px(FOOTER_KEY_EXTRA_H)).max(ctx.px(FOOTER_KEY_MIN_H));
+        let footer_h = key_h + ctx.px(FOOTER_PAD_Y) * 2.0;
         let mut max_visible =
-            (((win_h * LIST_MAX_FRACTION - search_h) / row_h).floor() as usize).max(1);
+            (((win_h * LIST_MAX_FRACTION - search_h - footer_h) / row_h).floor() as usize).max(1);
         if native.command_palette.rows > 0 {
             max_visible = max_visible.min(native.command_palette.rows as usize);
         } else if let Some(rows) = self.config.command_palette_rows {
@@ -2006,8 +2331,13 @@ impl crate::TermWindow {
         // The card shrinks to its contents; no empty rows, but always enough
         // room for the empty-state line.
         let list_h = shown_rows.max(1) as f32 * row_h;
-        let card_h =
-            search_h + 1.0 + ctx.px(LIST_TOP_PAD) + list_h + ctx.px(CARD_BOTTOM_PAD);
+        let card_h = search_h
+            + 1.0
+            + ctx.px(LIST_TOP_PAD)
+            + list_h
+            + ctx.px(CARD_BOTTOM_PAD)
+            + 1.0
+            + footer_h;
         let card = euclid::rect(card_x, card_y, card_w, card_h);
 
         ctx.draw_elevated_surface(
@@ -2105,13 +2435,7 @@ impl crate::TermWindow {
             state.search.caret_set(idx, extend);
         }
 
-        // System accent blue in both modes: the dark palette's selected_bg is
-        // a grey that vanishes against the dark card.
-        let accent = if dark {
-            LinearRgba::with_srgba(10, 132, 255, 255)
-        } else {
-            LinearRgba::with_srgba(0, 122, 255, 255)
-        };
+        let accent = palette.accent;
 
         let query = state.search.text().to_string();
         let search_text_y = card_y + (search_h - search_metrics.cell_size.height as f32) / 2.0;
@@ -2283,24 +2607,17 @@ impl crate::TermWindow {
             }
 
             let selected = order_idx == state.selected;
-            let hovered =
-                state.interaction.hovered == Some(PaletteAction::Row(order_idx)) && !selected;
 
-            if selected || hovered {
-                let highlight = if selected {
-                    palette.selected_bg
-                } else {
-                    palette.control_hover_bg
-                };
+            if selected {
                 ctx.draw_rounded_rect(
                     &mut row_layers,
                     0,
                     card_x + ctx.px(ROW_INSET_X),
-                    row_y + ctx.px(ROW_INSET_Y),
+                    row_y,
                     card_w - ctx.px(ROW_INSET_X) * 2.0,
-                    row_h - ctx.px(ROW_INSET_Y) * 2.0,
-                    highlight,
-                    ctx.px(ROW_RADIUS),
+                    row_h,
+                    palette.selected_bg,
+                    row_h / 2.0,
                 )?;
             }
 
@@ -2318,30 +2635,26 @@ impl crate::TermWindow {
             // Resolve the row's parts. Total lookups: the order was computed
             // from these same items, but a panic on a future drift is not
             // worth the two saved branches.
-            let (icon, prefix, label, accessory_value, chevron, key_label) = match entry {
+            let (icon, prefix, label, accessory_value, chevron, shortcut) = match entry {
                 MatchEntry::Item(item_idx) => match items.get(item_idx) {
-                    Some(PaletteItem::Leaf(cmd)) => {
-                        let prefix = if cmd.menubar.is_empty() {
-                            None
-                        } else {
-                            Some(format!("{} › ", cmd.menubar.join(" › ")))
-                        };
-                        (
-                            row_icon(cmd, &palette),
-                            prefix,
-                            cmd.brief.to_string(),
-                            cmd.accessory.as_ref().map(|text| text.to_string()),
-                            false,
-                            format_key_label(cmd, &self.config),
-                        )
-                    }
+                    Some(PaletteItem::Leaf(cmd)) => (
+                        row_icon(cmd, &palette),
+                        None,
+                        cmd.brief.to_string(),
+                        cmd.accessory.as_ref().map(|text| text.to_string()),
+                        false,
+                        command_shortcut(cmd, &self.config),
+                    ),
                     Some(PaletteItem::Group(group)) => (
                         RowIcon::Glyph(group.icon),
                         None,
                         group.label.clone(),
                         group.current_value.clone(),
                         true,
-                        None,
+                        group
+                            .command
+                            .as_ref()
+                            .and_then(|cmd| command_shortcut(cmd, &self.config)),
                     ),
                     _ => continue,
                 },
@@ -2358,7 +2671,7 @@ impl crate::TermWindow {
                         cmd.brief.to_string(),
                         cmd.accessory.as_ref().map(|text| text.to_string()),
                         false,
-                        format_key_label(cmd, &self.config),
+                        command_shortcut(cmd, &self.config),
                     )
                 }
             };
@@ -2379,8 +2692,6 @@ impl crate::TermWindow {
             // the row, as the card shows it.
             let row_surface = if selected {
                 crate::termwindow::ui::sidebar::over(palette.selected_bg, palette.control_bg)
-            } else if hovered {
-                crate::termwindow::ui::sidebar::over(palette.control_hover_bg, palette.control_bg)
             } else {
                 palette.control_bg
             };
@@ -2433,7 +2744,12 @@ impl crate::TermWindow {
                     mark_x,
                     (row_cy - size / 2.0).round(),
                     size,
-                    row.color,
+                    // Most marks are blue, and would vanish on the selection.
+                    if selected {
+                        palette.selected_text
+                    } else {
+                        row.color
+                    },
                 )?;
                 accessory_right = mark_x - ctx.px(LABEL_GAP);
                 if marks.layout == NativeThreadIcons::Trailing {
@@ -2460,25 +2776,32 @@ impl crate::TermWindow {
                 )?;
                 accessory_right -= chev + ctx.px(8.0);
             }
-            let accessory_text = accessory_value.or(key_label);
-            if let Some(text) = &accessory_text {
+            let accessory = accessory_value.map(Shortcut::Text).or(shortcut);
+            if let Some(accessory) = accessory {
                 let max_acc = (card_w * 0.35).max(ctx.px(80.0));
                 // Shaping goes through the shared UI shape cache
                 // (sidebar_text_width / paint_ui_title_text_cached): the
                 // DrawContext painters re-run HarfBuzz on every call, which
                 // at rows × frames is exactly the per-frame shaping cost
                 // that made the sidebar search list crawl.
-                let shown = self.ellipsize_ui_text(&list_font, text, max_acc as usize)?;
-                let acc_w = self.sidebar_text_width(&list_font, &shown)?;
-                self.paint_ui_title_text_cached(
+                let accessory = match accessory {
+                    Shortcut::Text(text) => Shortcut::Text(
+                        self.ellipsize_ui_text(&list_font, &text, max_acc as usize)?
+                            .into_owned(),
+                    ),
+                    symbols => symbols,
+                };
+                let icon_size = (list_metrics.cell_size.height as f32 * SHORTCUT_ICON_SCALE).round();
+                let acc_w = self.shortcut_width(&list_font, &accessory, icon_size)?;
+                self.paint_shortcut(
+                    &ctx,
                     &mut row_layers,
                     &list_font,
                     &list_metrics,
-                    &shown,
-                    (accessory_right - acc_w).max(0.0) as usize,
-                    (row_y + (row_h - list_metrics.cell_size.height as f32) / 2.0).round()
-                        as usize,
-                    (acc_w + ctx.px(2.0)) as usize,
+                    &accessory,
+                    (accessory_right - acc_w).max(0.0),
+                    row_y + row_h / 2.0,
+                    icon_size,
                     dim_color,
                 )?;
                 accessory_right -= acc_w;
@@ -2536,6 +2859,95 @@ impl crate::TermWindow {
             &self.dimensions,
         );
         row_heap.apply_to_clipped(&mut layers, clip, 1.0)?;
+
+        // ---- Footer ---------------------------------------------------------
+        // What the keys do to the selected row, right-aligned, Enter last.
+        let footer_y = list.max_y() + ctx.px(CARD_BOTTOM_PAD);
+        ctx.draw_rect(
+            &mut layers,
+            0,
+            card_x + 1.0,
+            footer_y,
+            card_w - 2.0,
+            1.0,
+            palette.separator,
+        )?;
+        // The same whatever is selected: a hint that depended on the row
+        // would flicker under a pointer moving down the list.
+        let enter = window::KeyCode::Char('\r');
+        let command_mods = if cfg!(target_os = "macos") {
+            Modifiers::SUPER
+        } else {
+            Modifiers::CTRL
+        };
+        let rendering = self.config.ui_key_cap_rendering;
+        let hints = [
+            (
+                crate::i18n::tr("command-palette-change-keymap"),
+                chord_shortcut(&enter, command_mods, rendering),
+                Some(PaletteAction::Keymap),
+            ),
+            (
+                crate::i18n::tr("command-palette-action"),
+                chord_shortcut(&enter, Modifiers::NONE, rendering),
+                None,
+            ),
+        ];
+        let key_y = footer_y + 1.0 + (footer_h - key_h) / 2.0;
+        let footer_text_y = footer_y + 1.0 + (footer_h - footer_cell_h) / 2.0;
+        let mut hint_right = card_x + card_w - ctx.px(PAD_X);
+        let key_icon = (footer_cell_h * SHORTCUT_ICON_SCALE).round();
+        for (label, key, action) in hints.iter().rev() {
+            let content_w = self.shortcut_width(&footer_font, key, key_icon)?;
+            let key_w = content_w + ctx.px(FOOTER_KEY_PAD_X) * 2.0;
+            let key_x = hint_right - key_w;
+            let label_w = self.sidebar_text_width(&footer_font, label)?;
+            let label_x = key_x - ctx.px(10.0) - label_w;
+            // A narrow window keeps the hints that fit, Enter's first.
+            if label_x < card_x + ctx.px(PAD_X) {
+                break;
+            }
+            ctx.draw_rounded_frame(
+                &mut layers,
+                0,
+                key_x,
+                key_y,
+                key_w,
+                key_h,
+                palette.control_bg,
+                palette.control_border,
+                ctx.px(FOOTER_KEY_RADIUS),
+            )?;
+            self.paint_shortcut(
+                &ctx,
+                &mut layers,
+                &footer_font,
+                &footer_metrics,
+                key,
+                key_x + ctx.px(FOOTER_KEY_PAD_X),
+                key_y + key_h / 2.0,
+                key_icon,
+                palette.secondary_text,
+            )?;
+            self.paint_sidebar_text(
+                &mut layers,
+                &footer_font,
+                footer_metrics,
+                label,
+                label_x as usize,
+                footer_text_y.round() as usize,
+                (label_w + ctx.px(2.0)) as usize,
+                palette.muted_text,
+            )?;
+            if let Some(action) = action {
+                state.widgets.push(
+                    euclid::rect(label_x, key_y, hint_right - label_x, key_h),
+                    WidgetKind::Button,
+                    *action,
+                );
+            }
+            hint_right = label_x - ctx.px(FOOTER_HINT_GAP);
+        }
 
         // Auto-hiding scrollbar: appears on scroll activity, lingers, fades.
         if (state.scroll.offset - state.last_scroll_offset).abs() > 0.5 {
@@ -2704,6 +3116,7 @@ mod tests {
             menubar: &[],
             icon: None,
             accessory: None,
+            english_brief: None,
         })
     }
 
@@ -2716,13 +3129,156 @@ mod tests {
             current_value: None,
             aliases: "",
             kind: PaletteGroupKind::ColorScheme,
+            command: None,
             items: Rc::new(children),
             haystacks: Rc::new(haystacks),
         })
     }
 
+    fn command(brief: &str, action: KeyAssignment) -> ExpandedCommand {
+        let PaletteItem::Leaf(mut cmd) = leaf(brief) else {
+            unreachable!();
+        };
+        cmd.action = action;
+        cmd
+    }
+
+    fn command_names(items: &[PaletteItem]) -> Vec<String> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                PaletteItem::Leaf(cmd) => Some(cmd.brief.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_pointer_selects_its_row_without_scrolling_or_stale_rows() {
+        let mut state = state_with(vec![leaf("One"), leaf("Two"), leaf("Three")]);
+        let offset = state.scroll.offset;
+
+        assert!(state.select_under_pointer(2));
+        assert_eq!(state.selected, 2);
+        assert_eq!(state.scroll.offset, offset);
+        assert!(!state.select_under_pointer(2), "already there");
+        assert!(!state.select_under_pointer(9), "past the end");
+
+        // A query typed since the paint: the numbers on screen are stale.
+        state.search.caret_insert("t", false);
+        state.invalidate_matches();
+        assert!(!state.select_under_pointer(1));
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn a_shortcut_reads_as_the_system_writes_it() {
+        use window::KeyCode as WindowKey;
+        let enter = WindowKey::Char('\r');
+        assert_eq!(
+            chord_shortcut(&enter, Modifiers::CTRL, UIKeyCapRendering::WindowsLong),
+            Shortcut::Text("Ctrl-Enter".to_string())
+        );
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                chord_shortcut(
+                    &WindowKey::Char('t'),
+                    Modifiers::SUPER | Modifiers::SHIFT | Modifiers::ALT | Modifiers::CTRL,
+                    UIKeyCapRendering::AppleSymbols,
+                ),
+                Shortcut::Symbols(
+                    vec![
+                        SvgIcon::ChevronUp,
+                        SvgIcon::Option,
+                        SvgIcon::ArrowBigUp,
+                        SvgIcon::Command,
+                    ],
+                    Some("T".to_string()),
+                )
+            );
+            assert_eq!(
+                chord_shortcut(&enter, Modifiers::SUPER, UIKeyCapRendering::AppleSymbols),
+                Shortcut::Symbols(vec![SvgIcon::Command, SvgIcon::CornerDownLeft], None)
+            );
+            // Nothing to draw a leader with; the label still says it.
+            assert!(matches!(
+                chord_shortcut(&enter, Modifiers::LEADER, UIKeyCapRendering::AppleSymbols),
+                Shortcut::Text(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn only_the_built_in_split_counts_as_common() {
+        let mut own = config::keyassignment::SpawnCommand {
+            domain: SpawnTabDomain::CurrentPaneDomain,
+            ..Default::default()
+        };
+        assert_eq!(
+            common_rank(&KeyAssignment::SplitHorizontal(own.clone())),
+            Some(3)
+        );
+        own.args = Some(vec!["top".to_string()]);
+        assert_eq!(common_rank(&KeyAssignment::SplitHorizontal(own)), None);
+    }
+
+    #[test]
+    fn the_common_commands_lead_in_their_order_with_recent_ones_first() {
+        let mut leaves = vec![
+            PaletteItem::Leaf(command("Settings", KeyAssignment::OpenSettings)),
+            PaletteItem::Leaf(command("Reset", KeyAssignment::ResetTerminal)),
+            PaletteItem::Leaf(command("New Window", KeyAssignment::SpawnWindow)),
+            PaletteItem::Leaf(command(
+                "New Tab",
+                KeyAssignment::SpawnTab(SpawnTabDomain::CurrentPaneDomain),
+            )),
+        ];
+        let mut scores = HashMap::new();
+        scores.insert(
+            command("Settings", KeyAssignment::OpenSettings)
+                .recent_key()
+                .to_string(),
+            1.0,
+        );
+
+        let common = take_common_commands(&mut leaves, &scores);
+
+        assert_eq!(command_names(&common), ["Settings", "New Tab", "New Window"]);
+        assert_eq!(command_names(&leaves), ["Reset"]);
+    }
+
+    #[test]
+    fn only_what_the_keymap_page_lists_can_be_sent_there() {
+        let mut find_thread = group("Find Thread", vec![leaf("main")]);
+        if let PaletteItem::Group(group) = &mut find_thread {
+            group.command = Some(command("Find Thread", KeyAssignment::OpenThreadSearch));
+        }
+        let items = vec![
+            find_thread,
+            group("Change Theme", vec![leaf("Nord")]),
+            PaletteItem::Leaf(command("Tab", KeyAssignment::SpawnWindow)),
+            PaletteItem::Leaf(command("Thread", KeyAssignment::ResetTerminal)),
+        ];
+        let listed = vec![
+            ("Listed Find".to_string(), KeyAssignment::OpenThreadSearch),
+            ("Listed Window".to_string(), KeyAssignment::SpawnWindow),
+        ];
+        let mut state = CommandPaletteState::new(items, listed);
+        state.ensure_matches();
+
+        assert_eq!(state.keymap_name(0), Some("Listed Find"));
+        assert_eq!(state.keymap_name(1), None);
+        assert_eq!(state.keymap_name(2), Some("Listed Window"));
+        assert_eq!(state.keymap_name(3), None);
+        assert_eq!(state.keymap_name(4), None);
+
+        assert_eq!(state.keymap_search(), "Listed Find");
+        state.selected = 1;
+        assert_eq!(state.keymap_search(), "");
+    }
+
     fn state_with(items: Vec<PaletteItem>) -> CommandPaletteState {
-        let mut state = CommandPaletteState::new(items);
+        let mut state = CommandPaletteState::new(items, Vec::new());
         state.ensure_matches();
         state
     }

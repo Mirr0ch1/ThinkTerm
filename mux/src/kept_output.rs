@@ -1,6 +1,7 @@
 //! What a pane showed when the process holding it stopped, kept on disk
 //! until its Thread's layout is restored and then put back above the new
-//! shell. Off unless Settings turns it on.
+//! shell. On where the desktop runs unless Settings turns it off; off on a
+//! remote host unless turned on there.
 //!
 //! Only a controlled exit keeps anything: a shutdown or logout, the session
 //! server being stopped, ThinkTerm quitting with its terminals inside it. A
@@ -78,7 +79,8 @@ fn switch_path() -> PathBuf {
 }
 
 /// Whether this machine keeps pane output, read when it matters: at an exit
-/// and at a restore.
+/// and at a restore. Not until something turns it on: the desktop does on
+/// its own machine (see `on_by_default`), a remote host only when told to.
 pub fn enabled() -> bool {
     enabled_at(&switch_path())
 }
@@ -87,7 +89,9 @@ fn enabled_at(switch: &Path) -> bool {
     std::fs::read_to_string(switch).is_ok_and(|text| text.trim() == "on")
 }
 
-/// Turn it on or off for this machine. Off removes what was kept, too.
+/// Turn it on or off for this machine. Off removes what was kept, too, and
+/// stays off: it is written down rather than the switch removed, which the
+/// desktop would take for one never set.
 pub fn set_enabled(on: bool) -> anyhow::Result<()> {
     set_enabled_at(&switch_path(), on)?;
     if !on {
@@ -97,20 +101,28 @@ pub fn set_enabled(on: bool) -> anyhow::Result<()> {
 }
 
 fn set_enabled_at(switch: &Path, on: bool) -> anyhow::Result<()> {
-    if on {
-        if let Some(dir) = switch.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let partial = switch.with_extension("partial");
-        std::fs::write(&partial, "on\n")?;
-        std::fs::rename(&partial, switch)?;
+    if let Some(dir) = switch.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let partial = switch.with_extension("partial");
+    std::fs::write(&partial, if on { "on\n" } else { "off\n" })?;
+    std::fs::rename(&partial, switch)?;
+    Ok(())
+}
+
+/// The desktop, as it starts: its own machine keeps pane output unless it
+/// has been told either way.
+pub fn on_by_default() {
+    if let Err(err) = on_by_default_at(&switch_path()) {
+        log::warn!("turning on kept pane output: {err:#}");
+    }
+}
+
+fn on_by_default_at(switch: &Path) -> anyhow::Result<()> {
+    if switch.try_exists()? {
         return Ok(());
     }
-    match std::fs::remove_file(switch) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err.into()),
-    }
+    set_enabled_at(switch, true)
 }
 
 fn root() -> PathBuf {

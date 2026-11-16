@@ -7,6 +7,7 @@
 //! terminal, which is why nothing in here touches `workspace_sidebar_width`
 //! or `workspace_sidebar_collapsed`.
 
+use crate::termwindow::render::split_slide::MIN_FRAMES;
 use crate::termwindow::ui::tokens::{SIDEBAR_HOVER_DWELL_MS, SIDEBAR_HOVER_GRACE_MS};
 use crate::ui::anim::{self, Easing, Timeline};
 use std::time::{Duration, Instant};
@@ -233,6 +234,20 @@ impl SidebarHoverReveal {
         frame
     }
 
+    /// Pace a travelling panel by the frame being painted: it goes no more
+    /// than its share of the way in one, as a split's slide does, so a slow
+    /// few frames -- its contents drawn for the first time, in a build
+    /// without optimisation -- do not see it out or away in one. Call once
+    /// per frame painted, before `step`.
+    pub(crate) fn pace(&mut self, now: Instant) {
+        if let Phase::Revealing { travel }
+        | Phase::Departing { travel, .. }
+        | Phase::Retreating { travel } = &mut self.phase
+        {
+            travel.pace(now, REVEAL / MIN_FRAMES);
+        }
+    }
+
     /// `None` = nothing presented; `Some(0.0..=1.0)` = how far out the panel
     /// is.
     pub(crate) fn progress(&self, now: Instant) -> Option<f32> {
@@ -267,6 +282,17 @@ impl SidebarHoverReveal {
         matches!(self.phase, Phase::Arming { .. })
     }
 
+    /// How far a dwell that is counting down has got, 0 to 1.
+    pub(crate) fn arming_progress(&self, now: Instant) -> Option<f32> {
+        match self.phase {
+            Phase::Arming { since } => Some(
+                (now.saturating_duration_since(since).as_secs_f32() / DWELL.as_secs_f32())
+                    .min(1.0),
+            ),
+            _ => None,
+        }
+    }
+
     /// Whether the machine still owes frames — a travel in flight or a dwell
     /// or grace counting down. Feeds the unfocused-window frame gate.
     pub(crate) fn needs_frames(&self) -> bool {
@@ -295,6 +321,27 @@ impl SidebarHoverReveal {
     /// Focus loss: drop the panel outright.
     pub(crate) fn cancel_immediately(&mut self) {
         self.phase = Phase::Hidden;
+    }
+
+    /// Already out by other means -- a pin let go under the pointer: carry
+    /// on as if the pointer had brought it, retreating once it leaves.
+    pub(crate) fn present_immediately(&mut self) {
+        self.phase = Phase::Revealed;
+    }
+
+    /// Bring the panel out now, as if the dwell had just run out: for a
+    /// reveal asked for by something other than the pointer.
+    pub(crate) fn reveal_now(&mut self, now: Instant) {
+        self.phase = match std::mem::take(&mut self.phase) {
+            Phase::Retreating { mut travel } => {
+                travel.retarget(now, 1.0, REVEAL, Easing::OutCubic);
+                Phase::Revealing { travel }
+            }
+            phase @ (Phase::Revealing { .. } | Phase::Revealed | Phase::Departing { .. }) => phase,
+            Phase::Hidden | Phase::Arming { .. } | Phase::Suppressed => Phase::Revealing {
+                travel: Timeline::progress(now, REVEAL, Easing::OutCubic),
+            },
+        };
     }
 }
 
@@ -360,6 +407,42 @@ mod tests {
             }
         }
         panic!("panel never settled");
+    }
+
+    #[test]
+    fn slow_frames_still_see_the_panel_on_its_way() {
+        let start = Instant::now();
+        let mut machine = SidebarHoverReveal::default();
+        machine.step(input(PointerZone::HotZone), start);
+        let mut now = at(start, SIDEBAR_HOVER_DWELL_MS);
+        let mut seen = vec![];
+        loop {
+            machine.pace(now);
+            machine.step(input(PointerZone::HotZone), now);
+            let progress = machine.progress(now).unwrap();
+            seen.push(progress);
+            if progress >= 1.0 {
+                break;
+            }
+            assert!(seen.len() < 50, "{:?}", seen);
+            // Each frame takes longer than the whole reveal.
+            now += Duration::from_millis(200);
+        }
+        let on_its_way = seen.iter().filter(|&&out| out > 0.0 && out < 1.0).count();
+        assert!(on_its_way as u32 >= MIN_FRAMES - 1, "{:?}", seen);
+    }
+
+    #[test]
+    fn a_dwell_counts_up_while_it_runs_and_only_then() {
+        let start = Instant::now();
+        let mut machine = SidebarHoverReveal::default();
+        assert_eq!(machine.arming_progress(start), None);
+        machine.step(input(PointerZone::HotZone), start);
+        assert_eq!(machine.arming_progress(start), Some(0.0));
+        let half = at(start, SIDEBAR_HOVER_DWELL_MS / 2);
+        assert!((machine.arming_progress(half).unwrap() - 0.5).abs() < 0.01);
+        machine.step(input(PointerZone::HotZone), at(start, SIDEBAR_HOVER_DWELL_MS));
+        assert_eq!(machine.arming_progress(at(start, SIDEBAR_HOVER_DWELL_MS)), None);
     }
 
     #[test]
@@ -670,6 +753,27 @@ mod tests {
         assert!(machine.needs_frames()); // Retreating
         machine.suppress_until_pointer_leaves();
         assert!(!machine.needs_frames()); // Suppressed
+    }
+
+    #[test]
+    fn a_reveal_asked_for_travels_out_and_holds_while_pinned() {
+        let start = Instant::now();
+        let mut machine = SidebarHoverReveal::default();
+        machine.reveal_now(start);
+        assert!(machine.is_presented());
+        assert!(machine.needs_frames());
+        // Held, with the pointer nowhere near: it lands and stays.
+        let mut now = start;
+        for _ in 0..200 {
+            let _ = machine.progress(now);
+            now += Duration::from_millis(16);
+            machine.step(pinned(PointerZone::Away), now);
+        }
+        assert_eq!(machine.progress(now), Some(1.0));
+        assert!(!machine.needs_frames());
+        // Let go, it leaves as a hover-revealed panel does.
+        machine.step(input(PointerZone::Away), now);
+        assert!(machine.needs_frames());
     }
 
     #[test]

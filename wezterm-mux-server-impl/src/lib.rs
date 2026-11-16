@@ -7,6 +7,7 @@ use wezterm_client::domain::{ClientDomain, ClientDomainConfig};
 
 pub mod connections;
 pub mod dispatch;
+pub mod foreign_panes;
 #[cfg(any(unix, windows))]
 pub mod handoff;
 #[cfg(target_os = "macos")]
@@ -15,9 +16,11 @@ pub mod session_import;
 pub mod local;
 pub mod pki;
 mod plugin_relay;
+pub mod privacy;
 mod private_file;
 mod sent_images;
 pub mod sessionhandler;
+pub mod share;
 pub mod thinkterm_access;
 pub mod thinkterm_layout;
 pub mod thinkterm_session;

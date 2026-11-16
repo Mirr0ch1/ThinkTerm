@@ -293,8 +293,8 @@ async fn plan_remote_walk_with_rules(
             .list_directory(dir, remaining.saturating_add(1))
             .await?;
         if listing.truncated || listing.entries.len() > remaining {
-            return Err(format!(
-                "That folder holds more than {REMOTE_WALK_ENTRY_LIMIT} items"
+            return Err(crate::termwindow::transfer_walk::too_many_entries(
+                REMOTE_WALK_ENTRY_LIMIT,
             ));
         }
         let mut materialized_names = HashSet::new();
@@ -309,13 +309,12 @@ async fn plan_remote_walk_with_rules(
                 }
                 if let Some(key) = name_rules.collision_key(&entry.name) {
                     if !materialized_names.insert(key) {
-                        return Err(format!(
-                            "The names in {} collide on this computer",
+                        return Err(names_collide(
                             entry
                                 .path
                                 .parent()
                                 .unwrap_or_else(|| entry.path.clone())
-                                .as_str()
+                                .as_str(),
                         ));
                     }
                 }
@@ -358,10 +357,15 @@ async fn plan_remote_walk_with_rules(
 }
 
 fn cannot_store_locally(path: &RemotePath) -> String {
-    format!(
-        "The name of {} cannot be used on this computer",
-        path.as_str()
-    )
+    let mut args = fluent_bundle::FluentArgs::new();
+    args.set("path", path.as_str().to_string());
+    crate::i18n::tr_args("transfer-name-unusable", &args)
+}
+
+fn names_collide(folder: impl std::fmt::Display) -> String {
+    let mut args = fluent_bundle::FluentArgs::new();
+    args.set("folder", folder.to_string());
+    crate::i18n::tr_args("transfer-names-collide", &args)
 }
 
 #[cfg(test)]

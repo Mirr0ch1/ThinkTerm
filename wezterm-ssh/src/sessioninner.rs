@@ -1,3 +1,4 @@
+use crate::authentication::AuthenticationInfo;
 use crate::channelwrap::ChannelWrap;
 use crate::config::ConfigMap;
 use crate::dirwrap::DirWrap;
@@ -21,7 +22,7 @@ use smol::channel::{bounded, Receiver, Sender, TryRecvError};
 use socket2::Socket;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -65,6 +66,7 @@ pub(crate) struct SessionInner {
     pub last_keep_alive: Instant,
     pub keep_alive: Option<Duration>,
     pub shutdown: Arc<SessionShutdown>,
+    pub authentication: Arc<OnceLock<AuthenticationInfo>>,
 }
 
 impl Drop for SessionInner {
@@ -74,12 +76,23 @@ impl Drop for SessionInner {
     }
 }
 
+/// What a session that ended with `err` tells whoever asked for it.
+pub(crate) fn failure_event(err: &anyhow::Error) -> SessionEvent {
+    let message = format!("{:#}", err);
+    if err
+        .chain()
+        .any(|cause| cause.is::<crate::auth::AnswerRefused>())
+    {
+        SessionEvent::AuthenticationRefused(message)
+    } else {
+        SessionEvent::Error(message)
+    }
+}
+
 impl SessionInner {
     pub fn run(&mut self) {
         if let Err(err) = self.run_impl() {
-            self.tx_event
-                .try_send(SessionEvent::Error(format!("{:#}", err)))
-                .ok();
+            self.tx_event.try_send(failure_event(&err)).ok();
         }
     }
 
@@ -153,7 +166,6 @@ impl SessionInner {
             .unwrap_or("false")
             == "true";
         if verbose {
-
             /// libssh logs to stderr, but on Windows in the GUI there isn't a valid
             /// stderr for it to log to.
             /// So, we redirect logging via our own log callback and pipe it via
@@ -234,8 +246,11 @@ impl SessionInner {
             .try_send(SessionEvent::Banner(Some(banner)))
             .context("notifying user of banner")?;
 
-        self.host_verification_libssh(&sess, &hostname, port)?;
-        self.authenticate_libssh(&sess)?;
+        let host_verified = self.host_verification_libssh(&sess, &hostname, port)?;
+        let authentication = self.authenticate_libssh(&sess)?.finish(host_verified);
+        self.authentication
+            .set(authentication)
+            .map_err(|_| anyhow!("SSH authentication was already recorded"))?;
         if let Some(reached) = &reached {
             crate::addresses::remember_reached(&hostname, port, reached);
         }
@@ -373,11 +388,16 @@ impl SessionInner {
             .try_send(SessionEvent::Banner(sess.banner().map(|s| s.to_string())))
             .context("notifying user of banner")?;
 
-        self.host_verification(&sess, &hostname, port, &remote_address)
+        let host_verified = self
+            .host_verification(&sess, &hostname, port, &remote_address)
             .context("host verification")?;
 
-        self.authenticate(&sess, &user, &hostname)
+        let authentication = self
+            .authenticate(&sess, &user, &hostname)
             .context("authentication")?;
+        self.authentication
+            .set(authentication.finish(host_verified))
+            .map_err(|_| anyhow!("SSH authentication was already recorded"))?;
         if let Some(reached) = &reached {
             crate::addresses::remember_reached(&hostname, port, reached);
         }
@@ -720,6 +740,25 @@ impl SessionInner {
             } else if idle_wakes < 3 {
                 idle_wakes += 1;
             } else {
+                // The session socket is ready and nothing took it up. Only
+                // a call on a channel has the backend deal with its socket,
+                // and here no channel is being read: a session kept for
+                // file transfers has none in `channels`, nor has one whose
+                // command has ended or that has run nothing yet. What the
+                // far end sent unasked, a write still marked as wanted, or
+                // the end of the connection then kept poll returning at
+                // once, two hundred times a second for as long as the
+                // session was held.
+                //
+                // A connection found ended has nothing more to give: with
+                // no channel left to wind down, the loop ends with it, and
+                // whoever still holds the session is told so on its next
+                // request rather than by a socket that stays ready.
+                if poll_array[1].revents != 0 && !sess.service_socket() && self.channels.is_empty()
+                {
+                    anyhow::bail!("the connection to the server has ended");
+                }
+
                 // Repeated immediate wakeups with no IO progress. The nap
                 // below caps this at a couple of hundred iterations a
                 // second, which keeps CPU usage negligible; don't kill the

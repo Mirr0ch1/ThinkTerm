@@ -1,5 +1,5 @@
 use crate::quad::{
-    HeapQuadAllocator, QuadClipRect, QuadTrait, TripleLayerQuadAllocator,
+    HeapQuadAllocator, QuadClipRect, QuadEdgeFade, QuadTrait, TripleLayerQuadAllocator,
     TripleLayerQuadAllocatorTrait,
 };
 use crate::shapecache::{BorrowedShapeCacheKey, ShapedInfo};
@@ -7,14 +7,16 @@ use crate::tabbar::{TabBarItem, TabEntry};
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::platform_chrome::uses_integrated_window_buttons;
 use crate::termwindow::ui::tokens::{
-    ICON_BUTTON_BORDER_WIDTH, SIDEBAR_INSET, TAB_CLOSE_HOVER_INSET,
-    TAB_CLOSE_HOVER_RADIUS, TAB_CONTENT_INSET, TAB_ICON_SIZE, TAB_ROW_START_PADDING,
-    TAB_VERTICAL_PADDING,
-    WINDOW_TAB_ADD_BUTTON_RADIUS, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET, WINDOW_TAB_GAP,
+    ICON_BUTTON_BORDER_WIDTH, SIDEBAR_INSET, TAB_CLOSE_HOVER_INSET, TAB_CLOSE_HOVER_RADIUS,
+    TAB_CONTENT_INSET, TAB_ICON_SIZE, TAB_ROW_FADE_WIDTH, TAB_ROW_START_PADDING, TAB_TITLE_FADE_GAP,
+    TAB_VERTICAL_PADDING, TITLE_FADE, WINDOW_TAB_ADD_BUTTON_RADIUS,
+    WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET, WINDOW_TAB_GAP,
     WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
     WINDOW_TAB_LEADING_ACTION_ICON_SIZE, WINDOW_TAB_RADIUS, WINDOW_TAB_TOP_SPACER,
 };
+use crate::termwindow::window_tab_reveal::{PaneBarWindowChrome, ToggleSlot};
 use crate::termwindow::{TermWindowNotif, UIItem, UIItemType, UiShapeCacheLookup};
+use crate::ui::draw::TextFade;
 use crate::ui::UiPalette;
 use crate::utilsprites::RenderMetrics;
 use anyhow::{anyhow, Context};
@@ -31,6 +33,8 @@ const WINDOW_TAB_INSET: usize = 8;
 const WINDOW_TAB_ICON_GAP: usize = 8;
 const WINDOW_TAB_MIN_TEXT_COLS: usize = 3;
 const UI_SHAPE_CACHE_FONT_IDENTITY_BIT: u64 = 1u64 << 63;
+/// The largest recording of a tab row kept for the next frame.
+pub(crate) const TAB_ROW_SCRATCH_KEEP_BYTES: usize = 1 << 20;
 
 
 impl crate::TermWindow {
@@ -45,7 +49,7 @@ impl crate::TermWindow {
     ) -> anyhow::Result<Vec<UIItem>> {
         let chrome = self.chrome();
         let row_height = self.tab_bar_pixel_height()?.ceil() as usize;
-        if row_height == 0 {
+        if row_height == 0 || !self.window_tab_row_drawn() {
             return Ok(vec![]);
         }
 
@@ -69,12 +73,14 @@ impl crate::TermWindow {
         let button_size = content_row_height
             .saturating_sub(self.ui_px(TAB_VERTICAL_PADDING) * 2)
             .max(icon_size);
-        let row_width = self
+        // Past the window's edge, by as much as the Library pushes it.
+        let row_width = (self
             .dimensions
             .pixel_width
             .saturating_sub(row_x + border.right.get() as usize)
             .saturating_sub(self.right_sidebar_width())
-            .max(1);
+            + self.library_push())
+        .max(1);
         let row_right = row_x + row_width;
         let viewport_left = (row_x as f32 + self.window_tab_left_padding_pixels()).ceil() as usize
             + self.ui_px(TAB_ROW_START_PADDING);
@@ -148,6 +154,15 @@ impl crate::TermWindow {
         let active_content_view_id = self.active_content_view_id;
         let cv_active = self.active_content_view_shown_in_tab_bar();
         let show_mux_tabs = !self.active_content_view_is_remote_thread();
+
+        // The tabs are recorded, so that where the row runs on past its
+        // viewport it can fade out in their own alpha: over a see-through
+        // bar a fade of its ground would show as a band.
+        let into = &mut *layers;
+        let mut row = std::mem::take(&mut self.tab_row_scratch);
+        row.recycle();
+        let row_start = row.mark();
+        let layers = &mut TripleLayerQuadAllocator::Heap(&mut row);
 
         let tab_step = tab_width + self.ui_px(WINDOW_TAB_GAP);
         let mut tab_sequence_idx = 0usize;
@@ -243,13 +258,12 @@ impl crate::TermWindow {
 
         // Dissolve the row into the bar wherever it runs on past the viewport,
         // so a clipped tab reads as continuing rather than as one sliced in
-        // half. Goes down after the tabs and before the trailing actions, which
-        // own the space beyond the boundary.
-        self.paint_tab_row_fades(
-            layers,
-            background,
-            content_row_y,
-            content_row_height,
+        // half. What follows paints straight into the bar again.
+        let layers = into;
+        self.apply_tab_row(
+            row,
+            &row_start,
+            &mut *layers,
             viewport_left,
             viewport_right,
             scroll_offset > 0.5,
@@ -281,12 +295,51 @@ impl crate::TermWindow {
         Ok(ui_items)
     }
 
+    /// Replay a tab `row` recorded from `start` into `layers`, cut at its
+    /// viewport and fading out at the ends that run on past it; then keep
+    /// its buffer for the next row, unless it grew large.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_tab_row(
+        &mut self,
+        mut row: HeapQuadAllocator,
+        start: &crate::quad::HeapQuadMark,
+        layers: &mut TripleLayerQuadAllocator,
+        viewport_left: usize,
+        viewport_right: usize,
+        fade_at_left: bool,
+        fade_at_right: bool,
+    ) -> anyhow::Result<()> {
+        let width = self
+            .ui_px(TAB_ROW_FADE_WIDTH)
+            .min(viewport_right.saturating_sub(viewport_left) / 2) as f32;
+        row.cut_after(
+            start,
+            QuadClipRect::from_top_left_pixels(
+                viewport_left as f32,
+                0.0,
+                viewport_right as f32,
+                self.dimensions.pixel_height as f32,
+                &self.dimensions,
+            ),
+            QuadEdgeFade {
+                left: if fade_at_left { width } else { 0.0 },
+                right: if fade_at_right { width } else { 0.0 },
+                ..Default::default()
+            },
+        );
+        let applied = row.apply_to(layers);
+        if row.resident_bytes() <= TAB_ROW_SCRATCH_KEEP_BYTES {
+            self.tab_row_scratch = row;
+        }
+        applied
+    }
+
     pub(crate) fn paint_window_tab_trailing_actions(
-        &self,
+        &mut self,
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<Vec<UIItem>> {
         let row_height = self.tab_bar_pixel_height()?.ceil() as usize;
-        if row_height == 0 {
+        if row_height == 0 || !self.window_tab_row_drawn() {
             return Ok(Vec::new());
         }
         let border = self.get_os_border();
@@ -298,62 +351,60 @@ impl crate::TermWindow {
             .saturating_sub(self.ui_px(TAB_VERTICAL_PADDING) * 2)
             .max(icon_size);
         let row_x = self.tab_bar_left_edge();
-        let row_width = self
+        // Past the window's edge, by as much as the Library pushes it.
+        let row_width = (self
             .dimensions
             .pixel_width
             .saturating_sub(row_x + border.right.get() as usize)
             .saturating_sub(self.right_sidebar_width())
-            .max(1);
+            + self.library_push())
+        .max(1);
         let row_right = row_x + row_width;
         let chrome = self.chrome();
         let foreground = chrome.text;
         let muted_fg = chrome.secondary_text;
         let mut ui_items = Vec::new();
         let mut action_right = row_right.saturating_sub(self.ui_px(WINDOW_TAB_INSET) + 2);
-        if self.fancy_tab_bar_shows_window_buttons() {
-            let window_button_right = if self.right_sidebar_width() > 0 {
-                self.dimensions
-                    .pixel_width
-                    .saturating_sub(border.right.get() as usize)
-                    .saturating_sub(self.ui_px(WINDOW_TAB_INSET) + 2)
+        // Over an open right sidebar the window's buttons are the sidebar's:
+        // see `paint_right_sidebar_window_buttons`. One sliding away holds
+        // them where they are, which is where the row's go once it is gone.
+        if self.fancy_tab_bar_shows_window_buttons() && self.right_sidebar_width() == 0 {
+            action_right = if self.right_sidebar_holds_window_buttons() {
+                action_right.saturating_sub(self.window_tab_window_buttons_width(button_size))
             } else {
-                action_right
-            };
-            let window_button_left = self.paint_window_tab_window_buttons(
-                layers,
-                &mut ui_items,
-                window_button_right,
-                content_row_y,
-                content_row_height,
-                button_size,
-                icon_size,
-                foreground,
-                muted_fg,
-            )?;
-            if self.right_sidebar_width() == 0 {
-                action_right = window_button_left;
-            }
-        }
-
-        if self.right_sidebar_width() > 0 {
-            let action_button_x = action_right.saturating_sub(button_size);
-            if cfg!(target_os = "macos") {
-                self.paint_window_tab_new_button(
+                self.paint_window_tab_window_buttons(
                     layers,
                     &mut ui_items,
-                    action_button_x,
+                    action_right,
                     content_row_y,
                     content_row_height,
                     button_size,
                     icon_size,
                     foreground,
                     muted_fg,
-                )?;
+                )?
+            };
+        }
+
+        // An auto-hiding row's pin takes the new-tab button's slot, just
+        // right of it, and moves the button one slot left.
+        let pin_then_new_tab = |slot: usize| {
+            if self.window_tab_reveal.shows_pin() {
+                (
+                    Some(slot),
+                    slot.saturating_sub(self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP) + button_size),
+                )
             } else {
-                let right_sidebar_toggle_x = action_button_x;
-                let new_button_x = right_sidebar_toggle_x
-                    .saturating_sub(self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP) + button_size);
-                self.paint_window_tab_new_button(
+                (None, slot)
+            }
+        };
+        let pin_x;
+        if self.right_sidebar_width() > 0 {
+            let action_button_x = action_right.saturating_sub(button_size);
+            if cfg!(target_os = "macos") {
+                let (pin, new_button_x) = pin_then_new_tab(action_button_x);
+                pin_x = pin;
+                self.paint_window_tab_icon_button(
                     layers,
                     &mut ui_items,
                     new_button_x,
@@ -363,8 +414,32 @@ impl crate::TermWindow {
                     icon_size,
                     foreground,
                     muted_fg,
+                    SvgIcon::Plus,
+                    UIItemType::TabBar(TabBarItem::NewTabButton),
+                    false,
                 )?;
-                self.paint_window_tab_right_sidebar_toggle_button(
+            } else {
+                let right_sidebar_toggle_x = action_button_x;
+                let (pin, new_button_x) = pin_then_new_tab(
+                    right_sidebar_toggle_x
+                        .saturating_sub(self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP) + button_size),
+                );
+                pin_x = pin;
+                self.paint_window_tab_icon_button(
+                    layers,
+                    &mut ui_items,
+                    new_button_x,
+                    content_row_y,
+                    content_row_height,
+                    button_size,
+                    icon_size,
+                    foreground,
+                    muted_fg,
+                    SvgIcon::Plus,
+                    UIItemType::TabBar(TabBarItem::NewTabButton),
+                    false,
+                )?;
+                self.paint_window_tab_row_right_sidebar_toggle(
                     layers,
                     &mut ui_items,
                     right_sidebar_toggle_x,
@@ -383,13 +458,14 @@ impl crate::TermWindow {
             // slot to match. The new button has to take that slot, or it
             // lands one button to the left -- inside the width the tab strip
             // was just given -- and overlaps the last tab.
-            let new_button_x = if self.right_sidebar_has_panels() {
+            let (pin, new_button_x) = pin_then_new_tab(if self.right_sidebar_has_panels() {
                 right_sidebar_toggle_x
                     .saturating_sub(self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP) + button_size)
             } else {
                 right_sidebar_toggle_x
-            };
-            self.paint_window_tab_new_button(
+            });
+            pin_x = pin;
+            self.paint_window_tab_icon_button(
                 layers,
                 &mut ui_items,
                 new_button_x,
@@ -399,8 +475,11 @@ impl crate::TermWindow {
                 icon_size,
                 foreground,
                 muted_fg,
+                SvgIcon::Plus,
+                UIItemType::TabBar(TabBarItem::NewTabButton),
+                false,
             )?;
-            self.paint_window_tab_right_sidebar_toggle_button(
+            self.paint_window_tab_row_right_sidebar_toggle(
                 layers,
                 &mut ui_items,
                 right_sidebar_toggle_x,
@@ -413,7 +492,182 @@ impl crate::TermWindow {
             )?;
         }
 
+        if let Some(pin_x) = pin_x {
+            // In, the row stays out and keeps its place, and the pin is drawn
+            // in the text's colour; out, the row comes and goes with the
+            // pointer.
+            self.paint_window_tab_icon_button(
+                layers,
+                &mut ui_items,
+                pin_x,
+                content_row_y,
+                content_row_height,
+                button_size,
+                icon_size,
+                foreground,
+                muted_fg,
+                SvgIcon::Pin,
+                UIItemType::WindowTabsPin,
+                self.window_tab_reveal.pinned(),
+            )?;
+        }
+
         Ok(ui_items)
+    }
+
+    /// The window's own buttons while an open right sidebar holds them at its
+    /// top rather than the row at its end. They stay there whether the row
+    /// is shown, hidden or on its way: hidden with the row, a window that
+    /// draws its own frame could not be closed.
+    pub(crate) fn paint_right_sidebar_window_buttons(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<Vec<UIItem>> {
+        let row_height = self.tab_bar_pixel_height()?.ceil() as usize;
+        if row_height == 0 || !self.right_sidebar_holds_window_buttons() {
+            return Ok(Vec::new());
+        }
+        let border = self.get_os_border();
+        let content_top_spacer = self.ui_px(WINDOW_TAB_TOP_SPACER).min(row_height);
+        let content_row_y = border.top.get() as usize + content_top_spacer;
+        let content_row_height = row_height.saturating_sub(content_top_spacer);
+        let icon_size = self.ui_px(TAB_ICON_SIZE).min(content_row_height);
+        let button_size = content_row_height
+            .saturating_sub(self.ui_px(TAB_VERTICAL_PADDING) * 2)
+            .max(icon_size);
+        let right = self
+            .dimensions
+            .pixel_width
+            .saturating_sub(border.right.get() as usize)
+            .saturating_sub(self.ui_px(WINDOW_TAB_INSET) + 2);
+        let chrome = self.chrome();
+        if self.library_push() > 0 && self.right_sidebar_width() == 0 {
+            // Over the row the Library pushed along, which goes on under
+            // them: on a ground of the row's own.
+            let width = self.window_tab_window_buttons_width(button_size) + self.ui_px(WINDOW_TAB_INSET) + 2;
+            self.filled_rectangle(
+                layers,
+                2,
+                euclid::rect(
+                    right.saturating_sub(width) as f32,
+                    border.top.get() as f32,
+                    (width + self.ui_px(WINDOW_TAB_INSET) + 2) as f32,
+                    row_height as f32,
+                ),
+                self.tab_bar_surface(chrome.header_bg),
+            )?;
+        }
+        let mut ui_items = Vec::new();
+        self.paint_window_tab_window_buttons(
+            layers,
+            &mut ui_items,
+            right,
+            content_row_y,
+            content_row_height,
+            button_size,
+            icon_size,
+            chrome.text,
+            chrome.secondary_text,
+        )?;
+        Ok(ui_items)
+    }
+
+    /// The window's own buttons at the end of the top-right pane bar, the
+    /// right sidebar's toggle before them and a rule between them and the
+    /// pane's buttons, while the pane bars stand in for a row that is away
+    /// (see `pane_bar_window_chrome`). Returns where the pane's buttons go on
+    /// from, and where the toggle stands -- left empty while it travels
+    /// (see `pane_bar_toggle_travels`); `pane_bar_window_chrome_width` is
+    /// the width this takes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_pane_bar_window_chrome(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_items: &mut Vec<UIItem>,
+        parts: PaneBarWindowChrome,
+        bar_right: usize,
+        bar_y: usize,
+        bar_height: usize,
+        button_size: usize,
+        icon_size: usize,
+    ) -> anyhow::Result<(usize, usize)> {
+        let chrome = self.chrome();
+        let mut x = bar_right.saturating_sub(self.ui_px(WINDOW_TAB_INSET) + 2);
+        if parts.window_buttons {
+            // A right sidebar sliding away holds them until it is gone.
+            x = if self.right_sidebar_holds_window_buttons() {
+                x.saturating_sub(self.window_tab_window_buttons_width(button_size))
+            } else {
+                self.paint_window_tab_window_buttons(
+                    layers,
+                    ui_items,
+                    x,
+                    bar_y,
+                    bar_height,
+                    button_size,
+                    icon_size,
+                    chrome.text,
+                    chrome.secondary_text,
+                )?
+            };
+        }
+        let mut toggle_x = x;
+        if parts.right_sidebar_toggle {
+            x = x.saturating_sub(button_size);
+            toggle_x = x;
+            if !self.pane_bar_toggle_travels(parts) {
+                self.paint_window_tab_right_sidebar_toggle_button(
+                    layers,
+                    ui_items,
+                    x,
+                    bar_y,
+                    bar_height,
+                    button_size,
+                    icon_size,
+                    chrome.text,
+                    chrome.secondary_text,
+                )?;
+            }
+        }
+        x = x.saturating_sub(self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP));
+        let rule_height = button_size * 3 / 5;
+        self.filled_rectangle(
+            layers,
+            1,
+            euclid::rect(
+                x as f32,
+                (bar_y + bar_height.saturating_sub(rule_height) / 2) as f32,
+                1.0,
+                rule_height as f32,
+            ),
+            chrome.separator,
+        )
+        .context("pane bar window button rule")?;
+        debug_assert_eq!(
+            bar_right.saturating_sub(x),
+            self.pane_bar_window_chrome_width(parts, button_size)
+        );
+        Ok((x, toggle_x))
+    }
+
+    /// What `paint_pane_bar_window_chrome` takes from the bar's right end.
+    pub(crate) fn pane_bar_window_chrome_width(
+        &self,
+        parts: PaneBarWindowChrome,
+        button_size: usize,
+    ) -> usize {
+        let gap = self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP);
+        let window_buttons = if parts.window_buttons {
+            self.window_tab_window_buttons_width(button_size)
+        } else {
+            0
+        };
+        let sidebar_toggle = if parts.right_sidebar_toggle {
+            button_size
+        } else {
+            0
+        };
+        self.ui_px(WINDOW_TAB_INSET) + 2 + window_buttons + sidebar_toggle + gap
     }
 
     /// Paint only the essential native/client window chrome over a full-window
@@ -475,10 +729,22 @@ impl crate::TermWindow {
         Ok(ui_items)
     }
 
-    fn fancy_tab_bar_shows_window_buttons(&self) -> bool {
+    pub(crate) fn fancy_tab_bar_shows_window_buttons(&self) -> bool {
         uses_integrated_window_buttons(self.config.window_decorations, self.window_state)
             && self.config.integrated_title_button_style != IntegratedTitleButtonStyle::MacOsNative
             && !self.config.integrated_title_buttons.is_empty()
+    }
+
+    /// Whether the window's buttons are the right sidebar's, at its top
+    /// (see `paint_right_sidebar_window_buttons`): while it is docked, and
+    /// while it slides back into the edge after, the row and the pane bars
+    /// leaving them room where they go once it is gone.
+    pub(crate) fn right_sidebar_holds_window_buttons(&self) -> bool {
+        self.fancy_tab_bar_shows_window_buttons()
+            && ((!self.right_sidebar_floats() && self.right_sidebar_docked_width() > 0)
+                // The row's end is pushed past the window's edge, or on its
+                // way back from there: they stay at its corner all the same.
+                || self.library_drawn_push() > 0)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -556,7 +822,7 @@ impl crate::TermWindow {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_window_sidebar_toggle_button(
+    pub(crate) fn paint_window_sidebar_toggle_button(
         &self,
         layers: &mut TripleLayerQuadAllocator,
         ui_items: &mut Vec<UIItem>,
@@ -646,6 +912,12 @@ impl crate::TermWindow {
         }
 
         Ok(action_right.saturating_sub(self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP) / 2))
+    }
+
+    /// What `paint_window_tab_window_buttons` takes from the right.
+    fn window_tab_window_buttons_width(&self, button_size: usize) -> usize {
+        let gap = self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP);
+        self.config.integrated_title_buttons.len() * (button_size + gap / 2) + gap / 2
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -850,14 +1122,18 @@ impl crate::TermWindow {
         let icon_y = row_y + (row_height.saturating_sub(icon_size) / 2);
         // The terminal card's circle, as the pane tabs draw it; the tab's
         // status keeps its own place after it.
-        let icon_right = self.paint_tab_circle_icon(
-            layers,
-            &crate::tab_icons::resolve_window_tab(),
-            tab_surface_y,
-            button_size,
-            false,
-            None,
-        )?;
+        let icon_right = match self.window_tab_page(tab_idx) {
+            // A tab that shows a plugin's page is headed by the page's icon.
+            Some(page) => self.paint_tab_page_icon(layers, &page, tab_surface_y, button_size)?,
+            None => self.paint_tab_circle_icon(
+                layers,
+                &crate::tab_icons::resolve_window_tab(),
+                tab_surface_y,
+                button_size,
+                false,
+                None,
+            )?,
+        };
 
         let close_x = self.tab_close_button_x(tab_width, button_size, icon_size);
         let close_y = row_y + (row_height.saturating_sub(button_size) / 2);
@@ -1148,8 +1424,10 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    /// A square icon button at the row's end: the new-tab button, the pin.
+    /// `lit` draws the icon in the text's colour without the pointer on it.
     #[allow(clippy::too_many_arguments)]
-    fn paint_window_tab_new_button(
+    fn paint_window_tab_icon_button(
         &self,
         layers: &mut TripleLayerQuadAllocator,
         ui_items: &mut Vec<UIItem>,
@@ -1160,6 +1438,9 @@ impl crate::TermWindow {
         icon_size: usize,
         foreground: LinearRgba,
         muted_fg: LinearRgba,
+        icon: SvgIcon,
+        item_type: UIItemType,
+        lit: bool,
     ) -> anyhow::Result<()> {
         let button_y = row_y + (row_height.saturating_sub(button_size) / 2);
         let hovered = self.is_pointer_over_ui_rect(button_x, button_y, button_size, button_size);
@@ -1190,7 +1471,7 @@ impl crate::TermWindow {
                 WINDOW_TAB_ADD_BUTTON_RADIUS,
                 ICON_BUTTON_BORDER_WIDTH,
             )
-            .context("window tab new button hover")?;
+            .context("window tab button hover")?;
         }
 
         ui_items.push(UIItem {
@@ -1198,7 +1479,7 @@ impl crate::TermWindow {
             y: button_y,
             width: button_size,
             height: button_size,
-            item_type: UIItemType::TabBar(TabBarItem::NewTabButton),
+            item_type,
         });
 
         let icon_size = if pressed {
@@ -1208,16 +1489,56 @@ impl crate::TermWindow {
         };
         self.paint_fancy_tab_icon(
             layers,
-            SvgIcon::Plus,
+            icon,
             button_x + press_inset + (visual_size.saturating_sub(icon_size) / 2),
             button_y + press_inset + (visual_size.saturating_sub(icon_size) / 2),
             icon_size,
-            if hovered { foreground } else { muted_fg },
+            if hovered || lit { foreground } else { muted_fg },
+        )
+    }
+
+    /// The row's own right sidebar toggle -- unless the row is on its way
+    /// and the one the top-right pane bar holds is going up into its place
+    /// (see `pane_bar_toggle_travels`): then only where it lands is noted.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_window_tab_row_right_sidebar_toggle(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_items: &mut Vec<UIItem>,
+        button_x: usize,
+        row_y: usize,
+        row_height: usize,
+        button_size: usize,
+        icon_size: usize,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+    ) -> anyhow::Result<()> {
+        if !self.window_tab_row_in_place() {
+            let slot = ToggleSlot {
+                x: button_x as f32,
+                y: (row_y + row_height.saturating_sub(button_size) / 2) as f32,
+                size: button_size as f32,
+                icon: icon_size as f32,
+            };
+            if self.window_tab_reveal.note_toggle_in_row(slot) {
+                return Ok(());
+            }
+        }
+        self.paint_window_tab_right_sidebar_toggle_button(
+            layers,
+            ui_items,
+            button_x,
+            row_y,
+            row_height,
+            button_size,
+            icon_size,
+            foreground,
+            muted_fg,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_window_tab_right_sidebar_toggle_button(
+    pub(crate) fn paint_window_tab_right_sidebar_toggle_button(
         &self,
         layers: &mut TripleLayerQuadAllocator,
         ui_items: &mut Vec<UIItem>,
@@ -1322,8 +1643,87 @@ impl crate::TermWindow {
             }
             text.push_str(value);
         }
-        let text = self.ellipsize_ui_text(font, &text, width)?;
-        self.paint_ui_title_text(layers, font, &metrics, &text, x, y, width, foreground)
+        self.paint_fading_title(layers, font, &metrics, &text, x, y, width, foreground)
+    }
+
+    /// A tab's `title` in `width`. One too long goes out towards the end of
+    /// the space it has, rather than stopping at "...".
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_fading_title(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        title: &str,
+        x: usize,
+        y: usize,
+        width: usize,
+        foreground: LinearRgba,
+    ) -> anyhow::Result<()> {
+        self.paint_title_fading_with(
+            layers,
+            font,
+            metrics,
+            title,
+            x,
+            y,
+            width,
+            foreground,
+            TAB_TITLE_FADE_GAP,
+            |fade| fade,
+        )
+    }
+
+    /// `paint_fading_title`, ending `gap` short of `width`, with `fade_for`
+    /// having the last word on the fade it is given, which is `None` for a
+    /// title that fits.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_title_fading_with(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        title: &str,
+        x: usize,
+        y: usize,
+        width: usize,
+        foreground: LinearRgba,
+        gap: f32,
+        fade_for: impl FnOnce(Option<TextFade>) -> Option<TextFade>,
+    ) -> anyhow::Result<()> {
+        if width == 0 {
+            return Ok(());
+        }
+        let (shaped, _) = self.cached_ui_shape(font, metrics, title)?;
+        let advance: f32 = shaped
+            .iter()
+            .map(|info| info.glyph.x_advance.get() as f32)
+            .sum();
+        let right = (x + width) as f32;
+        let fade = fade_for((advance > width as f32).then(|| {
+            let to = right - self.ui_f32(gap).min(width as f32 / 4.0);
+            TextFade {
+                from: to - self.ui_f32(TITLE_FADE).min(width as f32 / 2.0),
+                to,
+                amount: 1.0,
+            }
+        }));
+        // The glyph the end falls on is drawn too, for the fade to run out
+        // across; those after it would not show.
+        let slack = metrics.cell_size.width as f32 * 2.0;
+        let clip_right = fade.map_or(right, |fade| right.max(fade.to + slack));
+        self.paint_cached_ui_shape_fading(
+            layers,
+            metrics,
+            &shaped,
+            x as f32,
+            y as f32,
+            x as f32,
+            clip_right,
+            fade,
+            |_| foreground,
+        )?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1547,6 +1947,28 @@ impl crate::TermWindow {
         y: f32,
         clip_left: f32,
         clip_right: f32,
+        color_for: F,
+    ) -> anyhow::Result<f32>
+    where
+        F: FnMut(&ShapedInfo) -> LinearRgba,
+    {
+        self.paint_cached_ui_shape_fading(
+            layers, metrics, shaped, start_x, y, clip_left, clip_right, None, color_for,
+        )
+    }
+
+    /// `paint_cached_ui_shape_clipped`, going out along `fade` if there is one.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_cached_ui_shape_fading<F>(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        metrics: &RenderMetrics,
+        shaped: &[ShapedInfo],
+        start_x: f32,
+        y: f32,
+        clip_left: f32,
+        clip_right: f32,
+        fade: Option<TextFade>,
         mut color_for: F,
     ) -> anyhow::Result<f32>
     where
@@ -1587,8 +2009,7 @@ impl crate::TermWindow {
                     y + top_offset + metrics.cell_size.height as f32,
                 );
                 quad.set_texture(sprite.texture_coords());
-                quad.set_fg_color(color);
-                quad.set_alt_color_and_mix_value(color, 0.0);
+                set_glyph_color(&mut quad, color, x_pos, x_pos + advance, fade);
                 quad.set_hsv(None);
                 x_pos += advance;
                 continue;
@@ -1614,8 +2035,7 @@ impl crate::TermWindow {
                     glyph_y + top_offset + glyph_height,
                 );
                 quad.set_texture(texture.texture_coords());
-                quad.set_fg_color(color);
-                quad.set_alt_color_and_mix_value(color, 0.0);
+                set_glyph_color(&mut quad, color, glyph_x, glyph_x + glyph_width, fade);
                 quad.set_has_color(glyph.has_color);
                 quad.set_hsv(None);
             }
@@ -1807,6 +2227,25 @@ struct HorizontalTextureClip {
     position_right: f32,
     texture_left: f32,
     texture_right: f32,
+}
+
+/// `color` on a glyph's quad, `fade` running across the span it covers.
+fn set_glyph_color(
+    quad: &mut impl QuadTrait,
+    color: LinearRgba,
+    left: f32,
+    right: f32,
+    fade: Option<TextFade>,
+) {
+    match fade {
+        Some(fade) => {
+            let left = color.mul_alpha(fade.alpha_at(left));
+            let right = color.mul_alpha(fade.alpha_at(right));
+            quad.set_corner_gradient(left, right, left, right);
+        }
+        None => quad.set_fg_color(color),
+    }
+    quad.set_alt_color_and_mix_value(color, 0.0);
 }
 
 fn horizontal_texture_clip(

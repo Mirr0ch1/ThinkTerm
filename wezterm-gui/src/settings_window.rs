@@ -1,7 +1,8 @@
 use crate::tab_icons::RgbExt as _;
 use crate::customglyph::{BlockKey, Poly};
 use crate::glyphcache::CachedGlyph;
-use crate::native_settings::AgentStatusPart;
+use crate::native_settings::{NativeWorkspaceSettings, WorkMoment, WorkMoments};
+use wezterm_mux_server_impl::privacy::PrivacyReport;
 use crate::quad::{
     HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait,
 };
@@ -53,6 +54,7 @@ mod session_import;
 mod editor_import;
 mod import;
 mod keymap;
+mod connect_access;
 pub(crate) use import::EDITORS_SOURCE;
 use import::{ImportButton, ImportSource, ImportStep};
 
@@ -86,15 +88,19 @@ const HERO_MARK_SIZE: f32 = 108.0;
 const SWITCH_WIDTH: f32 = 76.0;
 const SWITCH_HEIGHT: f32 = 44.0;
 const SWITCH_KNOB_INSET: f32 = 4.0;
-// Matches termwindow::ui::tokens::SIDEBAR_ROW_HIGHLIGHT_RADIUS: the two
-// sidebars draw the same shape.
-const NAV_ROW_RADIUS: f32 = 20.0;
+/// The ticked chips under a Notifications prompt, one per moment.
+const WORK_MOMENT_CHIP_HEIGHT: f32 = 44.0;
+const WORK_MOMENT_CHIP_GAP: f32 = 14.0;
+const WORK_MOMENT_CHECK_SIDE: f32 = 24.0;
 // Row geometry lifted from the main window's sidebar -- SESSION_ROW_MIN_HEIGHT,
 // SIDEBAR_INSET and SIDEBAR_ROW_GAP in termwindow::ui. Both sidebars grow a row
 // from their own font's cell height against a shared floor rather than pinning
 // a constant, so a Settings row and a thread row are the same size even though
 // the two use different font sizes.
-const NAV_ROW_MIN_HEIGHT: f32 = 66.0;
+const NAV_ROW_MIN_HEIGHT: f32 = 72.0;
+// The corner of a row's highlight. The main window's sidebar draws its rows
+// as pills; Settings keeps its rounded rectangles.
+const NAV_ROW_RADIUS: f32 = 20.0;
 const NAV_ROW_INSET: f32 = 10.0;
 const NAV_ROW_GAP: f32 = 10.0;
 const HEADER_HEIGHT: f32 = 132.0;
@@ -292,6 +298,8 @@ thread_local! {
     /// The Import page's source to choose and start on, with PENDING_SECTION
     /// set to Import: first-run setup's Import buttons open Settings there.
     static PENDING_IMPORT: Cell<Option<ImportSource>> = const { Cell::new(None) };
+    /// What the Keymap page should search for, with PENDING_SECTION.
+    static PENDING_KEYMAP_SEARCH: Cell<Option<String>> = const { Cell::new(None) };
     /// The window Settings was opened from. The colour-scheme row hands the
     /// choosing back to that window's command palette, and a preview belongs
     /// in the terminal the user was looking at rather than in whichever
@@ -483,7 +491,7 @@ fn start_update_install_with(
 
     // The installer downloads and replaces files: off the UI thread, with
     // its progress and outcome posted back to whichever Settings window is
-    // open by then and to the windows' update capsules.
+    // open by then and to the windows' update notices.
     let spawned = std::thread::Builder::new()
         .name("thinkterm-update-install".into())
         .spawn(move || {
@@ -592,7 +600,7 @@ fn start_update_install_with(
     }
 }
 
-/// What the update capsule shows of an install's progress: the whole
+/// What the update notice shows of an install's progress: the whole
 /// percentage while it downloads, none once the installer runs.
 fn capsule_percent(progress: &Option<thinkterm_update::InstallProgress>) -> Option<u64> {
     match progress {
@@ -621,7 +629,7 @@ pub(crate) fn installs_updates_itself() -> bool {
     cfg!(windows) || thinkterm_update::InstallMethod::detect().self_updatable()
 }
 
-/// Where an update stands, as the update capsule shows it.
+/// Where an update stands, as the update notice shows it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum UpdateCapsuleStatus {
     /// `new_build`: the release has the running build's own version, made
@@ -659,7 +667,7 @@ pub(crate) fn update_capsule_status() -> Option<UpdateCapsuleStatus> {
 }
 
 /// `restart_ends_terminals`, asked again at most once a second: the update
-/// capsule asks on every paint of every window, and the answer only moves
+/// notice asks on every paint of every window, and the answer only moves
 /// as panes come and go.
 fn restart_ends_terminals_lately() -> bool {
     thread_local! {
@@ -675,7 +683,7 @@ fn restart_ends_terminals_lately() -> bool {
     })
 }
 
-/// Restart into the installed update, from the update capsule. False when
+/// Restart into the installed update, from the update notice. False when
 /// it did not: an install still runs, or restarting now would end
 /// terminals after all.
 pub(crate) fn restart_into_update() -> bool {
@@ -909,6 +917,12 @@ enum SettingsSection {
     Workspaces,
     Agents,
     Web,
+    /// Sharing a terminal with other accounts on its machine, and later
+    /// syncing with one's other devices.
+    ShareSync,
+    /// What macOS lets the programs run in terminals do, and where to allow
+    /// it. A Mac's page only.
+    Privacy,
     /// Not a page: what a search for it finds, which leads to the Tailscale
     /// group in Remote Hosts, where the tailnet is set up beside its
     /// machines.
@@ -917,6 +931,7 @@ enum SettingsSection {
     Keymap,
     CommandPalette,
     Import,
+    Accessibility,
     Developer,
     UiKit,
     Memory,
@@ -934,10 +949,13 @@ const BASE_SECTIONS: &[SettingsSection] = &[
     SettingsSection::Workspaces,
     SettingsSection::Agents,
     SettingsSection::Web,
+    SettingsSection::ShareSync,
+    SettingsSection::Privacy,
     SettingsSection::Archived,
     SettingsSection::Keymap,
     SettingsSection::CommandPalette,
     SettingsSection::Import,
+    SettingsSection::Accessibility,
     SettingsSection::Developer,
     SettingsSection::Backup,
     SettingsSection::Update,
@@ -970,7 +988,8 @@ fn agent_detail_lines(agent_id: &str, kind: crate::agent_status::IntegrationKind
 }
 
 /// Debug affordance companion to `THINKTERM_SETTINGS_SECTION`: pre-expands
-/// one Integrations row (e.g. for unattended UI captures).
+/// one Integrations row (e.g. for unattended UI captures). The same name
+/// opens a tool's row on the Dynamic Status card.
 fn initial_expanded_agent() -> Option<&'static str> {
     let name = std::env::var("THINKTERM_SETTINGS_EXPAND").ok()?;
     crate::agent_status::SUPPORTED_AGENTS
@@ -1004,12 +1023,16 @@ fn initial_section() -> SettingsSection {
     let section = match name.as_str() {
         "general" => SettingsSection::General,
         "appearance" => SettingsSection::Appearance,
+        "accessibility" => SettingsSection::Accessibility,
         "tabicons" | "tab-icons" | "tab_icons" => SettingsSection::TabIcons,
         "sidebar" => SettingsSection::Sidebar,
         "terminal" => SettingsSection::Terminal,
         "workspaces" => SettingsSection::Workspaces,
         "agents" => SettingsSection::Agents,
         "web" => SettingsSection::Web,
+        "share" | "sharing" | "sharesync" | "share-sync" => SettingsSection::ShareSync,
+        // A Mac's page only: elsewhere there is none to open.
+        "privacy" | "permissions" if cfg!(target_os = "macos") => SettingsSection::Privacy,
         // The plugins are on the Sidebar page, the only place they show.
         "plugins" => SettingsSection::Sidebar,
         "archived" => SettingsSection::Archived,
@@ -1039,12 +1062,15 @@ impl SettingsSection {
         match self {
             Self::General => crate::i18n::tr("settings-section-general"),
             Self::Appearance => crate::i18n::tr("settings-section-appearance"),
+            Self::Accessibility => crate::i18n::tr("settings-section-accessibility"),
             Self::TabIcons => crate::i18n::tr("settings-section-tab-icons"),
             Self::Sidebar => crate::i18n::tr("settings-section-sidebar"),
             Self::Terminal => crate::i18n::tr("settings-section-terminal"),
             Self::Workspaces => crate::i18n::tr("settings-section-workspaces"),
             Self::Agents => crate::i18n::tr("settings-section-agents"),
             Self::Web => crate::i18n::tr("settings-section-web"),
+            Self::ShareSync => crate::i18n::tr("settings-section-share-sync"),
+            Self::Privacy => crate::i18n::tr("settings-section-privacy"),
             Self::Tailscale => crate::i18n::tr("settings-section-tailscale"),
             Self::Archived => crate::i18n::tr("settings-section-archived"),
             Self::Keymap => crate::i18n::tr("settings-section-keymap"),
@@ -1063,12 +1089,15 @@ impl SettingsSection {
         match self {
             Self::General => SettingsIcon::General,
             Self::Appearance => SettingsIcon::Appearance,
+            Self::Accessibility => SettingsIcon::Accessibility,
             Self::TabIcons => SettingsIcon::TabIcons,
             Self::Sidebar => SettingsIcon::Sidebar,
             Self::Terminal => SettingsIcon::Terminal,
             Self::Workspaces => SettingsIcon::Workspaces,
             Self::Agents => SettingsIcon::Agents,
             Self::Web => SettingsIcon::Web,
+            Self::ShareSync => SettingsIcon::Share,
+            Self::Privacy => SettingsIcon::Privacy,
             Self::Tailscale => SettingsIcon::Tailscale,
             Self::Archived => SettingsIcon::Archived,
             Self::Keymap => SettingsIcon::Keymap,
@@ -1089,12 +1118,15 @@ impl SettingsSection {
         match self {
             Self::General => TileColor::Gray,
             Self::Appearance => TileColor::Purple,
+            Self::Accessibility => TileColor::Blue,
             Self::TabIcons => TileColor::Pink,
             Self::Sidebar => TileColor::Blue,
             Self::Terminal => TileColor::Slate,
             Self::Workspaces => TileColor::Yellow,
             Self::Agents => TileColor::Orange,
             Self::Web => TileColor::Teal,
+            Self::ShareSync => TileColor::Green,
+            Self::Privacy => TileColor::Blue,
             Self::Tailscale => TileColor::Blue,
             Self::Archived => TileColor::Indigo,
             Self::Keymap => TileColor::Gray,
@@ -1141,6 +1173,22 @@ impl SettingsSection {
                 "Port",
                 "Listener",
             ],
+            Self::ShareSync => &[
+                "Share",
+                "Sharing",
+                "Share Terminal",
+                "Shared with Me",
+                "Watch",
+                "Sync",
+            ],
+            Self::Privacy => &[
+                "Permissions",
+                "Privacy",
+                "Full Disk Access",
+                "Screen Recording",
+                "Microphone",
+                "Camera",
+            ],
             Self::Tailscale => &[
                 "Tailscale",
                 "Tailnet",
@@ -1159,8 +1207,12 @@ impl SettingsSection {
                 "Logo",
                 "Agent",
             ],
+            Self::Accessibility => &["Accessibility", "Button Shapes", "Buttons", "Hover"],
             Self::Appearance => &[
                 "Theme Mode",
+                "Tab Bar",
+                "Top Tab Bar",
+                "Auto-hide",
                 "Effective Color Scheme",
                 "App Icon",
                 "Window Opacity",
@@ -1213,6 +1265,10 @@ impl SettingsSection {
                 "Selection",
                 "Split Animation",
                 "Animation",
+                "Cursor",
+                "Cursor Shape",
+                "Cursor Blink",
+                "Blink",
                 "Terminal",
             ],
             Self::Workspaces => &[
@@ -1223,6 +1279,10 @@ impl SettingsSection {
                 "Remote Files",
                 "SFTP",
                 "Idle Timeout",
+                "Notifications",
+                "Sounds",
+                "Dock",
+                "Badge",
             ],
             Self::Agents => &[
                 "Agent",
@@ -1236,6 +1296,16 @@ impl SettingsSection {
                 "Copilot",
                 "Cursor",
                 "Detection Rules",
+                "Servers",
+                "Remote",
+                "thinkterm cli",
+                "Status",
+                "Dynamic Status",
+                "Tools",
+                "Task Rules",
+                "Homebrew",
+                "brew",
+                "apt",
             ],
             Self::Archived => &[
                 "Archive",
@@ -1373,9 +1443,24 @@ impl SettingsSection {
                 && ["settings-language", "settings-restore-pane-output"]
                     .iter()
                     .any(|key| crate::i18n::tr(key).to_lowercase().contains(query)))
+            || (self == Self::Accessibility
+                && crate::i18n::tr("settings-button-shapes")
+                    .to_lowercase()
+                    .contains(query))
+            || (self == Self::Privacy
+                && [
+                    "settings-privacy-heading",
+                    "settings-privacy-full-disk",
+                    "settings-privacy-screen",
+                    "settings-privacy-microphone",
+                    "settings-privacy-camera",
+                ]
+                .iter()
+                .any(|key| crate::i18n::tr(key).to_lowercase().contains(query)))
             || (self == Self::Appearance
                 && [
                     "settings-window-opacity",
+                    "settings-window-tabs",
                     "settings-thread-icons",
                     "settings-thread-status",
                     "settings-agents-status",
@@ -1383,6 +1468,10 @@ impl SettingsSection {
                 ]
                 .iter()
                 .any(|key| crate::i18n::tr(key).to_lowercase().contains(query)))
+            || (self == Self::ShareSync
+                && crate::i18n::tr("settings-sharing")
+                    .to_lowercase()
+                    .contains(query))
             || (self == Self::Sidebar
                 && crate::i18n::tr("settings-remember-right-sidebar")
                     .to_lowercase()
@@ -1394,9 +1483,12 @@ impl SettingsSection {
                     "settings-copy-on-select",
                     "settings-right-click",
                     "settings-right-click-paste",
+                    "settings-paste-confirmation",
                     "settings-copy-effect",
                     "settings-focus-follows-mouse",
                     "settings-split-animation",
+                    "settings-cursor-shape",
+                    "settings-cursor-blink",
                 ]
                 .iter()
                 .any(|id| crate::i18n::tr(id).to_lowercase().contains(query)))
@@ -1452,6 +1544,16 @@ mod settings_search_tests {
         }
         let localized_label = crate::i18n::tr("settings-right-click").to_lowercase();
         assert!(SettingsSection::Terminal.matches_search(&localized_label));
+    }
+
+    #[test]
+    fn permissions_are_found_on_their_own_page() {
+        for query in ["full disk access", "screen recording", "permissions", "camera"] {
+            assert!(SettingsSection::Privacy.matches_search(query), "{}", query);
+            assert!(!SettingsSection::General.matches_search(query), "{}", query);
+        }
+        let heading = crate::i18n::tr("settings-privacy-heading").to_lowercase();
+        assert!(SettingsSection::Privacy.matches_search(&heading));
     }
 
     #[test]
@@ -1628,6 +1730,7 @@ fn localized_app_icon_label(icon: NativeAppIcon) -> String {
         NativeAppIcon::Simple => "settings-app-icon-simple",
         NativeAppIcon::Red => "settings-app-icon-red",
         NativeAppIcon::Classic => "settings-app-icon-classic",
+        NativeAppIcon::Otter => "settings-app-icon-otter",
     })
 }
 
@@ -1673,9 +1776,9 @@ fn localized_mac_glass_label(glass: crate::native_settings::NativeMacGlass) -> S
     use crate::native_settings::NativeMacGlass;
     crate::i18n::tr(match glass {
         NativeMacGlass::Blur => "settings-mac-glass-blur",
+        NativeMacGlass::Frosted => "settings-mac-glass-frosted",
         NativeMacGlass::Regular => "settings-mac-glass-regular",
         NativeMacGlass::Clear => "settings-mac-glass-clear",
-        NativeMacGlass::ClearOverBlur => "settings-mac-glass-clear-over-blur",
     })
 }
 
@@ -1717,7 +1820,7 @@ fn localized_shade_label(shade: crate::native_settings::NativeShade) -> String {
 }
 
 /// Whether this macOS has Liquid Glass to offer.
-fn liquid_glass_available() -> bool {
+pub(crate) fn liquid_glass_available() -> bool {
     #[cfg(target_os = "macos")]
     {
         ::window::os::macos::liquid_glass_available()
@@ -1780,6 +1883,43 @@ fn localized_text_contrast_label(mode: crate::native_settings::NativeTextContras
     })
 }
 
+fn localized_window_tabs_label(mode: crate::native_settings::NativeWindowTabs) -> String {
+    use crate::native_settings::NativeWindowTabs;
+    crate::i18n::tr(match mode {
+        NativeWindowTabs::Show => "settings-window-tabs-show",
+        NativeWindowTabs::AutoHide => "settings-window-tabs-auto-hide",
+    })
+}
+
+fn localized_server_terminals_label(reach: crate::native_settings::NativeServerTerminals) -> String {
+    use crate::native_settings::NativeServerTerminals;
+    crate::i18n::tr(match reach {
+        NativeServerTerminals::Off => "settings-server-terminals-off",
+        NativeServerTerminals::Read => "settings-server-terminals-read",
+        NativeServerTerminals::Type => "settings-server-terminals-type",
+    })
+}
+
+fn localized_server_placement_label(
+    placement: crate::native_settings::NativeServerPlacement,
+) -> String {
+    use crate::native_settings::NativeServerPlacement;
+    crate::i18n::tr(match placement {
+        NativeServerPlacement::OwnSpace => "settings-server-placement-expanded",
+        NativeServerPlacement::OneRowEach => "settings-server-placement-one-row",
+        NativeServerPlacement::Folders => "settings-server-placement-folders",
+    })
+}
+
+fn localized_cursor_shape_label(shape: crate::native_settings::NativeCursorShape) -> String {
+    use crate::native_settings::NativeCursorShape;
+    crate::i18n::tr(match shape {
+        NativeCursorShape::Block => "settings-cursor-shape-block",
+        NativeCursorShape::Bar => "settings-cursor-shape-bar",
+        NativeCursorShape::Underline => "settings-cursor-shape-underline",
+    })
+}
+
 fn localized_cursor_blink_label(mode: crate::native_settings::NativeCursorBlink) -> String {
     use crate::native_settings::NativeCursorBlink;
     crate::i18n::tr(match mode {
@@ -1817,6 +1957,33 @@ fn settings_tr(id: &'static str, values: &[(&'static str, String)]) -> String {
 /// id is: two plugins in one list do not collide.
 fn plugin_key(id: &str) -> u64 {
     web_token_key(id)
+}
+
+/// The tab icon a tool's tab wears: its first program's.
+fn task_tool_icon(tool: &mux::task_status::Tool) -> crate::tab_icons::ResolvedIcon {
+    let program = thinkterm_proto::ForegroundProgram {
+        executable: tool.programs.first().cloned().unwrap_or_default(),
+        ..Default::default()
+    };
+    crate::tab_icons::catalog()
+        .card_for(None, Some(&program))
+        .resolved()
+}
+
+/// What Settings calls a tool: the name of the tab icon made for it
+/// ("Homebrew" for brew), else its rules' own name.
+fn task_tool_display_name(tool: &mux::task_status::Tool) -> String {
+    let catalog = crate::tab_icons::catalog();
+    let program = thinkterm_proto::ForegroundProgram {
+        executable: tool.programs.first().cloned().unwrap_or_default(),
+        ..Default::default()
+    };
+    let card = catalog.card_for(None, Some(&program));
+    if card.programs.iter().any(|name| *name == tool.id) {
+        card.name.clone()
+    } else {
+        tool.name.clone()
+    }
 }
 
 /// Every window lays its right sidebar out again. Not invalidate_all_windows:
@@ -1952,6 +2119,130 @@ fn web_token_key(id: &str) -> u64 {
     hasher.finish()
 }
 
+/// One way a thread's moments can prompt you, as the Notifications card
+/// lists them, each with the moments it answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkPrompt {
+    Sound,
+    SystemNotification,
+    DockBadge,
+}
+
+impl WorkPrompt {
+    fn label_key(self) -> &'static str {
+        match self {
+            Self::Sound => "settings-notification-sounds",
+            Self::SystemNotification => "settings-system-notifications",
+            Self::DockBadge => "settings-dock-badge",
+        }
+    }
+
+    fn enabled(self, workspaces: &NativeWorkspaceSettings) -> bool {
+        match self {
+            Self::Sound => workspaces.notification_sounds_enabled,
+            Self::SystemNotification => workspaces.system_notifications_enabled,
+            Self::DockBadge => workspaces.dock_badge_enabled,
+        }
+    }
+
+    fn moments(self, workspaces: &NativeWorkspaceSettings) -> WorkMoments {
+        match self {
+            Self::Sound => workspaces.notification_sound_moments,
+            Self::SystemNotification => workspaces.system_notification_moments,
+            Self::DockBadge => workspaces.dock_badge_moments,
+        }
+    }
+
+    fn moments_mut(self, workspaces: &mut NativeWorkspaceSettings) -> &mut WorkMoments {
+        match self {
+            Self::Sound => &mut workspaces.notification_sound_moments,
+            Self::SystemNotification => &mut workspaces.system_notification_moments,
+            Self::DockBadge => &mut workspaces.dock_badge_moments,
+        }
+    }
+
+    fn merge(self, from: &NativeWorkspaceSettings, into: &mut NativeWorkspaceSettings) {
+        match self {
+            Self::Sound => into.notification_sounds_enabled = from.notification_sounds_enabled,
+            Self::SystemNotification => {
+                into.system_notifications_enabled = from.system_notifications_enabled;
+            }
+            Self::DockBadge => into.dock_badge_enabled = from.dock_badge_enabled,
+        }
+        *self.moments_mut(into) = self.moments(from);
+    }
+}
+
+#[cfg(test)]
+mod work_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn saving_one_prompt_preserves_fresh_widths_and_other_prompts() {
+        for prompt in [
+            WorkPrompt::Sound,
+            WorkPrompt::SystemNotification,
+            WorkPrompt::DockBadge,
+        ] {
+            let mut stale = ThinkTermNativeSettings::default();
+            stale.workspaces.notification_sounds_enabled = false;
+            stale.workspaces.system_notifications_enabled = false;
+            stale.workspaces.dock_badge_enabled = false;
+            prompt
+                .moments_mut(&mut stale.workspaces)
+                .toggle(WorkMoment::NeedsInput);
+
+            let mut latest = ThinkTermNativeSettings::default();
+            latest.chrome.workspace_sidebar_width = Some(360);
+            latest.chrome.library_width = Some(960);
+            latest.chrome.right_sidebar_width = Some(420);
+            let before = latest.clone();
+            prompt.merge(&stale.workspaces, &mut latest.workspaces);
+
+            assert_eq!(latest.chrome.workspace_sidebar_width, Some(360));
+            assert_eq!(latest.chrome.library_width, Some(960));
+            assert_eq!(latest.chrome.right_sidebar_width, Some(420));
+            assert!(!prompt.enabled(&latest.workspaces));
+            assert!(!prompt.moments(&latest.workspaces).needs_input);
+            for other in [
+                WorkPrompt::Sound,
+                WorkPrompt::SystemNotification,
+                WorkPrompt::DockBadge,
+            ] {
+                if other != prompt {
+                    assert_eq!(
+                        other.enabled(&latest.workspaces),
+                        other.enabled(&before.workspaces)
+                    );
+                    assert_eq!(
+                        other.moments(&latest.workspaces),
+                        other.moments(&before.workspaces)
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// What the programs in local terminals may do, as Settings › General last
+/// found it (macOS).
+#[derive(Debug, Clone)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+enum PrivacyCheck {
+    /// Not looked yet, or due for another look.
+    Stale,
+    Checking,
+    Done(Result<PrivacyReport, String>),
+}
+
+fn work_moment_label_key(moment: WorkMoment) -> &'static str {
+    match moment {
+        WorkMoment::Finished => "settings-work-moment-finished",
+        WorkMoment::NeedsInput => "settings-work-moment-needs-input",
+        WorkMoment::Error => "settings-work-moment-error",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsAction {
     SelectImportSource(ImportSource),
@@ -1977,9 +2268,28 @@ enum SettingsAction {
     ClearImportFields,
     ToggleImportField(ImportFieldId),
     ToggleMainWindowFrameRestore,
+    ToggleSharing,
     ToggleNotificationSounds,
     ToggleSystemNotifications,
-    ToggleAgentStatusPart(AgentStatusPart),
+    ToggleDockBadge,
+    /// One moment's chip under a prompt in the Notifications card.
+    ToggleWorkMoment(WorkPrompt, WorkMoment),
+    /// A permission's page in System Settings › Privacy & Security.
+    #[cfg(target_os = "macos")]
+    OpenPrivacySettings(&'static str),
+    /// Show the program the permissions belong to in Finder, to be dragged
+    /// into a permission's list.
+    #[cfg(target_os = "macos")]
+    RevealPrivacyHolder,
+    /// Dynamic Status on, or down to ThinkTerm's own news.
+    ToggleDynamicStatus,
+    /// One tool's screen read or not. Carries `plugin_key(id)`, as
+    /// TogglePlugin does: the rules can be reloaded in between.
+    ToggleTaskTool(u64),
+    /// Open or close what a tool's rules read, keyed the same way.
+    ToggleTaskToolDetails(u64),
+    /// Show the folder the user's own task rules go in.
+    OpenTaskRulesFolder,
     ToggleRemoteUpdateKeepsSessions,
     ToggleLocalSessionsViaMux,
     ToggleRestorePaneOutput,
@@ -2054,6 +2364,23 @@ enum SettingsAction {
     SetMacGlass(crate::native_settings::NativeMacGlass),
     SetSidebarShade(crate::native_settings::NativeShade),
     SetTabBarShade(crate::native_settings::NativeShade),
+    SetWindowTabs(crate::native_settings::NativeWindowTabs),
+    SetServerPlacement(crate::native_settings::NativeServerPlacement),
+    SetServerTerminals(crate::native_settings::NativeServerTerminals),
+    ReverseSourceMenu,
+    ReverseHostMenu,
+    ReverseSource(mux::domain::DomainId),
+    ReverseHost(Option<mux::domain::DomainId>),
+    ReverseSetup,
+    ReversePane(u64),
+    ReversePermission(bool),
+    ReverseApprove,
+    ReverseRefresh,
+    ReverseClose(u64),
+    ReverseCancel(u64),
+    ReverseRevoke(u64, thinkterm_reverse_access::GrantRef),
+    ReverseRenew(u64, thinkterm_reverse_access::GrantRef),
+    ReverseMinutes(i8),
     SetTerminalShade(crate::native_settings::NativeShade),
     SetThreadIcons(crate::native_settings::NativeThreadIcons),
     SetThreadStatus(crate::native_settings::NativeThreadStatus),
@@ -2086,6 +2413,7 @@ enum SettingsAction {
     SetScrollMode(crate::native_settings::NativeScrollMode),
     SetSelectionStyle(crate::native_settings::NativeSelectionStyle),
     ToggleCopyOnSelect,
+    TogglePasteConfirmation,
     ToggleFocusFollowsMouse,
     SetRightClick(crate::native_settings::NativeRightClick),
     SetCopyEffect(crate::native_settings::NativeCopyEffect),
@@ -2094,7 +2422,9 @@ enum SettingsAction {
     OpenColorSchemePicker,
     SetTextContrast(crate::native_settings::NativeTextContrast),
     SetCursorBlink(crate::native_settings::NativeCursorBlink),
+    SetCursorShape(crate::native_settings::NativeCursorShape),
     ToggleOverlayScrollbar,
+    ToggleButtonShapes,
     ToggleSplitAnimation,
     SetBottomQuoteMode(NativeBottomQuoteMode),
     DecreaseBottomQuoteFontSize,
@@ -2177,6 +2507,9 @@ struct TabIconEditorLayout {
     shape_row: f32,
     /// Each colour's row.
     color_row: f32,
+    /// The colour rows: the circle's, and the glyph's unless the glyph
+    /// keeps its own colours.
+    color_rows: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2192,6 +2525,8 @@ enum SettingsDrag {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsDropdown {
+    ReverseSource,
+    ReverseHost,
     Language,
     MainRenderer,
     /// What a see-through window shows behind it, on macOS.
@@ -2780,6 +3115,8 @@ struct SettingsUiState {
     tab_icon_glyph_input_dirty: bool,
     /// Two-step delete: the card whose Delete was clicked once.
     confirm_delete_tab_icon: Option<String>,
+    /// The permissions card's last look (macOS).
+    privacy: PrivacyCheck,
 }
 
 impl SettingsUiState {
@@ -2860,6 +3197,7 @@ impl SettingsUiState {
             tab_icon_glyph_input: TextInputState::new(),
             tab_icon_glyph_input_dirty: false,
             confirm_delete_tab_icon: None,
+            privacy: PrivacyCheck::Stale,
         }
     }
 }
@@ -3560,12 +3898,40 @@ pub fn show_import_from(mux_window_id: MuxWindowId, space_id: &str, source: Opti
     show();
 }
 
+/// Open Settings on the Keymap page, searching for `search` (nothing, when it
+/// is empty), asked from a terminal window: the command palette's way to a
+/// command's shortcuts.
+pub fn show_keymap_from(mux_window_id: MuxWindowId, space_id: &str, search: &str) {
+    remember_origin(mux_window_id, space_id);
+    let switched = SETTINGS_WINDOW.with(|slot| {
+        let slot = slot.borrow();
+        let SettingsWindowSlot::Open { settings, .. } = &*slot else {
+            return false;
+        };
+        let mut settings = settings.borrow_mut();
+        if settings.window.is_none() {
+            return false;
+        }
+        settings.show_keymap_search(search);
+        if let Some(window) = settings.window.as_ref() {
+            window.invalidate();
+        }
+        true
+    });
+    if !switched {
+        PENDING_SECTION.with(|pending| pending.set(Some(SettingsSection::Keymap)));
+        PENDING_KEYMAP_SEARCH.with(|pending| pending.set(Some(search.to_string())));
+    }
+    show();
+}
+
 /// A window that failed to open takes the page it was asked for with it.
 /// Left set, the request would be acted on by the next, unrelated, opening:
 /// straight to that page, and an import started that nobody asked for.
 fn forget_pending_pages() {
     PENDING_SECTION.with(|pending| pending.take());
     PENDING_IMPORT.with(|pending| pending.take());
+    PENDING_KEYMAP_SEARCH.with(|pending| pending.take());
 }
 
 /// Whether a WezTerm configuration is there for the Import page to read.
@@ -3728,6 +4094,10 @@ struct SettingsWindow {
     chrome_palette: UiPalette,
     selected: SettingsSection,
     agents_expanded: Option<&'static str>,
+    /// The tool on the Dynamic Status card whose row is open, by
+    /// `plugin_key(id)`.
+    task_tool_expanded: Option<u64>,
+    reverse_access: connect_access::UiState,
     native_settings: ThinkTermNativeSettings,
     active_main_renderer: NativeRendererBackend,
     ui: SettingsUiState,
@@ -3903,6 +4273,10 @@ impl SettingsWindow {
             ),
             selected: initial_section(),
             agents_expanded: initial_expanded_agent(),
+            task_tool_expanded: std::env::var("THINKTERM_SETTINGS_EXPAND")
+                .ok()
+                .map(|id| plugin_key(&id)),
+            reverse_access: connect_access::UiState::default(),
             native_settings,
             active_main_renderer,
             ui,
@@ -4014,7 +4388,8 @@ impl SettingsWindow {
         // now and then send the next, unrelated, opening to that page.
         let late_section = PENDING_SECTION.with(|pending| pending.take());
         let pending_import = PENDING_IMPORT.with(|pending| pending.take());
-        if late_section.is_some() || pending_import.is_some() {
+        let pending_keymap_search = PENDING_KEYMAP_SEARCH.with(|pending| pending.take());
+        if late_section.is_some() || pending_import.is_some() || pending_keymap_search.is_some() {
             if let Some(settings) = settings_window_for_instance(instance_id) {
                 let mut settings = settings.borrow_mut();
                 if let Some(section) = late_section {
@@ -4024,6 +4399,20 @@ impl SettingsWindow {
                     settings.enter_section(SettingsSection::Import);
                     settings.start_import(source, &window);
                 }
+                if let Some(search) = pending_keymap_search {
+                    settings.show_keymap_search(&search);
+                }
+            }
+        }
+
+        // `tab-icon:<id>`: the Tab Icons page opens on that card's editor.
+        #[cfg(debug_assertions)]
+        if let Some(id) = std::env::var("THINKTERM_SETTINGS_EXPAND")
+            .ok()
+            .and_then(|value| value.strip_prefix("tab-icon:").map(str::to_string))
+        {
+            if let Some(settings) = settings_window_for_instance(instance_id) {
+                settings.borrow_mut().select_tab_icon(id);
             }
         }
 
@@ -4050,6 +4439,7 @@ impl SettingsWindow {
             return;
         }
         self.cleaned_up = true;
+        self.leave_reverse_editor();
         self.commit_focused_input();
         // Closed mid-drag: what the windows are previewing is what is kept.
         if matches!(self.ui.drag, Some(SettingsDrag::WindowOpacity)) {
@@ -4160,6 +4550,15 @@ impl SettingsWindow {
                 // macOS, so it ends when Settings is left.
                 self.ui.keymap.stop_recording();
                 window.invalidate();
+                Ok(true)
+            }
+            WindowEvent::FocusChanged(true) => {
+                // Back from System Settings, perhaps having granted one: the
+                // permissions card looks again when it is next painted.
+                if matches!(self.ui.privacy, PrivacyCheck::Done(_)) {
+                    self.ui.privacy = PrivacyCheck::Stale;
+                    window.invalidate();
+                }
                 Ok(true)
             }
             WindowEvent::AppearanceChanged(appearance) => {
@@ -4313,6 +4712,10 @@ impl SettingsWindow {
                         | SettingsAction::SetCommandPaletteHotkey(_)
                         | SettingsAction::ToggleWebLinkTtlMenu
                         | SettingsAction::SetWebLinkTtl(_)
+                        | SettingsAction::ReverseSourceMenu
+                        | SettingsAction::ReverseHostMenu
+                        | SettingsAction::ReverseSource(_)
+                        | SettingsAction::ReverseHost(_)
                         | SettingsAction::TogglePluginBackgroundMenu(_)
                         | SettingsAction::SetPluginBackground(..)
                         | SettingsAction::EditorImport(
@@ -5609,12 +6012,31 @@ impl SettingsWindow {
     }
 
     fn apply_cursor_blink(&mut self, mode: crate::native_settings::NativeCursorBlink) {
-        self.ui.open_dropdown = None;
-        // Merge into the freshest settings for the reason `apply_text_contrast`
-        // gives: another row may have written the file while this window was
-        // open.
         let mut merged = crate::native_settings::load();
         merged.terminal.cursor_blink = mode;
+        self.save_cursor_style(merged, "settings-cursor-blink", localized_cursor_blink_label(mode));
+    }
+
+    fn apply_cursor_shape(&mut self, shape: crate::native_settings::NativeCursorShape) {
+        let mut merged = crate::native_settings::load();
+        merged.terminal.cursor_shape = shape;
+        self.save_cursor_style(
+            merged,
+            "settings-cursor-shape",
+            localized_cursor_shape_label(shape),
+        );
+    }
+
+    /// Save a cursor blink or shape choice, made on settings merged from the
+    /// freshest file for the reason `apply_text_contrast` gives: another row
+    /// may have written it while this window was open.
+    fn save_cursor_style(
+        &mut self,
+        merged: crate::native_settings::ThinkTermNativeSettings,
+        setting: &str,
+        value: String,
+    ) {
+        self.ui.open_dropdown = None;
         self.set_native_settings(merged);
         match crate::native_settings::save(&self.native_settings) {
             Ok(()) => {
@@ -5624,17 +6046,14 @@ impl SettingsWindow {
                     for gui_window in front_end.gui_windows() {
                         gui_window.window.notify(
                             crate::termwindow::TermWindowNotif::Apply(Box::new(|term_window| {
-                                term_window.refresh_cursor_blink();
+                                term_window.refresh_cursor_style();
                             })),
                         );
                     }
                 }
                 self.status = settings_tr(
                     "settings-status-value-now",
-                    &[
-                        ("setting", crate::i18n::tr("settings-cursor-blink")),
-                        ("value", localized_cursor_blink_label(mode)),
-                    ],
+                    &[("setting", crate::i18n::tr(setting)), ("value", value)],
                 );
             }
             Err(err) => {
@@ -6024,6 +6443,9 @@ impl SettingsWindow {
     }
 
     fn enter_section(&mut self, section: SettingsSection) {
+        if section != SettingsSection::Agents {
+            self.leave_reverse_editor();
+        }
         self.selected = section;
         self.ui.content_scroll.reset();
         self.ui.open_dropdown = None;
@@ -6079,6 +6501,11 @@ impl SettingsWindow {
             if *section == SettingsSection::Developer && self.developer_mode_enabled() {
                 sections.extend_from_slice(DEVELOPER_SECTIONS);
             }
+        }
+        // What macOS asks of programs run in terminals: other systems ask
+        // nothing of the kind.
+        if !cfg!(target_os = "macos") {
+            sections.retain(|section| *section != SettingsSection::Privacy);
         }
         sections
     }
@@ -6230,6 +6657,25 @@ impl SettingsWindow {
                 self.ui.open_dropdown = None;
                 self.toggle_import_field(field_id);
             }
+            SettingsAction::ToggleSharing => {
+                self.ui.open_dropdown = None;
+                self.native_settings.sharing.enabled = !self.native_settings.sharing.enabled;
+                match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => {
+                        self.status = if self.native_settings.sharing.enabled {
+                            crate::i18n::tr("settings-status-sharing-on")
+                        } else {
+                            crate::i18n::tr("settings-status-sharing-off")
+                        };
+                    }
+                    Err(err) => {
+                        self.status = settings_tr(
+                            "settings-status-sharing-error",
+                            &[("error", format!("{err:#}"))],
+                        );
+                    }
+                }
+            }
             SettingsAction::ToggleMainWindowFrameRestore => {
                 self.ui.open_dropdown = None;
                 self.native_settings.window.restore_main_window_frame =
@@ -6254,7 +6700,7 @@ impl SettingsWindow {
                 self.ui.open_dropdown = None;
                 self.native_settings.workspaces.notification_sounds_enabled =
                     !self.native_settings.workspaces.notification_sounds_enabled;
-                match crate::native_settings::save(&self.native_settings) {
+                match self.persist_work_prompt(WorkPrompt::Sound) {
                     Ok(()) => {
                         self.status = if self.native_settings.workspaces.notification_sounds_enabled
                         {
@@ -6276,7 +6722,7 @@ impl SettingsWindow {
                 self.native_settings.workspaces.system_notifications_enabled =
                     !self.native_settings.workspaces.system_notifications_enabled;
                 let setting = crate::i18n::tr("settings-system-notifications");
-                self.status = match crate::native_settings::save(&self.native_settings) {
+                self.status = match self.persist_work_prompt(WorkPrompt::SystemNotification) {
                     Ok(()) => settings_tr("settings-status-saved", &[("setting", setting)]),
                     Err(err) => settings_tr(
                         "settings-status-save-error",
@@ -6284,24 +6730,75 @@ impl SettingsWindow {
                     ),
                 };
             }
-            SettingsAction::ToggleAgentStatusPart(part) => {
+            SettingsAction::ToggleDockBadge => {
                 self.ui.open_dropdown = None;
-                part.toggle(&mut self.native_settings.chrome.agent_status_display);
-                let setting = crate::i18n::tr(part.label_key());
-                self.status = match crate::native_settings::save(&self.native_settings) {
-                    Ok(()) => {
-                        // The sidebars, tabs and cards that show the part are
-                        // in the main windows.
-                        if let Some(front_end) = crate::frontend::try_front_end() {
-                            front_end.invalidate_all_windows();
+                self.native_settings.workspaces.dock_badge_enabled =
+                    !self.native_settings.workspaces.dock_badge_enabled;
+                self.save_work_prompt(WorkPrompt::DockBadge);
+            }
+            SettingsAction::ToggleWorkMoment(prompt, moment) => {
+                self.ui.open_dropdown = None;
+                prompt
+                    .moments_mut(&mut self.native_settings.workspaces)
+                    .toggle(moment);
+                self.save_work_prompt(prompt);
+            }
+            #[cfg(target_os = "macos")]
+            SettingsAction::OpenPrivacySettings(pane) => {
+                self.ui.open_dropdown = None;
+                wezterm_open_url::open_url(&crate::privacy_status::settings_url(pane));
+            }
+            #[cfg(target_os = "macos")]
+            SettingsAction::RevealPrivacyHolder => {
+                self.ui.open_dropdown = None;
+                match crate::privacy_status::responsible_program() {
+                    Ok(program) => wezterm_open_url::reveal_path(&program),
+                    Err(err) => log::warn!("finding the program permissions belong to: {err:#}"),
+                }
+            }
+            SettingsAction::ToggleDynamicStatus => {
+                self.ui.open_dropdown = None;
+                let chrome = &mut self.native_settings.chrome;
+                chrome.dynamic_status_enabled = Some(!chrome.dynamic_status_enabled.unwrap_or(true));
+                self.save_dynamic_status(crate::i18n::tr("settings-dynamic-status-show"));
+            }
+            SettingsAction::ToggleTaskTool(key) => {
+                self.ui.open_dropdown = None;
+                // Greyed while Dynamic Status is off: what it would switch
+                // shows nowhere.
+                let tool = mux::task_status::tools()
+                    .into_iter()
+                    .find(|tool| plugin_key(&tool.id) == key);
+                if let Some(tool) = tool.filter(|_| {
+                    self.native_settings.chrome.dynamic_status_enabled.unwrap_or(true)
+                }) {
+                    let off = &mut self.native_settings.chrome.task_tools_off;
+                    match off.iter().position(|id| *id == tool.id) {
+                        Some(index) => {
+                            off.remove(index);
                         }
-                        settings_tr("settings-status-saved", &[("setting", setting)])
+                        None => off.push(tool.id.clone()),
                     }
-                    Err(err) => settings_tr(
-                        "settings-status-save-error",
-                        &[("setting", setting), ("error", format!("{err:#}"))],
-                    ),
+                    self.save_dynamic_status(task_tool_display_name(&tool));
+                }
+            }
+            SettingsAction::ToggleTaskToolDetails(key) => {
+                self.ui.open_dropdown = None;
+                self.task_tool_expanded = if self.task_tool_expanded == Some(key) {
+                    None
+                } else {
+                    Some(key)
                 };
+            }
+            SettingsAction::OpenTaskRulesFolder => {
+                self.ui.open_dropdown = None;
+                let dir = mux::task_status::rules_dir();
+                // Made so there is somewhere to put the first file.
+                if let Err(err) = std::fs::create_dir_all(&dir) {
+                    self.status = format!("Unable to create {}: {err:#}", dir.display());
+                } else {
+                    Self::open_path(dir);
+                }
             }
             SettingsAction::Hint(_) => {}
             SettingsAction::ToggleRemoteUpdateKeepsSessions => {
@@ -6387,6 +6884,25 @@ impl SettingsWindow {
                 localized_shade_label(shade),
                 |appearance| appearance.tab_bar_shade = shade,
             ),
+            SettingsAction::SetWindowTabs(mode) => self.apply_window_tabs(mode),
+            SettingsAction::SetServerPlacement(placement) => {
+                self.apply_server_placement(placement)
+            }
+            SettingsAction::SetServerTerminals(reach) => self.apply_server_terminals(reach),
+            action @ (SettingsAction::ReverseSourceMenu
+            | SettingsAction::ReverseHostMenu
+            | SettingsAction::ReverseSource(_)
+            | SettingsAction::ReverseHost(_)
+            | SettingsAction::ReverseSetup
+            | SettingsAction::ReversePane(_)
+            | SettingsAction::ReversePermission(_)
+            | SettingsAction::ReverseApprove
+            | SettingsAction::ReverseRefresh
+            | SettingsAction::ReverseClose(_)
+            | SettingsAction::ReverseCancel(_)
+            | SettingsAction::ReverseRevoke(..)
+            | SettingsAction::ReverseRenew(..)
+            | SettingsAction::ReverseMinutes(_)) => self.apply_reverse_action(action),
             SettingsAction::SetTerminalShade(shade) => self.apply_window_areas(
                 "settings-terminal-shade",
                 localized_shade_label(shade),
@@ -6623,6 +7139,30 @@ impl SettingsWindow {
                 };
                 self.save_and_apply_bottom_quote_settings(status);
             }
+            SettingsAction::ToggleButtonShapes => {
+                self.ui.open_dropdown = None;
+                let shapes = !self.native_settings.accessibility.show_button_shapes;
+                self.native_settings.accessibility.show_button_shapes = shapes;
+                let setting = crate::i18n::tr("settings-button-shapes");
+                match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => {
+                        if let Some(front_end) = crate::frontend::try_front_end() {
+                            front_end.invalidate_all_windows();
+                        }
+                        let value = if shapes { "common-on" } else { "common-off" };
+                        self.status = settings_tr(
+                            "settings-status-value-now",
+                            &[("setting", setting), ("value", crate::i18n::tr(value))],
+                        );
+                    }
+                    Err(err) => {
+                        self.status = settings_tr(
+                            "settings-status-save-error",
+                            &[("setting", setting), ("error", format!("{err:#}"))],
+                        );
+                    }
+                }
+            }
             SettingsAction::ToggleOverlayScrollbar => {
                 self.ui.open_dropdown = None;
                 self.native_settings.terminal.overlay_scrollbar =
@@ -6682,6 +7222,19 @@ impl SettingsWindow {
                     terminal.copy_on_select = on
                 })
             }
+            SettingsAction::TogglePasteConfirmation => {
+                let on = !self.native_settings.terminal.paste_confirmation;
+                let done = settings_tr(
+                    "settings-status-value-now",
+                    &[
+                        ("setting", crate::i18n::tr("settings-paste-confirmation")),
+                        ("value", crate::i18n::tr(if on { "common-on" } else { "common-off" })),
+                    ],
+                );
+                self.apply_terminal_change("settings-paste-confirmation", done, |terminal| {
+                    terminal.paste_confirmation = on
+                })
+            }
             SettingsAction::ToggleFocusFollowsMouse => {
                 let on = !self.native_settings.terminal.focus_follows_mouse;
                 let done = settings_tr(
@@ -6715,6 +7268,7 @@ impl SettingsWindow {
             SettingsAction::WindowOpacitySlider => {}
             SettingsAction::SetTextContrast(mode) => self.apply_text_contrast(mode),
             SettingsAction::SetCursorBlink(mode) => self.apply_cursor_blink(mode),
+            SettingsAction::SetCursorShape(shape) => self.apply_cursor_shape(shape),
             SettingsAction::SetRemotePaneResizeMode(mode) => {
                 self.apply_remote_pane_resize_mode(mode)
             }
@@ -8430,6 +8984,9 @@ impl SettingsWindow {
             SettingsSection::Workspaces => self.paint_workspaces(layers, x, max_width)?,
             SettingsSection::Agents => self.paint_agents(layers, x, max_width)?,
             SettingsSection::Web => self.paint_web(layers, x, max_width)?,
+            SettingsSection::ShareSync => self.paint_share_sync(layers, x, max_width)?,
+            SettingsSection::Privacy => self.paint_privacy(layers, x, max_width)?,
+            SettingsSection::Accessibility => self.paint_accessibility(layers, x, max_width)?,
             // Never selected: picking it opens Remote Hosts instead.
             SettingsSection::Tailscale => {}
             SettingsSection::Archived => self.paint_archived(layers, x, max_width)?,
@@ -8872,6 +9429,7 @@ impl SettingsWindow {
                 })?;
         }
 
+
         let card_y = self.paint_card_heading(
             layers,
             x,
@@ -9003,7 +9561,7 @@ impl SettingsWindow {
                 TileColor::Blue,
             )?;
             rows.add(this.paint_window_opacity_row(layers, tx, rows.y, tw, rows.rule())?);
-            if cfg!(target_os = "macos") && liquid_glass_available() {
+            if cfg!(target_os = "macos") {
                 let (tx, tw) = this.paint_row_tile(
                     layers,
                     row_x,
@@ -9075,6 +9633,41 @@ impl SettingsWindow {
                     )?);
                 }
             }
+            {
+                use crate::native_settings::NativeWindowTabs;
+                let options: Vec<(String, SettingsAction)> = NativeWindowTabs::ALL
+                    .iter()
+                    .map(|mode| {
+                        (
+                            localized_window_tabs_label(*mode),
+                            SettingsAction::SetWindowTabs(*mode),
+                        )
+                    })
+                    .collect();
+                let selected = NativeWindowTabs::ALL
+                    .iter()
+                    .position(|mode| *mode == this.native_settings.appearance.window_tabs)
+                    .unwrap_or(0);
+                let (tx, tw) = this.paint_row_tile(
+                    layers,
+                    row_x,
+                    rows.y,
+                    row_width,
+                    SvgIcon::AppWindow,
+                    TileColor::Blue,
+                )?;
+                rows.add(this.paint_segmented_setting_row(
+                    layers,
+                    tx,
+                    rows.y,
+                    tw,
+                    &crate::i18n::tr("settings-window-tabs"),
+                    &crate::i18n::tr("settings-window-tabs-description"),
+                    &options,
+                    selected,
+                    rows.rule(),
+                )?);
+            }
             Ok(rows.bottom)
         })?;
 
@@ -9134,6 +9727,53 @@ impl SettingsWindow {
                 tw,
                 rows.rule(),
                 ThreadChoice::AgentStatus,
+            )?);
+            Ok(rows.bottom)
+        })?;
+
+        let card_y = self.paint_card_heading(
+            layers,
+            x,
+            bottom,
+            max_width,
+            &crate::i18n::tr("settings-appearance-servers-heading"),
+        )?;
+        let bottom = self.paint_card(layers, x, card_y, max_width, |this, layers, top| {
+            use crate::native_settings::NativeServerPlacement;
+            let mut rows = RowCursor::new(top, this);
+            let options: Vec<(String, SettingsAction)> = NativeServerPlacement::ALL
+                .iter()
+                .map(|placement| {
+                    (
+                        localized_server_placement_label(*placement),
+                        SettingsAction::SetServerPlacement(*placement),
+                    )
+                })
+                .collect();
+            let selected = NativeServerPlacement::ALL
+                .iter()
+                .position(|placement| {
+                    *placement == this.native_settings.appearance.server_placement
+                })
+                .unwrap_or(0);
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::Server,
+                TileColor::Teal,
+            )?;
+            rows.add(this.paint_segmented_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr("settings-server-placement"),
+                &crate::i18n::tr("settings-server-placement-description"),
+                &options,
+                selected,
+                rows.rule(),
             )?);
             Ok(rows.bottom)
         })?;
@@ -9830,6 +10470,7 @@ impl SettingsWindow {
             count_font: &count_font,
             count_metrics: &count_metrics,
             count_color: self.palette().secondary_text,
+            opacity: 1.0,
         };
         let pad = (height * 0.22).round();
         let bar_height = (height * 0.09).round().max(2.0);
@@ -9959,12 +10600,12 @@ impl SettingsWindow {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
         let side = self.ui_px(88.0).round();
-        let labels = NativeAppIcon::ALL.map(localized_app_icon_label);
+        let labels = NativeAppIcon::CHOICES.map(localized_app_icon_label);
         let widest = labels
             .iter()
             .map(|label| self.measure_text_width(&body_font, label))
             .fold(0.0, f32::max);
-        let count = NativeAppIcon::ALL.len() as f32;
+        let count = NativeAppIcon::CHOICES.len() as f32;
         let spacing = self.ui_px(12.0);
         // Every name gets the room of the widest, so none is cut off --
         // unless the names would then take over half the row: in a narrow
@@ -9987,7 +10628,7 @@ impl SettingsWindow {
         let icon_y = y - inset;
         let label_y = icon_y + side - inset + self.ui_px(10.0);
 
-        for (index, icon) in NativeAppIcon::ALL.iter().copied().enumerate() {
+        for (index, icon) in NativeAppIcon::CHOICES.iter().copied().enumerate() {
             let icon_x = block_x + (side + gap) * index as f32;
             let action = SettingsAction::SetAppIcon(icon);
             let selected = chosen == icon;
@@ -10303,10 +10944,92 @@ impl SettingsWindow {
         Ok(y + height)
     }
 
-    /// Settings › Agents › Status Display: a picture of where a program's
-    /// own report shows, numbered like the switches under it, then one
-    /// switch per part. Returns where the card ends.
-    fn paint_agent_status_card(
+    /// Settings › Agents & Status' card on how far the programs here may reach the
+    /// terminals of the servers a window is connected to, under its own
+    /// heading below `above`. Returns where it ends.
+    fn paint_server_terminals_card(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        above: f32,
+        max_width: f32,
+    ) -> anyhow::Result<f32> {
+        use crate::native_settings::NativeServerTerminals;
+        let card_padding = self.ui_px(36.0);
+        let row_x = x + card_padding;
+        let row_width = max_width - card_padding * 2.0;
+        let card_y = self.paint_card_heading(
+            layers,
+            x,
+            above,
+            max_width,
+            &crate::i18n::tr("settings-server-terminals-heading"),
+        )?;
+        // What turning it on lets a program do, as whom, takes its lines.
+        let layout = CardLayout {
+            description_lines: 4,
+            ..self.card_layout()
+        };
+        self.paint_card_as(layers, x, card_y, max_width, layout, |this, layers, top| {
+            let mut rows = RowCursor::new(top, this);
+            let options: Vec<(String, SettingsAction)> = NativeServerTerminals::ALL
+                .iter()
+                .map(|reach| {
+                    (
+                        localized_server_terminals_label(*reach),
+                        SettingsAction::SetServerTerminals(*reach),
+                    )
+                })
+                .collect();
+            let selected = NativeServerTerminals::ALL
+                .iter()
+                .position(|reach| *reach == this.native_settings.agents.server_terminals)
+                .unwrap_or(0);
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::Server,
+                TileColor::Orange,
+            )?;
+            rows.add(this.paint_segmented_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr("settings-server-terminals"),
+                &crate::i18n::tr("settings-server-terminals-description"),
+                &options,
+                selected,
+                rows.rule(),
+            )?);
+            Ok(rows.bottom)
+        })
+    }
+
+    /// Save a Dynamic Status switch, `setting` naming it, and have every
+    /// window show what it now allows.
+    fn save_dynamic_status(&mut self, setting: String) {
+        self.status = match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                mux::foreground_program::refresh_task_readings();
+                if let Some(front_end) = crate::frontend::try_front_end() {
+                    front_end.invalidate_all_windows();
+                }
+                settings_tr("settings-status-saved", &[("setting", setting)])
+            }
+            Err(err) => settings_tr(
+                "settings-status-save-error",
+                &[("setting", setting), ("error", format!("{err:#}"))],
+            ),
+        };
+    }
+
+    /// Dynamic Status: what the corner of the terminal area shows, its
+    /// switch, and the tools whose screens are read for it, each with its
+    /// own; then where rules for other tools go. Returns where it ends.
+    fn paint_dynamic_status_card(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
         x: f32,
@@ -10316,84 +11039,228 @@ impl SettingsWindow {
         let card_padding = self.ui_px(36.0);
         let row_x = x + card_padding;
         let row_width = max_width - card_padding * 2.0;
-        self.paint_card(layers, x, card_y, max_width, |this, layers, top| {
-            let diagram_bottom = this.paint_agent_status_diagram(layers, row_x, top, row_width)?;
-            let slot = this.ui_px(ROW_TILE_SIDE);
-            let indent = slot + this.ui_px(ROW_TILE_GAP);
-            let badge = this.ui_px(ROW_BADGE_SIDE).round();
+        let tools = mux::task_status::tools();
+        // The switch's explanation says what stays when it is off.
+        let layout = CardLayout {
+            description_lines: 3,
+            ..self.card_layout()
+        };
+        self.paint_card_as(layers, x, card_y, max_width, layout, |this, layers, top| {
+            let diagram_bottom =
+                this.paint_dynamic_status_diagram(layers, row_x, top, row_width, &tools)?;
             let mut rows = RowCursor::new(diagram_bottom + this.ui_px(52.0), this);
             // The first rule closes off the picture, across the card.
             this.paint_separator(layers, row_x, rows.y - this.ui_px(28.0), row_width)?;
-            let display = this.native_settings.chrome.agent_status_display;
-            for (index, part) in AgentStatusPart::ALL.iter().copied().enumerate() {
-                let block_bottom = this.settings_row_description_y(rows.y)
-                    + this.metrics.cell_size.height as f32;
-                this.paint_number_badge(
-                    layers,
-                    row_x + ((slot - badge) / 2.0).round(),
-                    ((rows.y + block_bottom - badge) / 2.0).round(),
-                    badge,
-                    index + 1,
-                )?;
-                rows.add(this.paint_toggle_setting_row(
-                    layers,
-                    row_x + indent,
-                    rows.y,
-                    row_width - indent,
-                    &crate::i18n::tr(part.label_key()),
-                    &crate::i18n::tr(part.description_key()),
-                    part.shown(&display),
-                    SettingsAction::ToggleAgentStatusPart(part),
-                    rows.rule(),
-                )?);
+            let enabled = this.native_settings.chrome.dynamic_status_enabled.unwrap_or(true);
+            rows.add(this.paint_toggle_setting_row(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                &crate::i18n::tr("settings-dynamic-status-show"),
+                &crate::i18n::tr("settings-dynamic-status-show-description"),
+                enabled,
+                SettingsAction::ToggleDynamicStatus,
+                rows.rule(),
+            )?);
+            for tool in &tools {
+                let extra =
+                    this.paint_task_tool_row(layers, row_x, rows.y, row_width, tool, enabled, rows.rule())?;
+                rows.add(extra);
             }
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::Plus,
+                TileColor::Gray,
+            )?;
+            rows.add(this.paint_action_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr("settings-task-tools-other"),
+                &settings_tr(
+                    "settings-task-tools-other-description",
+                    &[("folder", home_relative(&mux::task_status::rules_dir()))],
+                ),
+                &crate::i18n::tr("settings-plugins-open-folder"),
+                SettingsAction::OpenTaskRulesFolder,
+                rows.rule(),
+            )?);
             Ok(rows.bottom)
         })
     }
 
-    /// The main window drawn small with the parts of a program's own report
-    /// where they show: a thread's hover card beside the sidebar, and the
-    /// Agents panel on the right. Each part carries its switch's number; a
-    /// part switched off is left out, and the one whose switch is under the
-    /// pointer lights up. Returns where the picture ends.
-    fn paint_agent_status_diagram(
+    /// One tool's row on the Dynamic Status card: its tab icon, whether it
+    /// is installed here, and its switch; a click on its text opens what
+    /// its rules read and where they are. While Dynamic Status is off the
+    /// row is greyed and its switch does nothing. Returns what it took
+    /// beyond one line of description, as the setting rows do.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_task_tool_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        row_x: f32,
+        y: f32,
+        row_width: f32,
+        tool: &mux::task_status::Tool,
+        active: bool,
+        draw_top_rule: bool,
+    ) -> anyhow::Result<f32> {
+        let palette = self.palette();
+        let body_font = Rc::clone(&self.body_font);
+        let key = plugin_key(&tool.id);
+        let expanded = self.task_tool_expanded == Some(key);
+        let cell_height = self.metrics.cell_size.height as f32;
+        let side = self.ui_px(ROW_TILE_SIDE);
+        let block_bottom = self.settings_row_description_y(y) + cell_height;
+        // Its tab icon, as its tab wears it.
+        let icon = task_tool_icon(tool);
+        self.draw_tab_icon(
+            layers,
+            icon.circle,
+            &icon.glyph,
+            icon.glyph_color.linear(),
+            row_x,
+            ((y + block_bottom - side) / 2.0).round(),
+            side,
+        )?;
+        let indent = side + self.ui_px(ROW_TILE_GAP);
+        let text_x = row_x + indent;
+        let text_width = (row_width - indent).max(0.0);
+        let arrow = if expanded { "\u{25be}" } else { "\u{25b8}" };
+        let label = format!("{arrow}  {}", task_tool_display_name(tool));
+        let description = crate::i18n::tr(if crate::agent_status::tool_on_path(&tool.id) {
+            "settings-task-tool-found"
+        } else {
+            "settings-task-tool-missing"
+        });
+        let on = !self.native_settings.chrome.task_tools_off.iter().any(|id| *id == tool.id);
+        let extra = self.paint_toggle_setting_row(
+            layers,
+            text_x,
+            y,
+            text_width,
+            &label,
+            &description,
+            on,
+            SettingsAction::ToggleTaskTool(key),
+            draw_top_rule,
+        )?;
+        // The text opens the row; the switch keeps its own column.
+        let control_width = self.settings_control_width(text_width);
+        self.ui_context.push(
+            rect(
+                row_x,
+                y - self.ui_px(6.0),
+                (indent + text_width - control_width - self.ui_px(24.0)).max(0.0),
+                block_bottom + extra - y + self.ui_px(12.0),
+            ),
+            WidgetKind::Button,
+            SettingsAction::ToggleTaskToolDetails(key),
+        );
+        let mut taken = extra;
+        let mut end = block_bottom + extra;
+        if expanded {
+            let inset = self.ui_px(16.0);
+            let line_step = (cell_height + self.ui_px(8.0)).max(self.ui_px(24.0));
+            let bundled = tool.file.is_none();
+            let reads = crate::i18n::tr(match tool.id.as_str() {
+                "brew" if bundled => "settings-task-tool-reads-brew",
+                "apt" if bundled => "settings-task-tool-reads-apt",
+                _ => "settings-task-tool-reads-own",
+            });
+            // Rules are known by the id inside them, whatever their file
+            // is called.
+            let rules = match &tool.file {
+                Some(file) => settings_tr("settings-task-tool-rules-own", &[("file", home_relative(file))]),
+                None => settings_tr(
+                    "settings-task-tool-rules-bundled",
+                    &[
+                        ("folder", home_relative(&mux::task_status::rules_dir())),
+                        ("id", tool.id.clone()),
+                    ],
+                ),
+            };
+            let lines: Vec<String> = [reads, rules]
+                .iter()
+                .flat_map(|text| self.wrap_settings_text(&body_font, text, text_width - inset * 2.0))
+                .collect();
+            let block_y = end + self.ui_px(18.0);
+            let block_height = lines.len() as f32 * line_step + self.ui_px(22.0);
+            self.draw_rounded_frame(
+                layers,
+                0,
+                text_x,
+                block_y,
+                text_width,
+                block_height,
+                palette.control_bg,
+                palette.rule,
+                self.ui_px(10.0),
+            )?;
+            let mut line_y = block_y + self.ui_px(12.0);
+            for line in &lines {
+                self.draw_text(
+                    layers,
+                    &body_font,
+                    text_x + inset,
+                    line_y,
+                    line,
+                    palette.secondary_text,
+                    text_width - inset * 2.0,
+                )?;
+                line_y += line_step;
+            }
+            end = block_y + block_height;
+            // The next row's rule goes below the block.
+            taken = (end + self.ui_px(46.0) - y - self.settings_row_step()).max(extra);
+        }
+        if !active {
+            let top = y - self.ui_px(14.0);
+            self.draw_rounded_rect(
+                layers,
+                2,
+                row_x - self.ui_px(4.0),
+                top,
+                row_width + self.ui_px(8.0),
+                end + self.ui_px(14.0) - top,
+                palette.card_bg.mul_alpha(0.6),
+                0.0,
+            )?;
+        }
+        Ok(taken)
+    }
+
+    /// The terminal area drawn small with what Dynamic Status shows in its
+    /// bottom-right corner: a command that finished out of sight, with its
+    /// tick, and a tool's progress under it. What is switched off is left
+    /// out. Returns where the picture ends.
+    fn paint_dynamic_status_diagram(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
         x: f32,
         y: f32,
         width: f32,
+        tools: &[mux::task_status::Tool],
     ) -> anyhow::Result<f32> {
-        use crate::termwindow::ui::agent_panel::AGENT_BLOCKED_COLOR;
         let colors = self.chrome_palette;
         let ground = opaque(colors.window_bg);
         let sidebar_ground = opaque(colors.workspace_sidebar_bg);
-        let surface = opaque(colors.control_bg);
         let rule = colors.control_border;
         let line = self.ui_px(2.0).max(1.0).round();
-        let height = self.ui_px(330.0).round();
+        let height = self.ui_px(250.0).round();
         let radius = self.ui_px(16.0).round();
-        // Smaller than the font-size picture's: here four sit in one column.
-        let badge = self.ui_px(30.0).round();
         let bar = self.ui_px(10.0).round();
-        let pad = self.ui_px(18.0).round();
+        let pad = self.ui_px(26.0).round();
         let muted = colors.muted_text.mul_alpha(0.55);
-        let strong = colors.text.mul_alpha(0.8);
-        let brand = LinearRgba::with_srgba(0xD9, 0x77, 0x57, 0xFF);
-        let tint = colors.accent.mul_alpha(0.22);
-        let show = self.native_settings.chrome.agent_status_display;
-        let lit = self.hovered_agent_status_part();
         let sidebar_w = (width * 0.2).round();
-        let panel_w = (width * 0.34).round();
-        let middle_x = x + sidebar_w;
-        let panel_x = x + width - panel_w;
-        let middle_w = panel_x - middle_x;
-        let tabs_h = self.ui_px(54.0).round();
-
         let window = (x, y, width, height, radius);
         self.paint_window_shape(layers, window, sidebar_w, ground, sidebar_ground)?;
-        self.draw_rect(layers, 0, middle_x, y, line, height, rule)?;
-        self.draw_rect(layers, 0, panel_x, y, line, height, rule)?;
-        self.draw_rect(layers, 0, middle_x, y + tabs_h, middle_w, line, rule)?;
+        self.draw_rect(layers, 0, x + sidebar_w, y, line, height, rule)?;
         self.draw_rounded_frame(
             layers,
             0,
@@ -10405,304 +11272,140 @@ impl SettingsWindow {
             rule,
             radius,
         )?;
-
-        // A part's elements, lit when its switch is under the pointer.
-        let part = |this: &mut Self,
-                        layers: &mut TripleLayerQuadAllocator<'_>,
-                        which: AgentStatusPart,
-                        (px, py, pw, ph): (f32, f32, f32, f32),
-                        color: LinearRgba|
-         -> anyhow::Result<()> {
-            if lit == Some(which) {
-                let grow = this.ui_px(6.0);
-                this.draw_rounded_rect(
-                    layers,
-                    0,
-                    px - grow,
-                    py - grow,
-                    pw + grow * 2.0,
-                    ph + grow * 2.0,
-                    tint,
-                    (ph / 2.0 + grow).min(this.ui_px(12.0)),
-                )?;
-            }
-            this.draw_rounded_rect(layers, 0, px, py, pw, ph, color, ph / 2.0)
-        };
-        // The waiting reason's pill, in the panel's amber.
-        let pill = |this: &mut Self,
-                    layers: &mut TripleLayerQuadAllocator<'_>,
-                    px: f32,
-                    py: f32|
-         -> anyhow::Result<f32> {
-            let pw = this.ui_px(54.0).round();
-            let ph = bar * 1.8;
-            if lit == Some(AgentStatusPart::Reason) {
-                let grow = this.ui_px(6.0);
-                this.draw_rounded_rect(
-                    layers,
-                    0,
-                    px - grow,
-                    py - grow,
-                    pw + grow * 2.0,
-                    ph + grow * 2.0,
-                    tint,
-                    ph / 2.0 + grow,
-                )?;
-            }
-            this.draw_rounded_rect(
+        // A terminal's lines.
+        let text_x = x + sidebar_w + pad;
+        let area = width - sidebar_w;
+        for (index, share) in [0.44f32, 0.3, 0.52, 0.22].iter().enumerate() {
+            let line_y = y + pad + index as f32 * bar * 2.4;
+            self.draw_rounded_rect(layers, 0, text_x, line_y, area * share, bar, muted, bar / 2.0)?;
+        }
+        let chrome = &self.native_settings.chrome;
+        if !chrome.dynamic_status_enabled.unwrap_or(true) {
+            return Ok(y + height);
+        }
+        // A tool switched on, one installed here if there is one.
+        let on: Vec<&mux::task_status::Tool> = tools
+            .iter()
+            .filter(|tool| !chrome.task_tools_off.iter().any(|id| *id == tool.id))
+            .collect();
+        let tool = on
+            .iter()
+            .find(|tool| crate::agent_status::tool_on_path(&tool.id))
+            .or(on.first())
+            .map(|tool| (*tool).clone());
+        // Black in either appearance, as Dynamic Status is.
+        let surface = LinearRgba::with_srgba(5, 5, 5, 255);
+        let strong = LinearRgba::with_srgba(255, 255, 255, 215);
+        let faint = LinearRgba::with_srgba(235, 235, 245, 110);
+        let right = x + width - pad;
+        let mut above = y + height - pad;
+        if let Some(tool) = tool {
+            let pill_h = self.ui_px(44.0).round();
+            let pill_w = self.ui_px(150.0).round();
+            let pill_x = right - pill_w;
+            let pill_y = above - pill_h;
+            self.draw_rounded_rect(layers, 0, pill_x, pill_y, pill_w, pill_h, surface, pill_h / 2.0)?;
+            let mark = self.ui_px(28.0).round();
+            let icon = task_tool_icon(&tool);
+            self.draw_tab_icon(
                 layers,
-                0,
-                px,
-                py,
-                pw,
-                ph,
-                AGENT_BLOCKED_COLOR.mul_alpha(0.3),
-                ph / 2.0,
+                icon.circle,
+                &icon.glyph,
+                icon.glyph_color.linear(),
+                pill_x + ((pill_h - mark) / 2.0).round(),
+                pill_y + ((pill_h - mark) / 2.0).round(),
+                mark,
             )?;
-            Ok(px + pw + this.ui_px(10.0))
-        };
-
-        // The sidebar's threads, the third one under the pointer.
-        let row_step = self.ui_px(34.0).round();
-        let first_row = y + self.ui_px(52.0).round();
-        let hovered_row = first_row + row_step * 2.0;
-        for (index, share) in [0.75f32, 0.6, 0.7, 0.5, 0.65].iter().copied().enumerate() {
-            let row_y = first_row + row_step * index as f32;
-            if index == 2 {
-                self.draw_rounded_rect(
-                    layers,
-                    0,
-                    x + pad / 2.0,
-                    row_y - bar,
-                    sidebar_w - pad,
-                    bar * 3.0,
-                    surface,
-                    bar * 1.5,
-                )?;
-            }
-            let dot = if index == 2 { AGENT_BLOCKED_COLOR } else { muted };
-            self.draw_rounded_rect(layers, 0, x + pad, row_y, bar, bar, dot, bar / 2.0)?;
-            let bar_x = x + pad + bar * 2.0;
             self.draw_rounded_rect(
                 layers,
                 0,
-                bar_x,
-                row_y,
-                (x + sidebar_w - pad - bar_x) * share,
+                pill_x + pill_h,
+                pill_y + (pill_h - bar) / 2.0,
+                (pill_w * 0.32).round(),
                 bar,
                 strong,
                 bar / 2.0,
             )?;
-        }
-
-        // Two tabs: an agent's, with the dot that says it waits.
-        let tab_h = self.ui_px(32.0).round();
-        let tab_w = (middle_w * 0.26).round();
-        let tab_y = y + ((tabs_h - tab_h) / 2.0).round();
-        for index in 0..2 {
-            let tab_x = middle_x + pad + (tab_w + pad * 0.6) * index as f32;
-            self.draw_rounded_rect(layers, 0, tab_x, tab_y, tab_w, tab_h, surface, tab_h / 2.0)?;
-            let circle = tab_h - self.ui_px(8.0);
-            let circle_x = tab_x + self.ui_px(4.0);
-            let circle_y = tab_y + self.ui_px(4.0);
-            let fill = if index == 0 { brand } else { muted };
-            self.draw_rounded_rect(layers, 0, circle_x, circle_y, circle, circle, fill, circle / 2.0)?;
-            self.draw_rounded_rect(
+            let ring = self.ui_px(22.0);
+            let ctx = crate::ui::draw::DrawContext::new(
+                self.render_state.as_ref().unwrap(),
+                self.dimensions,
+                &self.metrics,
+            );
+            crate::termwindow::render::update_capsule::paint_ring(
+                &ctx,
                 layers,
-                0,
-                circle_x + circle + self.ui_px(8.0),
-                tab_y + (tab_h - bar) / 2.0,
-                tab_w * 0.45,
-                bar,
-                muted,
-                bar / 2.0,
+                (pill_x + pill_w - pill_h / 2.0, pill_y + pill_h / 2.0),
+                ring / 2.0 - self.ui_px(1.5),
+                self.ui_px(3.0),
+                Some(0.44),
+                0.0,
+                LinearRgba::with_srgba(255, 255, 255, 46),
+                colors.accent,
+                surface,
             )?;
-            if index == 0 {
-                let dot = self.ui_px(12.0).round();
-                self.draw_rounded_rect(
-                    layers,
-                    0,
-                    circle_x + circle - dot * 0.7,
-                    circle_y - dot * 0.25,
-                    dot,
-                    dot,
-                    AGENT_BLOCKED_COLOR,
-                    dot / 2.0,
-                )?;
-            }
+            above = pill_y - self.ui_px(12.0);
         }
-
-        // The hovered thread's card, beside the sidebar.
-        let card_x = middle_x + self.ui_px(12.0);
-        let card_w = (middle_w * 0.55).round();
-        let card_y = hovered_row - self.ui_px(22.0);
-        let card_h = pad * 2.0 + bar + self.ui_px(14.0) + bar * 1.8;
-        self.draw_rounded_frame(
+        let card_h = self.ui_px(64.0).round();
+        let card_w = (area * 0.58).min(self.ui_px(340.0)).round();
+        let card_x = right - card_w;
+        let card_y = above - card_h;
+        self.draw_rounded_rect(layers, 0, card_x, card_y, card_w, card_h, surface, card_h / 2.0)?;
+        let mark = self.ui_px(40.0).round();
+        let terminal = crate::tab_icons::catalog().terminal_card().resolved();
+        self.draw_tab_icon(
             layers,
-            0,
-            card_x,
-            card_y,
-            card_w,
-            card_h,
-            surface,
-            rule,
-            self.ui_px(10.0),
+            terminal.circle,
+            &terminal.glyph,
+            terminal.glyph_color.linear(),
+            card_x + ((card_h - mark) / 2.0).round(),
+            card_y + ((card_h - mark) / 2.0).round(),
+            mark,
         )?;
-        let heading_y = card_y + pad;
+        let text_x = card_x + card_h + self.ui_px(4.0);
         self.draw_rounded_rect(
             layers,
             0,
-            card_x + pad,
-            heading_y,
-            bar,
-            bar,
-            AGENT_BLOCKED_COLOR,
-            bar / 2.0,
-        )?;
-        self.draw_rounded_rect(
-            layers,
-            0,
-            card_x + pad + bar * 2.0,
-            heading_y,
-            card_w * 0.4,
+            text_x,
+            card_y + card_h * 0.3 - bar / 2.0,
+            (card_w * 0.34).round(),
             bar,
             strong,
             bar / 2.0,
         )?;
-        let said_y = heading_y + bar + self.ui_px(14.0);
-        let mut said_x = card_x + pad;
-        if show.reason {
-            said_x = pill(self, layers, said_x, said_y)?;
-        }
-        let card_said_end = card_x + card_w - pad;
-        if show.description {
-            part(
-                self,
-                layers,
-                AgentStatusPart::Description,
-                (said_x, said_y + bar * 0.4, (card_said_end - said_x).max(bar), bar),
-                muted,
-            )?;
-        }
-
-        // The Agents panel: one agent with everything it reported, a part
-        // to a line in the switches' order, each line's number in a gutter
-        // to the right where it sits on nothing.
-        let gutter = badge + self.ui_px(16.0);
-        let row_x = panel_x + pad / 2.0;
-        let row_w = panel_w - pad - gutter;
-        let text_x = row_x + pad + bar * 2.4;
-        let text_end = row_x + row_w - pad;
-        let line_step = (badge + self.ui_px(8.0)).round();
-        let progress_h = self.ui_px(8.0).round();
-        let row_y = y + self.ui_px(36.0).round();
-        let lines = 2
-            + usize::from(show.description)
-            + usize::from(show.reason)
-            + usize::from(show.progress)
-            + usize::from(show.subtasks);
-        let row_h = pad * 2.0 + line_step * (lines - 1) as f32 + bar;
-        self.draw_rounded_rect(layers, 0, row_x, row_y, row_w, row_h, surface, self.ui_px(12.0))?;
-        let mark = bar * 1.6;
-        let mut line_y = row_y + pad;
         self.draw_rounded_rect(
             layers,
             0,
-            row_x + pad,
-            line_y - bar * 0.3,
-            mark,
-            mark,
-            brand,
-            mark / 2.0,
+            text_x,
+            card_y + card_h * 0.66 - bar / 2.0,
+            (card_w * 0.2).round(),
+            bar,
+            faint,
+            bar / 2.0,
         )?;
-        self.draw_rounded_rect(layers, 0, text_x, line_y, (text_end - text_x) * 0.7, bar, strong, bar / 2.0)?;
-        line_y += line_step;
-        self.draw_rounded_rect(layers, 0, text_x, line_y, (text_end - text_x) * 0.45, bar, muted, bar / 2.0)?;
-        let badge_x = (row_x + row_w + (gutter - badge) / 2.0).round();
-        let mut badges = Vec::new();
-        if show.description {
-            line_y += line_step;
-            part(
-                self,
-                layers,
-                AgentStatusPart::Description,
-                (text_x, line_y, (text_end - text_x) * 0.85, bar),
-                muted,
-            )?;
-            badges.push((1, line_y + bar / 2.0));
-        }
-        if show.reason {
-            line_y += line_step;
-            pill(self, layers, text_x, line_y - bar * 0.4)?;
-            badges.push((2, line_y + bar / 2.0));
-        }
-        if show.progress {
-            line_y += line_step;
-            let track_y = line_y + (bar - progress_h) / 2.0;
-            let track_w = text_end - text_x;
-            part(
-                self,
-                layers,
-                AgentStatusPart::Progress,
-                (text_x, track_y, track_w, progress_h),
-                colors.separator,
-            )?;
-            self.draw_rounded_rect(
-                layers,
-                0,
-                text_x,
-                track_y,
-                (track_w * 0.6).round(),
-                progress_h,
-                colors.accent,
-                progress_h / 2.0,
-            )?;
-            badges.push((3, line_y + bar / 2.0));
-        }
-        if show.subtasks {
-            // Folded to the one line that counts them, as the panel shows
-            // them until that line is clicked.
-            line_y += line_step;
-            let chevron = (bar * 1.6).round();
-            self.draw_svg_icon(
-                layers,
-                SvgIcon::ChevronRight,
-                text_x - (chevron - bar) / 2.0,
-                line_y + (bar - chevron) / 2.0,
-                chevron,
-                colors.muted_text,
-            )?;
-            part(
-                self,
-                layers,
-                AgentStatusPart::Subtasks,
-                (
-                    text_x + bar * 2.0,
-                    line_y,
-                    (text_end - text_x - bar * 2.0) * 0.55,
-                    bar,
-                ),
-                muted,
-            )?;
-            badges.push((4, line_y + bar / 2.0));
-        }
-        for (number, center_y) in badges {
-            self.paint_number_badge(layers, badge_x, (center_y - badge / 2.0).round(), badge, number)?;
-        }
+        let tick = self.ui_px(36.0).round();
+        let tick_x = card_x + card_w - (card_h - tick) / 2.0 - tick;
+        let tick_y = card_y + ((card_h - tick) / 2.0).round();
+        self.draw_rounded_rect(
+            layers,
+            0,
+            tick_x,
+            tick_y,
+            tick,
+            tick,
+            LinearRgba::with_srgba(0, 188, 0, 255),
+            tick / 2.0,
+        )?;
+        let check = (tick * 0.6).round();
+        self.draw_svg_icon(
+            layers,
+            SvgIcon::Check,
+            tick_x + (tick - check) / 2.0,
+            tick_y + (tick - check) / 2.0,
+            check,
+            LinearRgba::with_srgba(255, 255, 255, 255),
+        )?;
         Ok(y + height)
-    }
-
-    /// The Status Display part whose switch the pointer is on, if any.
-    fn hovered_agent_status_part(&self) -> Option<AgentStatusPart> {
-        match self
-            .ui
-            .interaction
-            .pressed
-            .or(self.ui.interaction.hovered)?
-        {
-            SettingsAction::ToggleAgentStatusPart(part) => Some(part),
-            _ => None,
-        }
     }
 
     /// Tint one part of a window drawn by `paint_typography_diagram`: the
@@ -11765,44 +12468,54 @@ impl SettingsWindow {
         )?;
         let bottom = self.paint_card(layers, x, card_y, max_width, |this, layers, top| {
             let mut rows = RowCursor::new(top, this);
-            let (tx, tw) = this.paint_row_tile(
-                layers,
-                row_x,
-                rows.y,
-                row_width,
-                SvgIcon::Bell,
-                TileColor::Red,
-            )?;
-            rows.add(this.paint_toggle_setting_row(
-                layers,
-                tx,
-                rows.y,
-                tw,
-                &crate::i18n::tr("settings-notification-sounds"),
-                &crate::i18n::tr("settings-notification-sounds-description"),
-                this.native_settings.workspaces.notification_sounds_enabled,
-                SettingsAction::ToggleNotificationSounds,
-                rows.rule(),
-            )?);
-            let (tx, tw) = this.paint_row_tile(
-                layers,
-                row_x,
-                rows.y,
-                row_width,
-                SvgIcon::BellRing,
-                TileColor::Red,
-            )?;
-            rows.add(this.paint_toggle_setting_row(
-                layers,
-                tx,
-                rows.y,
-                tw,
-                &crate::i18n::tr("settings-system-notifications"),
-                &crate::i18n::tr("settings-system-notifications-description"),
-                this.native_settings.workspaces.system_notifications_enabled,
-                SettingsAction::ToggleSystemNotifications,
-                rows.rule(),
-            )?);
+            let mut prompts = vec![
+                (
+                    WorkPrompt::Sound,
+                    SvgIcon::Bell,
+                    "settings-notification-sounds-description",
+                    SettingsAction::ToggleNotificationSounds,
+                ),
+                (
+                    WorkPrompt::SystemNotification,
+                    SvgIcon::BellRing,
+                    "settings-system-notifications-description",
+                    SettingsAction::ToggleSystemNotifications,
+                ),
+            ];
+            // Only the Dock has a count to show on an application's icon.
+            if cfg!(target_os = "macos") {
+                prompts.push((
+                    WorkPrompt::DockBadge,
+                    SvgIcon::AppWindow,
+                    "settings-dock-badge-description",
+                    SettingsAction::ToggleDockBadge,
+                ));
+            }
+            for (prompt, icon, description, action) in prompts {
+                let enabled = prompt.enabled(&this.native_settings.workspaces);
+                let moments = prompt.moments(&this.native_settings.workspaces);
+                let (tx, tw) =
+                    this.paint_row_tile(layers, row_x, rows.y, row_width, icon, TileColor::Red)?;
+                let extra = this.paint_toggle_setting_row(
+                    layers,
+                    tx,
+                    rows.y,
+                    tw,
+                    &crate::i18n::tr(prompt.label_key()),
+                    &crate::i18n::tr(description),
+                    enabled,
+                    action,
+                    rows.rule(),
+                )?;
+                // Under the description, whatever its length.
+                let description_bottom = this.settings_row_description_y(rows.y)
+                    + this.metrics.cell_size.height as f32
+                    + extra;
+                let chips_top = description_bottom + this.ui_px(WORK_MOMENT_CHIP_GAP);
+                let chips_height =
+                    this.paint_work_moment_chips(layers, tx, chips_top, prompt, moments, enabled)?;
+                rows.add(chips_top + chips_height - description_bottom + extra);
+            }
             Ok(rows.bottom)
         })?;
 
@@ -12079,19 +12792,23 @@ impl SettingsWindow {
                 (detail_block_rel_y + detail_block_height + self.ui_px(18.0) - row_step).max(0.0)
             })
             .unwrap_or(0.0);
-        // How much of a program's own report shows comes first; the
-        // integrations follow under their own heading.
+        // Dynamic Status comes first; how much of a program's own report
+        // shows is the Status panel's, in its view menu. The integrations
+        // follow under their own heading.
         self.draw_text(
             layers,
             &body_font,
             x,
             section_y,
-            &crate::i18n::tr("settings-agent-status-heading"),
+            &crate::i18n::tr("settings-dynamic-status-heading"),
             palette.muted_text,
             max_width,
         )?;
         let (status_card_y, _) = self.settings_card_geometry(section_y, 0);
-        let status_bottom = self.paint_agent_status_card(layers, x, status_card_y, max_width)?;
+        let status_bottom = self.paint_dynamic_status_card(layers, x, status_card_y, max_width)?;
+        let status_bottom =
+            self.paint_server_terminals_card(layers, x, status_bottom, max_width)?;
+        let status_bottom = self.paint_reverse_access_card(layers, x, status_bottom, max_width)?;
         let integrations_title_y = status_bottom + self.settings_section_card_gap();
         let integrations_card_y = integrations_title_y + self.settings_section_card_gap();
         let integrations_first_row_y = integrations_card_y + self.settings_card_top_padding();
@@ -12712,14 +13429,15 @@ impl SettingsWindow {
             + self.ui_px(TAB_ICON_EDITOR_SWATCH_GAP)
             + self.ui_px(TAB_ICON_EDITOR_SWATCH);
         let hairline = self.ui_px(1.0).max(1.0);
+        let color_rows = if card.glyph.is_full_color() { 1 } else { 2 };
         let height = self.ui_px(TAB_ICON_EDITOR_PAD) * 2.0
             + self.ui_px(TAB_ICON_EDITOR_HEAD)
             + self.ui_px(TAB_ICON_EDITOR_SECTION_GAP) * 2.0
             + programs_row
             + hairline
             + shape_row
-            + color_row * 2.0
-            + hairline;
+            + color_row * color_rows as f32
+            + hairline * (color_rows - 1) as f32;
 
         let chips = card
             .programs
@@ -12746,6 +13464,7 @@ impl SettingsWindow {
             shape_buttons,
             shape_row,
             color_row,
+            color_rows,
         }
     }
 
@@ -13027,7 +13746,8 @@ impl SettingsWindow {
             )?;
         }
 
-        // The second group: the two colours.
+        // The second group: the two colours -- the circle's alone for a
+        // glyph in its own colours, which takes no other.
         let group_y = group_y + group_height + self.ui_px(TAB_ICON_EDITOR_SECTION_GAP);
         self.draw_rounded_rect(
             layers,
@@ -13035,7 +13755,7 @@ impl SettingsWindow {
             inner_x,
             group_y,
             inner_width,
-            layout.color_row * 2.0 + hairline,
+            layout.color_row * layout.color_rows as f32 + hairline * (layout.color_rows - 1) as f32,
             group_fill,
             group_radius,
         )?;
@@ -13052,6 +13772,9 @@ impl SettingsWindow {
             crate::tab_icons::CIRCLE_PRESETS,
             SettingsAction::TabIconCirclePreset,
         )?;
+        if layout.color_rows < 2 {
+            return Ok(());
+        }
         let rule_y = group_y + layout.color_row;
         self.draw_rect(
             layers,
@@ -13525,6 +14248,60 @@ impl SettingsWindow {
         );
     }
 
+    fn paint_accessibility(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let body_font = Rc::clone(&self.body_font);
+        let scroll = self.ui.content_scroll.offset;
+        let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
+        let card_padding = self.ui_px(36.0);
+        let row_x = x + card_padding;
+        let row_width = max_width - card_padding * 2.0;
+
+        self.draw_text(
+            layers,
+            &body_font,
+            x,
+            section_y,
+            &crate::i18n::tr("settings-accessibility-heading"),
+            palette.muted_text,
+            max_width,
+        )?;
+        let (card_y, _) = self.settings_card_geometry(section_y, 0);
+        let bottom = self.paint_card(layers, x, card_y, max_width, |this, layers, top| {
+            let mut rows = RowCursor::new(top, this);
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::CirclePlus,
+                TileColor::Blue,
+            )?;
+            rows.add(this.paint_toggle_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr("settings-button-shapes"),
+                &crate::i18n::tr("settings-button-shapes-description"),
+                this.native_settings.accessibility.show_button_shapes,
+                SettingsAction::ToggleButtonShapes,
+                rows.rule(),
+            )?);
+            Ok(rows.bottom)
+        })?;
+        self.ui.content_scroll.set_extents(
+            self.content_viewport_extent(),
+            self.settings_content_extent(bottom + scroll),
+        );
+        Ok(())
+    }
+
     fn paint_terminal(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -13638,7 +14415,7 @@ impl SettingsWindow {
         )?;
         let bottom = self.paint_card(layers, x, card_y, max_width, |this, layers, top| {
             use crate::native_settings::{
-                NativeCursorBlink, NativeScrollMode, NativeTextContrast,
+                NativeCursorBlink, NativeCursorShape, NativeScrollMode, NativeTextContrast,
             };
             let mut rows = RowCursor::new(top, this);
 
@@ -13743,6 +14520,39 @@ impl SettingsWindow {
                 tw,
                 &crate::i18n::tr("settings-text-contrast"),
                 &crate::i18n::tr("settings-text-contrast-description"),
+                &options,
+                selected,
+                rows.rule(),
+            )?);
+
+            let options: Vec<(String, SettingsAction)> = NativeCursorShape::ALL
+                .iter()
+                .map(|shape| {
+                    (
+                        localized_cursor_shape_label(*shape),
+                        SettingsAction::SetCursorShape(*shape),
+                    )
+                })
+                .collect();
+            let selected = NativeCursorShape::ALL
+                .iter()
+                .position(|shape| *shape == this.native_settings.terminal.cursor_shape)
+                .unwrap_or(0);
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::Square,
+                TileColor::Indigo,
+            )?;
+            rows.add(this.paint_segmented_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr("settings-cursor-shape"),
+                &crate::i18n::tr("settings-cursor-shape-description"),
                 &options,
                 selected,
                 rows.rule(),
@@ -13903,6 +14713,26 @@ impl SettingsWindow {
                 }),
                 &options,
                 selected,
+                rows.rule(),
+            )?);
+
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::Shield,
+                TileColor::Orange,
+            )?;
+            rows.add(this.paint_toggle_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr("settings-paste-confirmation"),
+                &crate::i18n::tr("settings-paste-confirmation-description"),
+                this.native_settings.terminal.paste_confirmation,
+                SettingsAction::TogglePasteConfirmation,
                 rows.rule(),
             )?);
 
@@ -15305,6 +16135,102 @@ impl SettingsWindow {
         Ok(())
     }
 
+    /// Share & Sync: whether this ThinkTerm shares terminals at all.
+    fn paint_share_sync(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let body_font = Rc::clone(&self.body_font);
+        let scroll = self.ui.content_scroll.offset;
+        let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
+        self.draw_text(
+            layers,
+            &body_font,
+            x,
+            section_y,
+            &crate::i18n::tr("settings-share-sync-description"),
+            palette.secondary_text,
+            max_width,
+        )?;
+        let card_padding = self.ui_px(36.0);
+        let row_x = x + card_padding;
+        let row_width = max_width - card_padding * 2.0;
+        let (card_y, _) = self.settings_card_geometry(section_y, 1);
+        // What turning it off does, and where it works on Windows, are in
+        // the explanation's last lines: it is given room for them.
+        let layout = CardLayout {
+            description_lines: 4,
+            ..self.card_layout()
+        };
+        let bottom = self.paint_card_as(layers, x, card_y, max_width, layout, |this, layers, top| {
+            let mut rows = RowCursor::new(top, this);
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::Share,
+                TileColor::Green,
+            )?;
+            // The share socket and the accounts it admits are unix's: on
+            // Windows this turns on sharing the panes of the Linux and Mac
+            // servers a window is connected to.
+            let description = if cfg!(windows) {
+                "settings-sharing-description-windows"
+            } else {
+                "settings-sharing-description"
+            };
+            let title = crate::i18n::tr("settings-sharing");
+            let title_y = rows.y;
+            let extra = this.paint_toggle_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &title,
+                &crate::i18n::tr(description),
+                this.native_settings.sharing.enabled,
+                SettingsAction::ToggleSharing,
+                rows.rule(),
+            )?;
+            let control_x = tx + tw - this.settings_control_width(tw);
+            let text_width = (control_x - tx - this.ui_px(24.0)).max(tw * 0.45);
+            // That it is still being tried, on a line of its own: after
+            // the description it would be cut off with it.
+            let note_y =
+                this.settings_row_description_y(title_y) + this.description_line_step() + extra;
+            let last_note_y = note_y
+                + this.draw_row_note(
+                    layers,
+                    tx,
+                    note_y,
+                    &crate::i18n::tr("settings-sharing-experimental"),
+                    text_width,
+                )?;
+            let cell_height = this.metrics.cell_size.height as f32;
+            let bottom = last_note_y + cell_height + this.ui_px(6.0);
+            rows.add((bottom - (title_y + this.settings_row_visual_height())).max(0.0));
+            // New, and said so after its title, as window opacity is.
+            let ui_font = Rc::clone(&this.ui_font);
+            let title_width = this.measure_text_width(&ui_font, &title).min(text_width);
+            this.paint_beta_badge(
+                layers,
+                tx + title_width + this.ui_px(14.0),
+                title_y,
+                tx + text_width,
+            )?;
+            Ok(rows.bottom)
+        })?;
+        self.ui.content_scroll.set_extents(
+            self.content_viewport_extent(),
+            self.settings_content_extent(bottom + scroll),
+        );
+        Ok(())
+    }
+
     fn paint_backup(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -16019,7 +16945,7 @@ impl SettingsWindow {
             Panel::Chat => (SvgIcon::FolderOpen, TileColor::Blue),
             Panel::Tasks => (SvgIcon::NotebookTabs, TileColor::Yellow),
             Panel::Snippets => (SvgIcon::Braces, TileColor::Purple),
-            Panel::Agents => (SvgIcon::Bot, TileColor::Orange),
+            Panel::Agents => (SvgIcon::Eye, TileColor::Orange),
             Panel::Plugin(_) => (SvgIcon::Puzzle, TileColor::Green),
         }
     }
@@ -17367,6 +18293,444 @@ impl SettingsWindow {
         Ok(extra)
     }
 
+    /// The moments `prompt` answers, as a row of ticked chips starting at
+    /// `x, y`: one per [`WorkMoment`], each flipped by a click. While the
+    /// prompt is off they are greyed and keep what was chosen. Returns their
+    /// height.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_work_moment_chips(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        prompt: WorkPrompt,
+        moments: WorkMoments,
+        active: bool,
+    ) -> anyhow::Result<f32> {
+        let palette = self.palette();
+        let font = Rc::clone(&self.ui_font);
+        let height = self.ui_px(WORK_MOMENT_CHIP_HEIGHT);
+        let check = self.ui_px(WORK_MOMENT_CHECK_SIDE);
+        let pad = self.ui_px(12.0);
+        let mut chip_x = x;
+        for moment in WorkMoment::ALL {
+            let label = crate::i18n::tr(work_moment_label_key(moment));
+            let label_width = self.measure_text_width(&font, &label);
+            let width = pad + check + self.ui_px(10.0) + label_width + pad + self.ui_px(4.0);
+            let action = SettingsAction::ToggleWorkMoment(prompt, moment);
+            let state = if !active {
+                ControlState::Disabled
+            } else if self.ui.interaction.pressed == Some(action) {
+                ControlState::Pressed
+            } else if self.ui.interaction.hovered == Some(action) {
+                ControlState::Hovered
+            } else {
+                ControlState::Normal
+            };
+            if active {
+                self.ui_context
+                    .push(rect(chip_x, y, width, height), WidgetKind::Button, action);
+            }
+            let (background, border) = state.colors(self.chrome_palette);
+            self.draw_rounded_frame(
+                layers,
+                0,
+                chip_x,
+                y,
+                width,
+                height,
+                background,
+                border,
+                height / 2.0,
+            )?;
+
+            let check_x = chip_x + pad;
+            let check_y = y + (height - check) / 2.0;
+            let ticked = moments.includes(moment);
+            if ticked {
+                let fill = if active {
+                    self.chrome_palette.accent
+                } else {
+                    palette.muted_text
+                };
+                self.draw_rounded_rect(
+                    layers,
+                    0,
+                    check_x,
+                    check_y,
+                    check,
+                    check,
+                    fill,
+                    self.ui_px(6.0),
+                )?;
+                let glyph = (check * 0.75).round();
+                self.draw_svg_icon(
+                    layers,
+                    SvgIcon::Check,
+                    check_x + (check - glyph) / 2.0,
+                    check_y + (check - glyph) / 2.0,
+                    glyph,
+                    palette.on_accent,
+                )?;
+            } else {
+                self.draw_rounded_frame(
+                    layers,
+                    0,
+                    check_x,
+                    check_y,
+                    check,
+                    check,
+                    palette.control_bg,
+                    palette.control_border,
+                    self.ui_px(6.0),
+                )?;
+            }
+            let text_x = check_x + check + self.ui_px(10.0);
+            self.draw_text(
+                layers,
+                &font,
+                text_x,
+                self.control_text_y(y, height),
+                &label,
+                if active {
+                    palette.text
+                } else {
+                    palette.muted_text
+                },
+                label_width + self.ui_px(4.0),
+            )?;
+            chip_x += width + self.ui_px(10.0);
+        }
+        Ok(height)
+    }
+
+    fn persist_work_prompt(&mut self, prompt: WorkPrompt) -> anyhow::Result<()> {
+        let workspaces = self.native_settings.workspaces.clone();
+        let saved = crate::native_settings::update(|settings| {
+            prompt.merge(&workspaces, &mut settings.workspaces);
+        });
+        self.set_native_settings(match &saved {
+            Ok(settings) => settings.as_ref().clone(),
+            Err(_) => crate::native_settings::load(),
+        });
+        saved.map(drop)
+    }
+
+    /// Save a change to one of the Notifications card's prompts, and show
+    /// it on the Dock icon at once when that is the prompt that changed.
+    fn save_work_prompt(&mut self, prompt: WorkPrompt) {
+        let setting = crate::i18n::tr(prompt.label_key());
+        self.status = match self.persist_work_prompt(prompt) {
+            Ok(()) => settings_tr("settings-status-saved", &[("setting", setting)]),
+            Err(err) => settings_tr(
+                "settings-status-save-error",
+                &[("setting", setting), ("error", format!("{err:#}"))],
+            ),
+        };
+        if prompt == WorkPrompt::DockBadge {
+            crate::workspace_threads::refresh_dock_badge();
+        }
+    }
+
+    /// Look up what the programs in local terminals may do, off the main
+    /// thread, and repaint once the answer is in.
+    #[cfg(target_os = "macos")]
+    fn start_privacy_check(&mut self) {
+        self.ui.privacy = PrivacyCheck::Checking;
+        let instance_id = self.instance_id;
+        let spawned = std::thread::Builder::new()
+            .name("thinkterm-privacy-check".into())
+            .spawn(move || {
+                let result = crate::privacy_status::query().map_err(|err| format!("{err:#}"));
+                if let Err(err) = &result {
+                    log::warn!("privacy check: {err}");
+                }
+                promise::spawn::spawn_into_main_thread(async move {
+                    let Some(settings) = settings_window_for_instance(instance_id) else {
+                        return;
+                    };
+                    let mut settings = settings.borrow_mut();
+                    settings.ui.privacy = PrivacyCheck::Done(result);
+                    if let Some(window) = settings.window.as_ref() {
+                        window.invalidate();
+                    }
+                })
+                .detach();
+            });
+        if let Err(err) = spawned {
+            self.ui.privacy = PrivacyCheck::Done(Err(format!("{err:#}")));
+        }
+    }
+
+    /// Settings › Permissions: whose permissions they are -- every program
+    /// run in a terminal is ThinkTerm to macOS -- and the card of them. A
+    /// Mac's page only; listed nowhere else.
+    fn paint_privacy(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            let palette = self.palette();
+            let body_font = Rc::clone(&self.body_font);
+            let scroll = self.ui.content_scroll.offset;
+            let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
+            let lines = self.wrap_settings_text(
+                &body_font,
+                &crate::i18n::tr("settings-privacy-page-description"),
+                max_width,
+            );
+            let last = self.draw_text_lines(
+                layers,
+                &body_font,
+                x,
+                section_y,
+                &lines,
+                palette.secondary_text,
+                max_width,
+            )?;
+            let card_padding = self.ui_px(36.0);
+            let bottom = self.paint_privacy_card(
+                layers,
+                x,
+                section_y + last,
+                max_width,
+                x + card_padding,
+                max_width - card_padding * 2.0,
+            )?;
+            self.ui.content_scroll.set_extents(
+                self.content_viewport_extent(),
+                self.settings_content_extent(bottom + scroll),
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (layers, x, max_width);
+        Ok(())
+    }
+
+    /// Settings › Permissions' card on what macOS lets the programs in
+    /// local terminals do: each permission as it stands with a way to its
+    /// page in System Settings, then the program they belong to, to be added
+    /// to a list by hand. Returns where the card ends.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    fn paint_privacy_card(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        top: f32,
+        max_width: f32,
+        row_x: f32,
+        row_width: f32,
+    ) -> anyhow::Result<f32> {
+        use crate::privacy_status::{
+            CAMERA_PANE, FULL_DISK_ACCESS_PANE, MICROPHONE_PANE, SCREEN_RECORDING_PANE,
+        };
+        use wezterm_mux_server_impl::privacy::PrivacyStatus;
+        if matches!(self.ui.privacy, PrivacyCheck::Stale) {
+            self.start_privacy_check();
+        }
+        let card_y = self.paint_card_heading(
+            layers,
+            x,
+            top,
+            max_width,
+            &crate::i18n::tr("settings-privacy-heading"),
+        )?;
+        let report = match &self.ui.privacy {
+            PrivacyCheck::Done(Ok(report)) => Some(*report),
+            _ => None,
+        };
+        let checking = matches!(
+            self.ui.privacy,
+            PrivacyCheck::Stale | PrivacyCheck::Checking
+        );
+        let held_by_server = crate::privacy_status::held_by_server();
+        self.paint_card(layers, x, card_y, max_width, |this, layers, top| {
+            let mut rows = RowCursor::new(top, this);
+            let permissions = [
+                (
+                    SvgIcon::FileText,
+                    TileColor::Gray,
+                    "settings-privacy-full-disk",
+                    "settings-privacy-full-disk-description",
+                    // Every program in every terminal past every folder at
+                    // once: what that risks, under what it is for.
+                    Some("settings-privacy-full-disk-caution"),
+                    FULL_DISK_ACCESS_PANE,
+                    report.map(|report| report.full_disk_access),
+                ),
+                (
+                    SvgIcon::Monitor,
+                    TileColor::Indigo,
+                    "settings-privacy-screen",
+                    "settings-privacy-screen-description",
+                    None,
+                    SCREEN_RECORDING_PANE,
+                    report.map(|report| report.screen_recording),
+                ),
+                (
+                    SvgIcon::Mic,
+                    TileColor::Orange,
+                    "settings-privacy-microphone",
+                    "settings-privacy-microphone-description",
+                    None,
+                    MICROPHONE_PANE,
+                    report.map(|report| report.microphone),
+                ),
+                (
+                    SvgIcon::Camera,
+                    TileColor::Teal,
+                    "settings-privacy-camera",
+                    "settings-privacy-camera-description",
+                    None,
+                    CAMERA_PANE,
+                    report.map(|report| report.camera),
+                ),
+            ];
+            for (icon, color, label, description, caution, pane, status) in permissions {
+                let (tx, tw) = this.paint_row_tile(layers, row_x, rows.y, row_width, icon, color)?;
+                let (state, dot) = match status {
+                    _ if checking => ("settings-privacy-checking", this.palette().control_border),
+                    Some(PrivacyStatus::Granted) => {
+                        ("settings-privacy-granted", TileColor::Green.linear())
+                    }
+                    Some(PrivacyStatus::NotGranted) => {
+                        ("settings-privacy-not-granted", this.palette().muted_text)
+                    }
+                    Some(PrivacyStatus::Denied) => {
+                        ("settings-privacy-denied", TileColor::Red.linear())
+                    }
+                    Some(PrivacyStatus::NotAsked) => {
+                        ("settings-privacy-not-asked", this.palette().control_border)
+                    }
+                    Some(PrivacyStatus::Unknown) | None => {
+                        ("settings-privacy-unknown", this.palette().control_border)
+                    }
+                };
+                rows.add(this.paint_privacy_row(
+                    layers,
+                    tx,
+                    rows.y,
+                    tw,
+                    &crate::i18n::tr(label),
+                    &crate::i18n::tr(description),
+                    caution.map(crate::i18n::tr).as_deref(),
+                    &crate::i18n::tr(state),
+                    dot,
+                    SettingsAction::OpenPrivacySettings(pane),
+                    rows.rule(),
+                )?);
+            }
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                if held_by_server {
+                    SvgIcon::MuxServer
+                } else {
+                    SvgIcon::AppWindow
+                },
+                TileColor::Slate,
+            )?;
+            rows.add(this.paint_action_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr(if held_by_server {
+                    "settings-privacy-holder-server"
+                } else {
+                    "settings-privacy-holder-app"
+                }),
+                &crate::i18n::tr("settings-privacy-holder-description"),
+                &crate::i18n::tr("menu-reveal-finder"),
+                SettingsAction::RevealPrivacyHolder,
+                rows.rule(),
+            )?);
+            Ok(rows.bottom)
+        })
+    }
+
+    /// A permission's row: its name and what it is for, then what allowing
+    /// it risks where it has a `caution`; how it stands as a dot and a word,
+    /// and a button to its page in System Settings.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    fn paint_privacy_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        label: &str,
+        description: &str,
+        caution: Option<&str>,
+        state: &str,
+        dot_color: LinearRgba,
+        action: SettingsAction,
+        draw_top_rule: bool,
+    ) -> anyhow::Result<f32> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        if draw_top_rule {
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
+        }
+        let button = crate::i18n::tr("settings-privacy-open");
+        let button_width = self.button_width_for_label(&button, 0.0);
+        let button_x = x + width - button_width;
+        let control_y = y + self.ui_px(4.0);
+        let control_height = self.ui_px(CONTROL_HEIGHT);
+        let dot = self.ui_px(14.0);
+        let state_width = self.measure_text_width(&ui_font, state);
+        let state_x = button_x - self.ui_px(20.0) - state_width;
+        let dot_x = state_x - self.ui_px(10.0) - dot;
+        let text_width = (dot_x - x - self.ui_px(24.0)).max(width * 0.35);
+
+        self.draw_text(layers, &ui_font, x, y, label, palette.text, text_width)?;
+        let mut extra = self.draw_row_description(layers, x, y, description, text_width)?;
+        if let Some(caution) = caution {
+            // Whole, and in a colour of its own: it is there to be read.
+            let body_font = Rc::clone(&self.body_font);
+            let step = self.description_line_step();
+            let lines = self.wrap_settings_text(&body_font, caution, text_width);
+            extra += step
+                + self.draw_text_lines(
+                    layers,
+                    &body_font,
+                    x,
+                    self.settings_row_description_y(y) + extra + step,
+                    &lines,
+                    TileColor::Orange.linear(),
+                    text_width,
+                )?;
+        }
+        self.draw_rounded_rect(
+            layers,
+            0,
+            dot_x,
+            control_y + (control_height - dot) / 2.0,
+            dot,
+            dot,
+            dot_color,
+            dot / 2.0,
+        )?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            state_x,
+            self.control_text_y(control_y, control_height),
+            state,
+            palette.secondary_text,
+            state_width + self.ui_px(4.0),
+        )?;
+        self.draw_button(layers, button_x, control_y, button_width, &button, action)?;
+        Ok(extra)
+    }
+
     /// A single-line band like `paint_toggle_setting_row_with_hint`, with a
     /// button on the right instead of a switch: the label and its hint
     /// icon on the left, the button centred in the band.
@@ -17588,15 +18952,20 @@ impl SettingsWindow {
                 (self.measure_text_width(&ui_font, text) + self.ui_px(28.0)).max(self.ui_px(72.0))
             })
             .collect();
-        let natural_total: f32 = natural.iter().sum::<f32>() + inset * 2.0;
+        // Neighbouring segments keep the edge's margin between them, so a
+        // hovered segment next to the selected one does not run into it.
+        let gap = inset;
+        let gaps = gap * options.len().saturating_sub(1) as f32;
+        let natural_segments: f32 = natural.iter().sum();
+        let natural_total = natural_segments + gaps + inset * 2.0;
         // The column is the target width, but three labels can need more
         // than it offers (fonts scale with the point size, the column with
         // the UI scale, and the two diverge at 96 dpi). Let the control
         // borrow from the label side before ellipsising its options.
         let max_width = column_width.max(width * 0.45);
         let control_width = natural_total.min(max_width);
-        let shrink = if natural_total > inset * 2.0 {
-            (control_width - inset * 2.0) / (natural_total - inset * 2.0)
+        let shrink = if natural_segments > 0.0 {
+            ((control_width - inset * 2.0 - gaps) / natural_segments).max(0.0)
         } else {
             1.0
         };
@@ -17625,7 +18994,15 @@ impl SettingsWindow {
             options.iter().zip(natural.iter()).enumerate()
         {
             let segment_width = natural_width * shrink;
-            let segment_rect = rect(segment_x, segment_y, segment_width, segment_height);
+            // Clicks in a gap go to the nearer segment.
+            let reach_left = if index > 0 { gap / 2.0 } else { 0.0 };
+            let reach_right = if index + 1 < options.len() { gap / 2.0 } else { 0.0 };
+            let segment_rect = rect(
+                segment_x - reach_left,
+                segment_y,
+                segment_width + reach_left + reach_right,
+                segment_height,
+            );
             self.ui_context
                 .push(segment_rect, WidgetKind::Button, *action);
             let is_selected = index == selected;
@@ -17669,7 +19046,7 @@ impl SettingsWindow {
                 },
                 available,
             )?;
-            segment_x += segment_width;
+            segment_x += segment_width + gap;
         }
         Ok(extra)
     }
@@ -19047,6 +20424,7 @@ impl SettingsWindow {
         let current = self.native_settings.appearance.mac_glass;
         crate::native_settings::NativeMacGlass::ALL
             .iter()
+            .filter(|glass| !glass.is_liquid_glass() || liquid_glass_available())
             .map(|glass| {
                 (
                     localized_mac_glass_label(*glass),
@@ -19077,6 +20455,123 @@ impl SettingsWindow {
                 self.status = settings_tr(
                     "settings-status-value-now",
                     &[("setting", setting), ("value", value)],
+                );
+            }
+            Err(err) => {
+                self.set_native_settings(crate::native_settings::load());
+                self.status = settings_tr(
+                    "settings-status-save-error",
+                    &[("setting", setting), ("error", format!("{err:#}"))],
+                );
+            }
+        }
+    }
+
+    /// Show the window tab row or have it auto-hide, in every window. Choosing
+    /// auto-hide here starts with the pin out: it is what was asked for.
+    fn apply_window_tabs(&mut self, mode: crate::native_settings::NativeWindowTabs) {
+        self.ui.open_dropdown = None;
+        // The chosen segment pressed again: nothing changes, the pin included.
+        if crate::native_settings::load_shared().appearance.window_tabs == mode {
+            return;
+        }
+        let mut merged = crate::native_settings::load();
+        merged.appearance.window_tabs = mode;
+        merged.appearance.window_tabs_pinned = false;
+        self.set_native_settings(merged);
+        let setting = crate::i18n::tr("settings-window-tabs");
+        match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                if let Some(front_end) = crate::frontend::try_front_end() {
+                    for gui_window in front_end.gui_windows() {
+                        gui_window.window.notify(
+                            crate::termwindow::TermWindowNotif::Apply(Box::new(|term_window| {
+                                term_window.refresh_window_tabs();
+                            })),
+                        );
+                    }
+                }
+                self.status = settings_tr(
+                    "settings-status-value-now",
+                    &[("setting", setting), ("value", localized_window_tabs_label(mode))],
+                );
+            }
+            Err(err) => {
+                self.set_native_settings(crate::native_settings::load());
+                self.status = settings_tr(
+                    "settings-status-save-error",
+                    &[("setting", setting), ("error", format!("{err:#}"))],
+                );
+            }
+        }
+    }
+
+    /// Give servers Spaces of their own or show them as folders in this
+    /// device's Spaces. The sidebars read the choice as they paint, the
+    /// Space menu and the palette as they open; what it owes the windows is
+    /// a repaint, and letting go of a server thread whose folder is gone.
+    fn apply_server_placement(
+        &mut self,
+        placement: crate::native_settings::NativeServerPlacement,
+    ) {
+        self.ui.open_dropdown = None;
+        if crate::native_settings::load_shared().appearance.server_placement == placement {
+            return;
+        }
+        let mut merged = crate::native_settings::load();
+        merged.appearance.server_placement = placement;
+        self.set_native_settings(merged);
+        let setting = crate::i18n::tr("settings-server-placement");
+        match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                // A server thread on screen through a folder that is gone
+                // now is let go of.
+                for gui_window in crate::frontend::front_end().gui_windows() {
+                    gui_window
+                        .window
+                        .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                            |term_window| term_window.leave_server_folder_content_if_hidden(),
+                        )));
+                }
+                crate::frontend::front_end().invalidate_all_windows();
+                self.status = settings_tr(
+                    "settings-status-value-now",
+                    &[
+                        ("setting", setting),
+                        ("value", localized_server_placement_label(placement)),
+                    ],
+                );
+            }
+            Err(err) => {
+                self.set_native_settings(crate::native_settings::load());
+                self.status = settings_tr(
+                    "settings-status-save-error",
+                    &[("setting", setting), ("error", format!("{err:#}"))],
+                );
+            }
+        }
+    }
+
+    /// How far the programs here may reach servers' terminals. The window's
+    /// server for the command line asks each time a program asks, so
+    /// saving is all it owes.
+    fn apply_server_terminals(&mut self, reach: crate::native_settings::NativeServerTerminals) {
+        self.ui.open_dropdown = None;
+        if crate::native_settings::load_shared().agents.server_terminals == reach {
+            return;
+        }
+        let mut merged = crate::native_settings::load();
+        merged.agents.server_terminals = reach;
+        self.set_native_settings(merged);
+        let setting = crate::i18n::tr("settings-server-terminals");
+        match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                self.status = settings_tr(
+                    "settings-status-value-now",
+                    &[
+                        ("setting", setting),
+                        ("value", localized_server_terminals_label(reach)),
+                    ],
                 );
             }
             Err(err) => {
@@ -19321,6 +20816,8 @@ impl SettingsWindow {
     /// and whether it is the current one.
     fn dropdown_menu_options(&self, dropdown: SettingsDropdown) -> Vec<(String, SettingsAction, bool)> {
         match dropdown {
+            SettingsDropdown::ReverseSource => self.reverse_source_options(),
+            SettingsDropdown::ReverseHost => self.reverse_host_options(),
             SettingsDropdown::Language => self.language_menu_options(),
             SettingsDropdown::MacGlass => self.mac_glass_menu_options(),
             SettingsDropdown::MainRenderer => self.main_renderer_menu_options(),
@@ -19610,7 +21107,7 @@ impl SettingsWindow {
             let inset_x = self.ui_px(DROPDOWN_HOVER_INSET_X);
             let inset_y = self.ui_px(DROPDOWN_HOVER_INSET_Y);
             // Opaque, a step of the card towards its text as the eye sees
-            // it, as the update capsule's button: the card's own hover grey
+            // it, as the dynamic status's buttons: the card's own hover grey
             // is a translucent white, which blends in linear light and so
             // comes out several times brighter than it reads in sRGB.
             let step = if pressed { 0.14 } else { 0.08 };

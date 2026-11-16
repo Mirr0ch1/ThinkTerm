@@ -15,7 +15,7 @@ use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
 use url::Url;
 use wezterm_bidi::ParagraphDirectionHint;
 use wezterm_cell::{
-    grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, SemanticType,
+    grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, PlainWidths, SemanticType,
 };
 use wezterm_escape_parser::csi::{
     CharacterPath, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
@@ -137,16 +137,25 @@ impl<'a> Performer<'a> {
             return;
         }
 
-        let seqno = self.seqno;
         let mut p = std::mem::take(&mut self.print);
+        self.print_now(&p, false);
+        std::mem::swap(&mut self.print, &mut p);
+        self.print.clear();
+    }
+
+    /// Write `text` to the screen. `ascii` says it is known to be printable
+    /// ASCII, which saves looking.
+    fn print_now(&mut self, text: &str, ascii: bool) {
+        let seqno = self.seqno;
         let normalized: String;
-        let text = if self.config_normalize_output_to_unicode_nfc()
-            && is_nfc_quick(p.chars()) != IsNormalized::Yes
+        let text = if !ascii
+            && self.config_normalize_output_to_unicode_nfc()
+            && is_nfc_quick(text.chars()) != IsNormalized::Yes
         {
-            normalized = p.as_str().nfc().collect();
+            normalized = text.nfc().collect();
             normalized.as_str()
         } else {
-            p.as_str()
+            text
         };
 
         // Mixed Unicode must still be segmented as a whole: an ASCII base may
@@ -160,7 +169,7 @@ impl<'a> Performer<'a> {
         let ascii_batch = !self.insert
             && charset == CharSet::Ascii
             && self.unicode_version.cell_widths.is_none()
-            && text.bytes().all(|b| (b' '..=b'~').contains(&b));
+            && (ascii || wezterm_escape_parser::printable_ascii_len(text.as_bytes()) == text.len());
         #[cfg(test)]
         let ascii_batch = ascii_batch && !self.disable_ascii_batch;
         if ascii_batch {
@@ -176,11 +185,50 @@ impl<'a> Performer<'a> {
                 && self.unicode_version.cell_widths.is_none();
             #[cfg(test)]
             let runs = runs && !self.disable_grapheme_runs;
+            // Writing a few characters is no quicker by way of `print_plain`.
+            let plain = if runs && text.len() >= PLAIN_TEXT_MIN_LEN {
+                self.unicode_version.plain_widths()
+            } else {
+                None
+            };
             let mut run = GraphemeRun::default();
             // A row found unable to take a run, until the cursor next wraps.
             let mut no_run_row = None;
             let mut offset = 0;
-            for g in Graphemes::new(text) {
+            let mut graphemes = Graphemes::new(text);
+            // Graphemes to go before looking for plain text again, and how
+            // many to give it next time: text with marks on every letter
+            // should not pay for looking at each one. An emoji on its own
+            // says nothing about what follows it.
+            let mut not_plain = 0;
+            let mut back_off = 1;
+            loop {
+                if not_plain > 0 {
+                    not_plain -= 1;
+                } else if let Some(plain) = plain {
+                    // Rows of CJK text have a path of their own, apart from
+                    // this one, which every other kind of text takes as before.
+                    let printed = if starts_in_a_wide_script(text.as_bytes(), offset) {
+                        self.print_wide(text, offset, plain, &mut run, &mut no_run_row)
+                    } else {
+                        self.print_plain(text, offset, plain, &mut run, &mut no_run_row)
+                    };
+                    if printed == offset {
+                        not_plain = back_off;
+                        back_off = (back_off * 2).min(64);
+                    } else {
+                        back_off = 1;
+                        offset = printed;
+                        graphemes = Graphemes::new(&text[offset..]);
+                    }
+                }
+                let Some(g) = graphemes.next() else {
+                    break;
+                };
+                if not_plain > 0 && g.len() == 4 && g.as_bytes()[0] >= 0xf0 {
+                    not_plain = 0;
+                    back_off = 1;
+                }
                 let start = offset;
                 offset += g.len();
                 let g = self.remap_grapheme(g);
@@ -216,6 +264,7 @@ impl<'a> Performer<'a> {
                     // Wrapping marks the row and may scroll it away.
                     self.flush_grapheme_run(&mut run, text, seqno);
                     no_run_row = None;
+                    run.written_to = None;
                 }
                 self.wrap_if_needed();
 
@@ -256,8 +305,18 @@ impl<'a> Performer<'a> {
                     run.push(x, y, start, offset, print_width);
                 } else {
                     let pen = self.pen.clone();
-                    self.screen_mut()
-                        .set_cell_grapheme(x, y, g, print_width, pen, seqno);
+                    let follows = run.written_to == Some(start);
+                    run.written_to = Some(offset);
+                    let screen = self.screen_mut();
+                    let row = screen.phys_row(y);
+                    screen.line_mut(row).set_cell_grapheme_after(
+                        x,
+                        g,
+                        print_width,
+                        pen,
+                        follows,
+                        seqno,
+                    );
                 }
 
                 if !wrappable {
@@ -269,8 +328,241 @@ impl<'a> Performer<'a> {
             }
             self.flush_grapheme_run(&mut run, text, seqno);
         }
-        std::mem::swap(&mut self.print, &mut p);
-        self.print.clear();
+    }
+
+    /// Write the plain text at `offset` of `text` (see `PlainWidths`) that
+    /// goes in one row at a time, for as long as it lasts, and return where
+    /// it stopped. A character with something else after it is left for the
+    /// general path to take with what follows it, and so is the one that
+    /// reaches the margin, which has more to do.
+    fn print_plain(
+        &mut self,
+        text: &str,
+        offset: usize,
+        plain: &PlainWidths,
+        run: &mut GraphemeRun,
+        no_run_row: &mut Option<VisibleRowIndex>,
+    ) -> usize {
+        let seqno = self.seqno;
+        let bytes = text.as_bytes();
+        let mut offset = offset;
+        loop {
+            // The first grapheme, and whether it can go at all.
+            let Some(mut this) = plain.first(&bytes[offset..]) else {
+                return offset;
+            };
+            let Some(mut step) = plain_grapheme(plain, &bytes[offset..], this.0) else {
+                return offset;
+            };
+            // A run waiting is cheaper to go on with than to cut short for a
+            // little plain text.
+            if run.count > 0 && !plain_lasts(plain, &bytes[offset..]) {
+                return offset;
+            }
+            // What is waiting has to be in the row to tell where this goes.
+            self.flush_grapheme_run(run, text, seqno);
+            if self.wrap_next {
+                *no_run_row = None;
+                run.written_to = None;
+            }
+            self.wrap_if_needed();
+
+            let x = self.cursor.x;
+            let y = self.cursor.y;
+            let margin = self.left_and_right_margins.end;
+            // A row that can't take it all at once takes it a cell at a time.
+            let at_once = self.can_start_grapheme_run(x, y);
+
+            let start = offset;
+            let mut cells = 0;
+            let mut wide = [0; 128];
+            let mut num_wide = 0;
+            let mut max_len = 0;
+            let mut last_width = 0;
+            loop {
+                let (len, next) = step;
+                let width = this.1;
+                if x + cells + width >= margin {
+                    break;
+                }
+                if !at_once {
+                    let pen = self.pen.clone();
+                    let g = &text[offset..offset + len];
+                    let follows = run.written_to == Some(offset);
+                    run.written_to = Some(offset + len);
+                    let screen = self.screen_mut();
+                    let row = screen.phys_row(y);
+                    screen.line_mut(row).set_cell_grapheme_after(
+                        x + cells,
+                        g,
+                        width,
+                        pen,
+                        follows,
+                        seqno,
+                    );
+                } else if width > 1 {
+                    if num_wide == wide.len() {
+                        break;
+                    }
+                    wide[num_wide] = cells as u16;
+                    num_wide += 1;
+                }
+                let first = cells == 0;
+                cells += width;
+                offset += len;
+                max_len = max_len.max(len);
+                last_width = width;
+                let Some(next) = next else {
+                    break;
+                };
+                this = next;
+                let Some(after) = plain_grapheme(plain, &bytes[offset..], this.0) else {
+                    break;
+                };
+                step = after;
+                // Writing past the end of a row fills in the gap, after which
+                // the rest can go at once.
+                if first && !at_once && self.can_start_grapheme_run(x + cells, y) {
+                    break;
+                }
+            }
+            if offset == start {
+                return offset;
+            }
+            if at_once {
+                let pen = self.pen.clone();
+                let follows = run.written_to == Some(start);
+                let appended = {
+                    let screen = self.screen_mut();
+                    let idx = screen.phys_row(y);
+                    screen.line_mut(idx).append_grapheme_run(
+                        x,
+                        &text[start..offset],
+                        max_len,
+                        cells,
+                        &wide[..num_wide],
+                        last_width as u8,
+                        &pen,
+                        follows,
+                        seqno,
+                    )
+                };
+                if !appended {
+                    self.write_graphemes(x, y, &text[start..offset], &pen, follows, seqno);
+                }
+                run.written_to = Some(offset);
+            }
+            self.cursor.x += cells;
+            self.wrap_next = false;
+            if offset == bytes.len() {
+                return offset;
+            }
+        }
+    }
+
+    /// `print_plain` for text that starts with a character of three bytes:
+    /// while what is next is a wide one in a row that can take a run, the
+    /// plain graphemes there are found first, everything of them that goes
+    /// in the row, and written in one piece (`print_wide_run`). Anything
+    /// else is `print_plain`'s. Out of line, so that the path every other
+    /// kind of text takes is the code it was.
+    #[inline(never)]
+    fn print_wide(
+        &mut self,
+        text: &str,
+        offset: usize,
+        plain: &PlainWidths,
+        run: &mut GraphemeRun,
+        no_run_row: &mut Option<VisibleRowIndex>,
+    ) -> usize {
+        let seqno = self.seqno;
+        let bytes = text.as_bytes();
+        let mut offset = offset;
+        loop {
+            // As `print_plain` begins: the first grapheme, and whether it
+            // can go at all.
+            let Some(this) = plain.first(&bytes[offset..]) else {
+                return offset;
+            };
+            if this != (3, 2) {
+                break;
+            }
+            if plain_grapheme(plain, &bytes[offset..], this.0).is_none() {
+                return offset;
+            }
+            if run.count > 0 && !plain_lasts(plain, &bytes[offset..]) {
+                return offset;
+            }
+            self.flush_grapheme_run(run, text, seqno);
+            if self.wrap_next {
+                *no_run_row = None;
+                run.written_to = None;
+            }
+            self.wrap_if_needed();
+            let x = self.cursor.x;
+            let y = self.cursor.y;
+            let margin = self.left_and_right_margins.end;
+            if !self.can_start_grapheme_run(x, y) {
+                break;
+            }
+            let Some(printed) = self.print_wide_run(text, offset, plain, run, x, y, margin) else {
+                return offset;
+            };
+            offset = printed;
+            if offset == bytes.len() {
+                return offset;
+            }
+        }
+        self.print_plain(text, offset, plain, run, no_run_row)
+    }
+
+    /// The plain graphemes at `offset` in `text`, which start with a wide
+    /// character, written at `x` in row `y` in one piece: everything of
+    /// them that fits short of `margin`. Returns where the text goes on, or
+    /// None if nothing could be written this way.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn print_wide_run(
+        &mut self,
+        text: &str,
+        offset: usize,
+        plain: &PlainWidths,
+        run: &mut GraphemeRun,
+        x: usize,
+        y: VisibleRowIndex,
+        margin: usize,
+    ) -> Option<usize> {
+        let seqno = self.seqno;
+        let found = PlainRun::find(plain, &text.as_bytes()[offset..], margin.saturating_sub(x + 1));
+        if found.len == 0 {
+            return None;
+        }
+        let start = offset;
+        let offset = offset + found.len;
+        let pen = self.pen.clone();
+        let follows = run.written_to == Some(start);
+        let appended = {
+            let screen = self.screen_mut();
+            let idx = screen.phys_row(y);
+            screen.line_mut(idx).append_wide_run(
+                x,
+                &text[start..offset],
+                found.max_len,
+                found.cells,
+                &found.wide,
+                found.last_width as u8,
+                &pen,
+                follows,
+                seqno,
+            )
+        };
+        if !appended {
+            self.write_graphemes(x, y, &text[start..offset], &pen, follows, seqno);
+        }
+        run.written_to = Some(offset);
+        self.cursor.x += found.cells;
+        self.wrap_next = false;
+        Some(offset)
     }
 
     fn can_start_grapheme_run(&mut self, x: usize, y: VisibleRowIndex) -> bool {
@@ -292,6 +584,8 @@ impl<'a> Performer<'a> {
         }
         let run_text = &text[run.start..run.end];
         let pen = self.pen.clone();
+        let follows = run.written_to == Some(run.start);
+        run.written_to = Some(run.end);
         let appended = {
             let screen = self.screen_mut();
             let idx = screen.phys_row(run.y);
@@ -303,21 +597,38 @@ impl<'a> Performer<'a> {
                 &run.wide[..run.num_wide],
                 run.last_width,
                 &pen,
+                follows,
                 seqno,
             )
         };
         if !appended {
-            // Refused for an overflowing cluster width, or a grapheme too
-            // long to tell how the row's text grows; write each grapheme
-            // instead. Zero-width ones in a run are white space, shown as
-            // one cell.
-            let mut x = run.x;
-            for g in Graphemes::new(run_text) {
-                let width = grapheme_column_width(g, Some(&self.unicode_version)).max(1);
-                self.screen_mut()
-                    .set_cell_grapheme(x, run.y, g, width, pen.clone(), seqno);
-                x += width;
-            }
+            self.write_graphemes(run.x, run.y, run_text, &pen, follows, seqno);
+        }
+    }
+
+    /// Write the graphemes of a run the row would not take in one go, for an
+    /// overflowing cluster width or a grapheme too long to tell how the
+    /// row's text grows, or that would run into what is before it. Zero-width
+    /// ones in a run are white space, shown as one cell. `follows` says that
+    /// the text is known not to.
+    fn write_graphemes(
+        &mut self,
+        mut x: usize,
+        y: VisibleRowIndex,
+        text: &str,
+        pen: &CellAttributes,
+        mut follows: bool,
+        seqno: wezterm_surface::SequenceNo,
+    ) {
+        for g in Graphemes::new(text) {
+            let width = grapheme_column_width(g, Some(&self.unicode_version)).max(1);
+            let screen = self.screen_mut();
+            let row = screen.phys_row(y);
+            screen
+                .line_mut(row)
+                .set_cell_grapheme_after(x, g, width, pen.clone(), follows, seqno);
+            x += width;
+            follows = true;
         }
     }
 
@@ -329,6 +640,7 @@ impl<'a> Performer<'a> {
             // so that we can correctly reflow it if the window is
             // resized.
             {
+                let x = self.cursor.x;
                 let y = self.cursor.y;
                 let is_conpty = self.state.enable_conpty_quirks;
                 let screen = self.screen_mut();
@@ -350,7 +662,9 @@ impl<'a> Performer<'a> {
                         .map(|cell| makes_sense_to_wrap(cell.str()))
                         .unwrap_or(false);
                 if should_mark_wrapped {
-                    screen.line_mut(y).set_last_cell_was_wrapped(true, seqno);
+                    let line = screen.line_mut(y);
+                    line.keep_blanks_to(x + 1);
+                    line.set_last_cell_was_wrapped(true, seqno);
                 }
             }
             self.new_line(true);
@@ -369,10 +683,9 @@ impl<'a> Performer<'a> {
             let pen = self.pen.clone();
             let screen = self.screen_mut();
             let row = screen.phys_row(y);
-            let written = screen
+            screen
                 .line_mut(row)
-                .set_ascii_cells(x, &text[..count], &pen, seqno);
-            debug_assert!(written);
+                .set_printable_ascii_cells(x, &text[..count], &pen, seqno);
             if x + count < width {
                 self.cursor.x += count;
                 self.wrap_next = false;
@@ -408,6 +721,40 @@ impl<'a> Performer<'a> {
         }
     }
 
+    /// `print_text` for a parser's run of text, with the tabs and line ends
+    /// it may have left in it acted on in place. Text ahead of one of those
+    /// goes straight to the screen: nothing can follow it to join it, so
+    /// there is no need to gather it up first. What is left at the end can
+    /// still be joined by what comes next.
+    pub(crate) fn print_run(&mut self, text: &str) {
+        let bytes = text.as_bytes();
+        let mut start = 0;
+        while start < bytes.len() {
+            let mut end = start + wezterm_escape_parser::printable_ascii_len(&bytes[start..]);
+            let ascii = !matches!(bytes.get(end), Some(0x7f..));
+            if !ascii {
+                end += wezterm_escape_parser::c0_position(&bytes[end..]);
+            }
+            let control = match bytes.get(end) {
+                None => return self.print_text(&text[start..]),
+                Some(b'\t') => ControlCode::HorizontalTab,
+                Some(b'\n') => ControlCode::LineFeed,
+                Some(b'\r') => ControlCode::CarriageReturn,
+                // Anything else is the business of the general path.
+                Some(_) => return self.print_text(&text[start..]),
+            };
+            if self.print.is_empty() && self.accumulating_title.is_none() {
+                if end > start {
+                    self.print_now(&text[start..end], ascii);
+                }
+            } else {
+                self.print_text(&text[start..end]);
+            }
+            self.control(control);
+            start = end + 1;
+        }
+    }
+
     pub fn perform(&mut self, action: Action) {
         debug!("perform {:?}", action);
         if self.suppress_initial_title_change {
@@ -425,7 +772,7 @@ impl<'a> Performer<'a> {
         }
         match action {
             Action::Print(c) => self.print(c),
-            Action::PrintString(s) => self.print_text(&s),
+            Action::PrintString(s) => self.print_run(&s),
             Action::Control(code) => self.control(code),
             Action::DeviceControl(ctrl) => self.device_control(ctrl),
             Action::OperatingSystemCommand(osc) => self.osc_dispatch(*osc),
@@ -1346,6 +1693,178 @@ fn selection_to_selection(sel: Selection) -> ClipboardSelection {
     }
 }
 
+/// Whether the character at `offset` is from where the scripts written in
+/// wide characters are: U+3000 to U+D7FF (CJK, kana, Hangul) or U+F900 to
+/// U+FFFF (compatibility ideographs and fullwidth forms), told from its
+/// first bytes. Only a guess at which way to go: `print_wide` looks at what
+/// the character is, and everything else of three bytes -- accented Latin,
+/// punctuation, arrows, box drawing, symbols, private-use icons -- is not
+/// sent the long way round to find out.
+#[inline(always)]
+fn starts_in_a_wide_script(bytes: &[u8], offset: usize) -> bool {
+    match bytes.get(offset) {
+        Some(0xe3..=0xed) => true,
+        Some(0xef) => bytes.get(offset + 1).is_some_and(|second| *second >= 0xa4),
+        _ => false,
+    }
+}
+
+/// The plain graphemes (see `PlainWidths`) at the start of some text that
+/// fit in a row, found before any of them is written.
+struct PlainRun {
+    /// Bytes of text they come to.
+    len: usize,
+    cells: usize,
+    /// The cells, counted from the first, that start a grapheme two cells
+    /// wide: bit n of the lot is cell n.
+    wide: [u64; PlainRun::CELLS / 64],
+    /// Byte length of the longest grapheme.
+    max_len: usize,
+    last_width: usize,
+}
+
+impl PlainRun {
+    /// The most cells in a run. A row wider than this takes more than one.
+    const CELLS: usize = 256;
+
+    /// The graphemes at the start of `bytes` that `plain_grapheme` gives one
+    /// after another, for as long as they stay short of `room` cells: the
+    /// one that would reach the margin is left, with all it has to do, to
+    /// the general path, and so is one that something after it may join.
+    fn find(plain: &PlainWidths, bytes: &[u8], room: usize) -> Self {
+        let room = room.min(Self::CELLS);
+        let mut found = Self {
+            len: 0,
+            cells: 0,
+            wide: [0; Self::CELLS / 64],
+            max_len: 0,
+            last_width: 0,
+        };
+        // The character the next grapheme starts with, which is plain.
+        let Some(mut this) = plain.first(bytes) else {
+            return found;
+        };
+        loop {
+            let rest = &bytes[found.len..];
+            if this == (3, 2) {
+                // CJK text is mostly these, one after another: counted, and
+                // marked, all together.
+                let wide = plain.wide_run(rest, (room - found.cells) / 2);
+                if wide == 0 {
+                    // No room for it.
+                    break;
+                }
+                // The last of them is a grapheme unless what follows joins
+                // it, which nothing plain does, and nothing at all does to
+                // the last character of the text.
+                let after = &rest[wide * 3..];
+                let next = plain.first(after);
+                let whole = after.is_empty() || next.is_some();
+                let taken = if whole { wide } else { wide - 1 };
+                if taken > 0 {
+                    found.mark_wide(taken);
+                    found.cells += taken * 2;
+                    found.len += taken * 3;
+                    found.max_len = found.max_len.max(3);
+                    found.last_width = 2;
+                }
+                match next {
+                    Some(next) => this = next,
+                    None => break,
+                }
+                continue;
+            }
+            let (_, width) = this;
+            let Some((len, next)) = plain_grapheme(plain, rest, this.0) else {
+                break;
+            };
+            if found.cells + width > room {
+                break;
+            }
+            if width > 1 {
+                found.wide[found.cells / 64] |= 1 << (found.cells % 64);
+            }
+            found.cells += width;
+            found.len += len;
+            found.max_len = found.max_len.max(len);
+            found.last_width = width;
+            match next {
+                Some(next) => this = next,
+                None => break,
+            }
+        }
+        found
+    }
+
+    /// Mark `count` graphemes two cells wide, one after another from the
+    /// end of what has been found: every other cell from there.
+    #[inline]
+    fn mark_wide(&mut self, count: usize) {
+        const EVEN: u64 = 0x5555_5555_5555_5555;
+        let (start, end) = (self.cells, self.cells + count * 2);
+        // A word is an even number of cells, so the cells to mark are the
+        // even ones of every word or the odd ones of every word.
+        let every_other = if start % 2 == 0 { EVEN } else { !EVEN };
+        for word in start / 64..=(end - 1) / 64 {
+            let from = start.max(word * 64) - word * 64;
+            let to = end.min((word + 1) * 64) - word * 64;
+            let below = |bit: usize| if bit == 64 { u64::MAX } else { (1 << bit) - 1 };
+            self.wide[word] |= every_other & below(to) & !below(from);
+        }
+    }
+}
+
+/// How far the grapheme goes that starts with the plain character of `len`
+/// bytes at the start of `bytes`, and the plain character after it if there
+/// is one; None if it takes the general path to tell. The diacritics a letter
+/// can have on it are the one thing allowed to follow it, these being how
+/// macOS spells accented file names.
+#[inline(always)]
+fn plain_grapheme(
+    plain: &PlainWidths,
+    bytes: &[u8],
+    len: usize,
+) -> Option<(usize, Option<(usize, usize)>)> {
+    let rest = &bytes[len..];
+    if rest.is_empty() {
+        return Some((len, None));
+    }
+    if let Some(next) = plain.first(rest) {
+        return Some((len, Some(next)));
+    }
+    let marks = if len == 1 {
+        wezterm_cell::diacritics_len(rest)
+    } else {
+        0
+    };
+    if marks == 0 {
+        return None;
+    }
+    let rest = &rest[marks..];
+    if rest.is_empty() {
+        return Some((len + marks, None));
+    }
+    plain.first(rest).map(|next| (len + marks, Some(next)))
+}
+
+/// How long text has to be for `print_plain` to have a go at it.
+const PLAIN_TEXT_MIN_LEN: usize = 12;
+
+/// Whether `bytes` starts with enough plain graphemes to be worth the end of
+/// a run of graphemes.
+fn plain_lasts(plain: &PlainWidths, mut bytes: &[u8]) -> bool {
+    for _ in 0..4 {
+        let Some((len, _)) = plain.first(bytes) else {
+            return false;
+        };
+        let Some((len, _)) = plain_grapheme(plain, bytes, len) else {
+            return false;
+        };
+        bytes = &bytes[len..];
+    }
+    true
+}
+
 /// Graphemes waiting to be appended to one row in a single write.
 struct GraphemeRun {
     x: usize,
@@ -1361,6 +1880,9 @@ struct GraphemeRun {
     wide: [u16; GraphemeRun::MAX],
     num_wide: usize,
     last_width: u8,
+    /// Where in the text the row was last written up to. Text that goes on
+    /// from there has already been cut at a grapheme boundary.
+    written_to: Option<usize>,
 }
 
 impl Default for GraphemeRun {
@@ -1376,6 +1898,7 @@ impl Default for GraphemeRun {
             wide: [0; GraphemeRun::MAX],
             num_wide: 0,
             last_width: 0,
+            written_to: None,
         }
     }
 }
@@ -1496,17 +2019,25 @@ mod ascii_tests {
                         let mut expected = make();
                         let mut actual = make();
                         let mut direct = make();
+                        let mut kept = make();
                         let mut parser = Parser::new();
                         let mut direct_parser = Parser::new();
+                        let mut kept_parser = Parser::new();
+                        kept_parser.set_text_keeps_line_controls(true);
                         let input = format!("{setup}abc #q~0123456789az      next\rOVERWRITE\nmore\te\u{301}1\u{fe0f}\u{20e3}界\x1b[0m\x1bkASCII title界\x1b\\end");
                         for chunk in input.as_bytes().chunks(chunk_size) {
                             let mut actions = Vec::new();
                             parser.parse_with_borrowed_text(chunk, |action| {
                                 action.append_to(&mut actions)
                             });
+                            let mut kept_actions = Vec::new();
+                            kept_parser.parse_with_borrowed_text(chunk, |action| {
+                                action.append_to(&mut kept_actions)
+                            });
                             actual.increment_seqno();
                             expected.increment_seqno();
                             direct.increment_seqno();
+                            kept.increment_seqno();
                             {
                                 let mut direct_performer = Performer::new(&mut direct);
                                 direct_parser.parse_with_borrowed_text(
@@ -1523,6 +2054,10 @@ mod ascii_tests {
                                 let mut scalar = Performer::new(&mut expected);
                                 scalar.disable_ascii_batch = true;
                                 let mut batched = Performer::new(&mut actual);
+                                let mut line_controls_kept = Performer::new(&mut kept);
+                                for action in kept_actions {
+                                    line_controls_kept.perform(action);
+                                }
                                 for action in actions {
                                     batched.perform(action.clone());
                                     match action {
@@ -1535,13 +2070,292 @@ mod ascii_tests {
                                     }
                                 }
                             }
-                            assert_eq!(actual.snapshot(), expected.snapshot(),
+                            let expected_rows = expected.snapshot().with_rows_as_cells();
+                            assert_eq!(actual.snapshot().with_rows_as_cells(), expected_rows,
                                 "rows={rows}, cols={cols}, setup={setup:?}, normalize={normalize}, custom_widths={custom_widths}, conpty={conpty}, chunk_size={chunk_size}");
-                            assert_eq!(direct.snapshot(), expected.snapshot(),
+                            assert_eq!(direct.snapshot().with_rows_as_cells(), expected_rows,
                                 "direct: rows={rows}, cols={cols}, setup={setup:?}, normalize={normalize}, custom_widths={custom_widths}, conpty={conpty}, chunk_size={chunk_size}");
+                            assert_eq!(kept.snapshot().with_rows_as_cells(), expected_rows,
+                                "kept: rows={rows}, cols={cols}, setup={setup:?}, normalize={normalize}, custom_widths={custom_widths}, conpty={conpty}, chunk_size={chunk_size}");
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Write `input` with and without grapheme runs, and with the parser as
+    /// the mux has it, and compare what each makes of it, whatever each is
+    /// stored as.
+    fn check_runs(rows: usize, cols: usize, input: &str, chunk_size: usize) {
+        let make = || {
+            TerminalState::new(
+                TerminalSize {
+                    rows,
+                    cols,
+                    pixel_width: cols * 8,
+                    pixel_height: rows * 16,
+                    dpi: 96,
+                },
+                Arc::new(TestConfig {
+                    normalize: false,
+                    custom_widths: false,
+                }),
+                "test",
+                "test",
+                Box::new(Vec::new()),
+            )
+        };
+        let mut runs = make();
+        let mut single = make();
+        let mut parser = Parser::new();
+        let mut kept_parser = Parser::new();
+        kept_parser.set_text_keeps_line_controls(true);
+        for chunk in input.as_bytes().chunks(chunk_size) {
+            let mut actions = Vec::new();
+            parser.parse_with_borrowed_text(chunk, |action| action.append_to(&mut actions));
+            let mut kept_actions = Vec::new();
+            kept_parser
+                .parse_with_borrowed_text(chunk, |action| action.append_to(&mut kept_actions));
+            runs.increment_seqno();
+            single.increment_seqno();
+            let mut batched = Performer::new(&mut runs);
+            for action in kept_actions {
+                batched.perform(action);
+            }
+            drop(batched);
+            let mut scalar = Performer::new(&mut single);
+            scalar.disable_grapheme_runs = true;
+            for action in actions {
+                scalar.perform(action);
+            }
+            drop(scalar);
+            // A row of cells keeps the wrap flag of a wide cell in its second
+            // half, where the cell doesn't show it.
+            let cells = |line: &wezterm_surface::Line| {
+                line.visible_cells()
+                    .map(|cell| {
+                        let mut attrs = cell.attrs().clone();
+                        if cell.width() > 1 {
+                            attrs.set_wrapped(false);
+                        }
+                        (
+                            cell.cell_index(),
+                            cell.str().to_string(),
+                            cell.width(),
+                            attrs,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let actual = runs.snapshot();
+            let expected = single.snapshot();
+            assert_eq!(actual.screen.lines.len(), expected.screen.lines.len());
+            for (row, (a, e)) in actual
+                .screen
+                .lines
+                .iter()
+                .zip(&expected.screen.lines)
+                .enumerate()
+            {
+                assert_eq!(
+                    (a.len(), a.current_seqno(), cells(a)),
+                    (e.len(), e.current_seqno(), cells(e)),
+                    "row {row}, rows={rows}, cols={cols}, input={input:?}, chunk_size={chunk_size}"
+                );
+            }
+            assert_eq!(runs.cursor_pos(), single.cursor_pos(), "{input:?}");
+        }
+    }
+
+    /// Rows of wide characters are found and marked many at a time: the
+    /// marks have to fall where one grapheme at a time puts them, wherever
+    /// the row starts and however far it goes.
+    #[test]
+    fn long_rows_of_wide_text_match_one_grapheme_at_a_time() {
+        let han = "\u{4e2d}\u{6587}\u{5b57}\u{7b26}\u{ff0c}\u{3001}";
+        let input = |lead: &str, tail: &str, repeat: usize| {
+            format!(
+                "{lead}{}{tail}\r\n\x1b[3G{lead}{}x{}{tail}",
+                han.repeat(repeat),
+                han.repeat(repeat),
+                han.repeat(3),
+            )
+        };
+        for cols in [9, 65, 130, 300] {
+            for lead in ["", "a", "abc \u{e9}\u{4e00}x"] {
+                for tail in ["", "e\u{301}", "\u{1f600}", "\u{301}"] {
+                    for repeat in [1, 22, 130] {
+                        check_runs(4, cols, &input(lead, tail, repeat), 4096);
+                    }
+                }
+            }
+        }
+        // And in pieces that end part of the way through a character: of a
+        // size that still reaches the plain paths, and of one that does not.
+        for chunk_size in [7, 13, 29, 100] {
+            for lead in ["", "a"] {
+                check_runs(4, 65, &input(lead, "e\u{301}", 11), chunk_size);
+            }
+        }
+    }
+
+    #[test]
+    fn the_wide_cells_of_a_run_are_every_other_one() {
+        // Marked from any cell, across the words of the mask.
+        for start in [0, 1, 2, 31, 62, 63, 64, 65, 127, 128, 190] {
+            for count in [1, 2, 3, 31, 32, 33] {
+                if start + count * 2 > PlainRun::CELLS {
+                    continue;
+                }
+                let mut run = PlainRun {
+                    len: 0,
+                    cells: start,
+                    wide: [0; PlainRun::CELLS / 64],
+                    max_len: 0,
+                    last_width: 0,
+                };
+                run.mark_wide(count);
+                let marked: Vec<usize> = (0..PlainRun::CELLS)
+                    .filter(|cell| run.wide[cell / 64] >> (cell % 64) & 1 == 1)
+                    .collect();
+                let expected: Vec<usize> = (0..count).map(|n| start + n * 2).collect();
+                assert_eq!(marked, expected, "from {} for {}", start, count);
+            }
+        }
+    }
+
+    #[test]
+    fn grapheme_runs_over_erased_rows_match_one_grapheme_at_a_time() {
+        let texts = [
+            "\u{4e2d}\u{6587}\u{5b57}\u{7b26}\u{4e2d}\u{6587}",
+            "abc\u{4e2d}def",
+            "\u{1f600}\u{4e2d}\u{6587}\u{1f600} hello",
+            "\u{2764}\u{fe0f}\u{4e2d}",
+            "e\u{301}xe\u{301}",
+            "\u{e01}\u{e33}x",
+            "\u{1f1fa}\u{1f1f8}",
+        ];
+        for (rows, cols) in [(3, 7), (4, 12), (4, 80)] {
+            for setup in [
+                "",
+                "abcdef\x1b[2K",
+                "abcdef\x1b[2J\x1b[H",
+                "\x1b[2K\x1b[3G",
+                "ab\x1b[K\x1b[5G",
+                "\u{4e2d}\u{6587}\x1b[2K",
+                "abcdef\r\x1b[2K\x1b[32m",
+                "\x1b[44m\x1b[2K\x1b[0m",
+                "ab\x1b[1b\r\x1b[3C",
+            ] {
+                for text in texts {
+                    for chunk_size in [1, 5, 4096] {
+                        let input =
+                            format!("{setup}{text}\x1b[31m{text}\x1b[0m\x1b[K{text}\r\n{text}");
+                        check_runs(rows, cols, &input, chunk_size);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `print_plain` starts as soon as what is waiting has been written.
+    #[test]
+    fn plain_text_follows_what_is_not() {
+        for text in [
+            "\u{1f600}\u{4e2d}\u{6587}\u{5b57}\u{7b26}\r\n",
+            "\u{2764}\u{fe0f}\u{4e2d}\u{6587}\u{5b57}\u{7b26}\r\n",
+            "\u{1f600} hello world\r\n",
+            "\u{4e2d}\u{1f600}\u{4e2d}\u{1f600}\u{4e2d}\r\n",
+        ] {
+            for chunk_size in [1, 7, 4096] {
+                check_runs(4, 20, &text.repeat(9), chunk_size);
+            }
+        }
+    }
+
+    /// A row a run can't go on keeps it for the rest of the row, plain or not.
+    #[test]
+    fn plain_text_over_text_matches_one_grapheme_at_a_time() {
+        for chunk_size in [1, 4096] {
+            check_runs(
+                3,
+                20,
+                "\u{4e2d}\u{6587}abc\x1b[H\u{5b57}\u{7b26}\x1b[H\u{6587}x",
+                chunk_size,
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_control_after_a_c1_control_is_a_control() {
+        for control in ['\n', '\r', '\t'] {
+            for tail in ["cd", "\x1b[32mcd"] {
+                let input = format!("ab\u{94}{control}{tail}");
+                check_runs(4, 20, &input, 4);
+                check_runs(4, 20, &input, 4096);
+            }
+        }
+    }
+
+    /// What a row wraps from has blanks in it that were written, whatever
+    /// the row is stored as.
+    #[test]
+    fn blanks_before_a_wrap_survive_a_resize() {
+        for input in [
+            "abc\x1b[10G next",
+            "qqqqq\r\x1b[Kabc\x1b[K\x1b[10G next",
+            "xxxxxxxxxx\x1b[2K\x1b[Khello",
+        ] {
+            let mut term = TerminalState::new(
+                TerminalSize {
+                    rows: 4,
+                    cols: 10,
+                    pixel_width: 80,
+                    pixel_height: 64,
+                    dpi: 96,
+                },
+                Arc::new(TestConfig {
+                    normalize: false,
+                    custom_widths: false,
+                }),
+                "test",
+                "test",
+                Box::new(Vec::new()),
+            );
+            let mut parser = Parser::new();
+            let mut actions = Vec::new();
+            parser.parse_with_borrowed_text(input.as_bytes(), |action| {
+                action.append_to(&mut actions)
+            });
+            term.increment_seqno();
+            let mut performer = Performer::new(&mut term);
+            for action in actions {
+                performer.perform(action);
+            }
+            drop(performer);
+            let (_, lines) = term.screen().lines_in_phys_range(0..2).into_iter().fold(
+                (0, Vec::new()),
+                |(n, mut lines), line| {
+                    lines.push(line);
+                    (n + 1, lines)
+                },
+            );
+            assert_eq!(lines[0].len(), 10, "{input:?}");
+            assert!(lines[0].last_cell_was_wrapped(), "{:?}", input);
+        }
+    }
+
+    #[test]
+    fn deleting_on_a_row_of_cells_written_apart_does_not_panic() {
+        for cols in [10, 11] {
+            for input in [
+                "abbbb\u{e01}\x1b[1m\u{e33}xy\x1b[P",
+                "ab\x1b[3b\u{e01}\x1b[1m\u{e33}xy\x1b[P",
+                "ab\x1b[3b\u{1f1fa}\x1b[1m\u{1f1f8}\x1b[P",
+            ] {
+                check_runs(3, cols, input, 4096);
+                check_runs(3, cols, input, 1);
             }
         }
     }

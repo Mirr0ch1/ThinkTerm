@@ -249,8 +249,14 @@ mod content_view_key_routing_tests {
 }
 
 impl super::TermWindow {
-    fn paste_text_into_inline_tab_rename(&mut self, text: &str) {
-        if let Some(rename) = self.inline_tab_rename.as_mut() {
+    /// Only the edit this paste was started in: a clipboard can answer after
+    /// that one has ended and another begun, of the same name too.
+    fn paste_text_into_inline_tab_rename(&mut self, edit: u64, text: &str) {
+        if let Some(rename) = self
+            .inline_tab_rename
+            .as_mut()
+            .filter(|rename| rename.edit == edit)
+        {
             rename.input.caret_insert(text, false);
             self.update_title_impl();
             if let Some(window) = self.window.as_ref() {
@@ -312,13 +318,14 @@ impl super::TermWindow {
                     return true;
                 }
                 KeyCode::Char('v') | KeyCode::Char('V') => {
-                    if let Some(window) = self.window.as_ref().cloned() {
+                    let edit = self.inline_tab_rename.as_ref().map(|rename| rename.edit);
+                    if let (Some(window), Some(edit)) = (self.window.as_ref().cloned(), edit) {
                         let future = window.get_clipboard(Clipboard::Clipboard);
                         promise::spawn::spawn(async move {
                             if let Ok(text) = future.await {
                                 window.notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
                                     move |term_window| {
-                                        term_window.paste_text_into_inline_tab_rename(&text);
+                                        term_window.paste_text_into_inline_tab_rename(edit, &text);
                                     },
                                 )));
                             }
@@ -568,6 +575,32 @@ impl super::TermWindow {
                 }
             }
 
+            // The pane in focus holds a plugin's page: the page has what is
+            // pressed there, as the sidebar's panel has it once the user
+            // gave it the keyboard.
+            if only_key_bindings == OnlyKeyBindings::No
+                && !self.right_sidebar_has_text_focus()
+                // A view over the terminal's area is over the page too, and
+                // has what is typed.
+                && !self.content_view_foreground()
+            {
+                if let Some(page) = self.plugin_page_in_focus(pane) {
+                    let took = match self.win_key_code_to_termwiz_key_code(keycode) {
+                        Key::Code(term_key) => self.plugin_page_key(
+                            page,
+                            term_key,
+                            raw_modifiers.remove_positional_mods(),
+                        ),
+                        Key::Composed(text) => self.plugin_page_text(page, &text),
+                        _ => false,
+                    };
+                    if took {
+                        context.invalidate();
+                        return true;
+                    }
+                }
+            }
+
             if only_key_bindings == OnlyKeyBindings::No && self.content_view_foreground() {
                 use ::termwiz::input::{KeyCode as TKC, Modifiers as TMods};
                 match self.win_key_code_to_termwiz_key_code(keycode) {
@@ -667,6 +700,12 @@ impl super::TermWindow {
         // keyboard protocols can report key releases, which made the terminal
         // appear to retain focus while typing in Notes.
         if only_key_bindings == OnlyKeyBindings::No && self.right_sidebar_has_text_focus() {
+            return true;
+        }
+
+        // A page has no terminal under it: what it and the application's
+        // own keys left is nobody's, and never text for a pane.
+        if only_key_bindings == OnlyKeyBindings::No && pane.is_page() {
             return true;
         }
 
@@ -803,6 +842,7 @@ impl super::TermWindow {
                             let stage =
                                 crate::input_diagnostics::StageTimer::begin("set_cursor_none");
                             context.set_cursor(None);
+                            self.dynamic_status_pointer_hidden();
                             stage.finish(true);
                         }
                         if !keycode.is_modifier() {
@@ -825,6 +865,13 @@ impl super::TermWindow {
         // Typing puts away a hover card that would cover what is typed.
         if key.key_is_down && !key.key.is_modifier() && self.dismiss_hover_tooltip() {
             context.invalidate();
+        }
+        // On Windows a modifier's own key event names it physically.
+        if key.key_is_down
+            && !key.key.is_modifier()
+            && !key.phys_code.is_some_and(|code| code.is_modifier())
+        {
+            self.note_key_for_thread_numbers(&key);
         }
         let mut input_trace =
             crate::input_diagnostics::KeyEventTrace::begin(key.key_is_down, key.key.is_modifier());
@@ -856,13 +903,21 @@ impl super::TermWindow {
         if self.current_modifier_and_leds != modifier_and_leds {
             self.current_modifier_and_leds = modifier_and_leds;
             self.schedule_next_status_update();
+            // Everywhere else the window has an event for modifiers alone,
+            // and a key's state can run behind it.
+            if cfg!(windows) {
+                self.note_thread_number_modifiers(key.modifiers);
+            }
         }
 
         // While the command palette is open no physical-key binding may fire
         // behind it. Placed after the modifier/LED bookkeeping so status-line
         // state stays current; not marking the event handled lets the cooked
         // KeyEvent still arrive, where the palette's dispatch consumes it.
-        if self.command_palette.is_some() || self.recording_overlay.owns_keyboard() {
+        if self.command_palette.is_some()
+            || self.recording_overlay.owns_keyboard()
+            || self.share_panel_open()
+        {
             return;
         }
         // The chord that opens the palette is left to the cooked event that
@@ -878,7 +933,7 @@ impl super::TermWindow {
             }
         }
         let stage = crate::input_diagnostics::StageTimer::begin("get_active_pane");
-        let pane = self.get_active_pane_or_overlay();
+        let pane = self.pane_for_key_bindings();
         stage.finish(pane.is_some());
         let pane = match pane {
             Some(pane) => pane,
@@ -1135,6 +1190,42 @@ impl super::TermWindow {
             }
             return;
         }
+        // A pane's share panel takes the keyboard as the palette does.
+        if self.share_panel_open() {
+            if window_key.key_is_down {
+                let mods = window_key.modifiers.remove_positional_mods();
+                match self.win_key_code_to_termwiz_key_code(&window_key.key) {
+                    Key::Code(key) => self.share_panel_key(key, mods),
+                    Key::Composed(text) => self.share_panel_text(&text),
+                    Key::None => {}
+                }
+                context.invalidate();
+            }
+            return;
+        }
+        // Escape takes the Library back to the sidebar, unless something
+        // else is there to take it first -- a modal such as the character
+        // selector, an overlay such as copy mode, a view in front such as
+        // Live Overview, a field in the right sidebar, a menu, a key table or
+        // the leader. Every other key is the terminal's, which stays beside
+        // it.
+        if self.library_open()
+            && window_key.key_is_down
+            && window_key.modifiers.remove_positional_mods().is_empty()
+            && matches!(window_key.key, KeyCode::Char('\u{1b}'))
+            && self.get_modal().is_none()
+            && self.get_active_pane_or_overlay().map(|pane| pane.pane_id())
+                == self.get_active_pane_no_overlay().map(|pane| pane.pane_id())
+            && !self.content_view_foreground()
+            && !self.right_sidebar_has_text_focus()
+            && self.context_menu.is_none()
+            && !self.native_context_menu_open
+            && self.key_table_state.current_table().is_none()
+            && !self.leader_is_active()
+        {
+            self.close_library(context);
+            return;
+        }
         if window_key.key_is_down
             && self.opens_command_palette(
                 &window_key.key,
@@ -1151,7 +1242,7 @@ impl super::TermWindow {
         );
 
         let stage = crate::input_diagnostics::StageTimer::begin("get_active_pane");
-        let pane = self.get_active_pane_or_overlay();
+        let pane = self.pane_for_key_bindings();
         stage.finish(pane.is_some());
         let pane = match pane {
             Some(pane) => pane,
@@ -1341,6 +1432,7 @@ impl super::TermWindow {
                     {
                         let stage = crate::input_diagnostics::StageTimer::begin("set_cursor_none");
                         context.set_cursor(None);
+                        self.dynamic_status_pointer_hidden();
                         stage.finish(true);
                     }
                     if !key.is_modifier() {

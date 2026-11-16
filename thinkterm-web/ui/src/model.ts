@@ -14,6 +14,8 @@ export type TabView = {
   /** The pane a click on the tab shows. */
   target: number;
   current: boolean;
+  /** For a tab on a plugin's page, the lucide icon heading it. */
+  page?: string;
   panes: PaneView[];
 };
 
@@ -33,7 +35,7 @@ export type NavRect = { pane: number; left: number; top: number; width: number; 
 
 /** `icon`: the card heading it, for what the pane runs; null with tab
     icons off. */
-export type CapsuleView = { pane: number; title: string; busy: boolean; current: boolean; icon: string | null };
+export type CapsuleView = { pane: number; title: string; busy: boolean; current: boolean; icon: string | null; /** For a pane on a plugin's page, the lucide icon heading it. */ page?: string };
 
 export type NavView = {
   rect: NavRect;
@@ -192,6 +194,8 @@ export type AgentRow = {
   place: string;
   /** `brand-<agent>` for an agent with a logo (agents.rs `icon`), else `bot`. */
   icon: string;
+  /** For a program with no logo: the card its tab shows, drawn instead of `bot`. */
+  card: string | null;
   /** What the program said about itself (OSC 7501), when it did. */
   kind: string | null;
   said: string | null;
@@ -300,6 +304,7 @@ export type PanelOp =
       size: 'small' | 'body' | 'title';
       bold: boolean;
       align: 'left' | 'center' | 'right';
+      wrap: boolean;
     }
   | { op: 'line'; clip: number; points: number[]; width: number; color: string }
   | { op: 'area'; clip: number; points: number[]; base: number; color: string; fade: boolean }

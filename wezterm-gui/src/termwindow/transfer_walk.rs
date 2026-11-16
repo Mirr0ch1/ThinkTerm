@@ -70,16 +70,23 @@ pub(crate) enum TransferPlanError {
     Unreadable(String),
 }
 
+/// "That folder holds more than N items", for a walk here or on a remote.
+pub(crate) fn too_many_entries(limit: usize) -> String {
+    let mut args = fluent_bundle::FluentArgs::new();
+    args.set("limit", limit);
+    crate::i18n::tr_args("transfer-too-many-items", &args)
+}
+
 impl TransferPlanError {
     pub(crate) fn message(&self) -> String {
         match self {
-            Self::DestinationInsideSource => {
-                "Cannot copy a folder into itself or into one of its own subfolders".to_string()
+            Self::DestinationInsideSource => crate::i18n::tr("transfer-into-itself"),
+            Self::TooManyEntries(limit) => too_many_entries(*limit),
+            Self::Unreadable(path) => {
+                let mut args = fluent_bundle::FluentArgs::new();
+                args.set("path", path.to_string());
+                crate::i18n::tr_args("transfer-unreadable", &args)
             }
-            Self::TooManyEntries(limit) => {
-                format!("That folder holds more than {limit} items")
-            }
-            Self::Unreadable(path) => format!("Unable to read {path}"),
         }
     }
 }

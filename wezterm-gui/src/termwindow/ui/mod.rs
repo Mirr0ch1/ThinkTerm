@@ -8,6 +8,8 @@ pub mod plugin_panel;
 pub mod right_sidebar;
 pub mod recording_overlay;
 pub mod sidebar;
+pub mod library;
+pub mod sidebar_jump;
 pub mod status_icon;
 pub mod tokens;
 
@@ -49,6 +51,34 @@ impl crate::TermWindow {
         active: bool,
     ) -> anyhow::Result<()> {
         let rect = euclid::rect(0.0, y as f32, width as f32, height as f32);
+        // Over a see-through window a tab, as a sidebar row, lets some of
+        // what is behind it through: no shadow under it to darken that, and
+        // its edge a ring round the fill rather than a coat under it.
+        if self.chrome_see_through() {
+            use crate::termwindow::ui::tokens::{
+                SEE_THROUGH_BORDER_BOOST, SEE_THROUGH_SURFACE_ALPHA,
+            };
+            let Some(gl_state) = self.render_state.as_ref() else {
+                return Ok(());
+            };
+            let border = if active {
+                border.mul_alpha(SEE_THROUGH_BORDER_BOOST.min(1.0 / border.3.max(f32::EPSILON)))
+            } else {
+                border
+            };
+            return crate::ui::draw::DrawContext::new(gl_state, self.dimensions, &self.render_metrics)
+                .draw_rounded_frame(
+                    layers,
+                    layer_num,
+                    rect.min_x(),
+                    rect.min_y(),
+                    rect.width(),
+                    rect.height(),
+                    fill.mul_alpha(SEE_THROUGH_SURFACE_ALPHA),
+                    border,
+                    radius,
+                );
+        }
         if active {
             self.paint_active_surface_shadow(layers, layer_num, rect, radius)?;
         }
@@ -109,89 +139,6 @@ impl crate::TermWindow {
                 radius + spread,
             )?;
         }
-        Ok(())
-    }
-
-    /// Dissolve a tab row into the bar at an edge the viewport cut.
-    ///
-    /// A tab sliced mid-body reads as a paint bug however honestly its corner
-    /// is squared off; ramping the bar's own colour over the last few pixels
-    /// turns the same cut into the row visibly continuing past the boundary.
-    /// Modelled on `ssh_hosts_view::paint_list_fades`, which does this for a
-    /// scrolling list's top and bottom.
-    ///
-    /// Painted on layer 2, above the tab surfaces and their icons, so it has to
-    /// go down after the tabs and before whatever owns the space beyond the
-    /// boundary.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn paint_tab_row_fades(
-        &self,
-        layers: &mut crate::quad::TripleLayerQuadAllocator,
-        background: ::window::color::LinearRgba,
-        row_y: usize,
-        row_height: usize,
-        viewport_left: usize,
-        viewport_right: usize,
-        fade_at_left: bool,
-        fade_at_right: bool,
-    ) -> anyhow::Result<()> {
-        use crate::ui::anim::Easing;
-        use anyhow::Context;
-        // The tabs are clipped at the viewport already; over a see-through
-        // bar this fade would only darken a band of it.
-        if self.chrome_see_through() {
-            return Ok(());
-        }
-
-        if row_height == 0 || viewport_right <= viewport_left {
-            return Ok(());
-        }
-        let width = self
-            .ui_px(crate::termwindow::ui::tokens::TAB_ROW_FADE_WIDTH)
-            .min(viewport_right - viewport_left);
-        if width == 0 {
-            return Ok(());
-        }
-
-        if fade_at_left {
-            for step in 0..width {
-                let progress = step as f32 / width as f32;
-                let alpha = 1.0 - Easing::Smooth.apply(progress);
-                self.filled_rectangle(
-                    layers,
-                    2,
-                    euclid::rect(
-                        (viewport_left + step) as f32,
-                        row_y as f32,
-                        1.0,
-                        row_height as f32,
-                    ),
-                    background.mul_alpha(alpha),
-                )
-                .context("tab row leading fade")?;
-            }
-        }
-
-        if fade_at_right {
-            let start = viewport_right - width;
-            for step in 0..width {
-                let progress = (step + 1) as f32 / width as f32;
-                let alpha = Easing::Smooth.apply(progress);
-                self.filled_rectangle(
-                    layers,
-                    2,
-                    euclid::rect(
-                        (start + step) as f32,
-                        row_y as f32,
-                        1.0,
-                        row_height as f32,
-                    ),
-                    background.mul_alpha(alpha),
-                )
-                .context("tab row trailing fade")?;
-            }
-        }
-
         Ok(())
     }
 

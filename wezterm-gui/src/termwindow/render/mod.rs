@@ -43,6 +43,8 @@ use window::color::LinearRgba;
 
 pub mod borders;
 pub mod corners;
+pub mod dynamic_status;
+pub mod transfer_card;
 pub mod draw;
 pub mod edge_light;
 pub mod fancy_tab_bar;
@@ -522,7 +524,7 @@ impl crate::TermWindow {
             - padding_top
             - padding_bottom
             - {
-                let (top, bottom) = self.pane_area_insets();
+                let (top, bottom) = self.pane_area_layout_insets();
                 top + bottom
             };
         let left_gap = match self.config.window_content_alignment.horizontal {
@@ -896,17 +898,29 @@ impl crate::TermWindow {
     }
 
     /// The shape a cursor is drawn with. A program that set its own style
-    /// keeps it; the default style blinks when Settings asks for a blink.
+    /// keeps it; the default style takes the shape chosen in Settings, and
+    /// blinks when Settings or the configuration asks for a blink.
     fn effective_cursor_shape(
         default_style: config::DefaultCursorStyle,
         shape: CursorShape,
+        chosen_shape: crate::native_settings::NativeCursorShape,
         blinks_by_default: bool,
     ) -> CursorShape {
-        let effective = default_style.effective_shape(shape);
-        if shape != CursorShape::Default || !blinks_by_default {
-            return effective;
+        use crate::native_settings::NativeCursorShape;
+
+        let configured = default_style.effective_shape(shape);
+        if shape != CursorShape::Default {
+            return configured;
         }
-        match effective {
+        let shape = match chosen_shape {
+            NativeCursorShape::Block => configured,
+            NativeCursorShape::Bar => CursorShape::SteadyBar,
+            NativeCursorShape::Underline => CursorShape::SteadyUnderline,
+        };
+        if !blinks_by_default && !configured.is_blinking() {
+            return shape;
+        }
+        match shape {
             CursorShape::SteadyBlock => CursorShape::BlinkingBlock,
             CursorShape::SteadyUnderline => CursorShape::BlinkingUnderline,
             CursorShape::SteadyBar => CursorShape::BlinkingBar,
@@ -1002,6 +1016,7 @@ impl crate::TermWindow {
                 Self::effective_cursor_shape(
                     params.config.default_cursor_style,
                     cursor.shape,
+                    self.cursor_shape_choice,
                     self.cursor_blinks_by_default,
                 ),
                 cursor.visibility,
@@ -1052,7 +1067,10 @@ impl crate::TermWindow {
                 | CursorShape::SteadyBar,
                 CursorVisibility::Visible,
             ) => {
-                if self.use_reverse_video_cursor(&params) {
+                // A line this thin in the scheme's cursor colour -- a mid grey
+                // in the macOS default -- all but disappears, so it takes the
+                // text's colour unless the program chose the cursor's.
+                if self.use_reverse_video_cursor(&params) || params.cursor_is_default_color {
                     (params.fg_color, params.bg_color, params.fg_color)
                 } else {
                     (params.fg_color, params.bg_color, params.cursor_bg)
@@ -1432,6 +1450,8 @@ impl crate::TermWindow {
         if let Some(render_state) = self.render_state.as_mut() {
             render_state.recreate_texture_atlas(&self.fonts, &self.render_metrics, size)?;
         }
+        // The Library's cards hold coordinates into the old atlas.
+        self.discard_library_recordings();
         Ok(())
     }
 
@@ -1794,10 +1814,15 @@ mod cursor_colour_tests {
 mod cursor_blink_tests {
     use crate::TermWindow;
     use config::DefaultCursorStyle;
+    use crate::native_settings::NativeCursorShape;
     use termwiz::surface::CursorShape;
 
     fn shape(style: DefaultCursorStyle, asked: CursorShape, blinks: bool) -> CursorShape {
-        TermWindow::effective_cursor_shape(style, asked, blinks)
+        TermWindow::effective_cursor_shape(style, asked, NativeCursorShape::Block, blinks)
+    }
+
+    fn chosen(style: DefaultCursorStyle, pick: NativeCursorShape, blinks: bool) -> CursorShape {
+        TermWindow::effective_cursor_shape(style, CursorShape::Default, pick, blinks)
     }
 
     /// With the setting off the cursor is exactly what the configuration
@@ -1832,6 +1857,41 @@ mod cursor_blink_tests {
         assert_eq!(
             shape(DefaultCursorStyle::SteadyBlock, CursorShape::SteadyBar, true),
             CursorShape::SteadyBar
+        );
+        assert_eq!(
+            TermWindow::effective_cursor_shape(
+                DefaultCursorStyle::SteadyBlock,
+                CursorShape::SteadyBlock,
+                NativeCursorShape::Bar,
+                false,
+            ),
+            CursorShape::SteadyBlock
+        );
+    }
+
+    #[test]
+    fn a_chosen_shape_replaces_the_default_one() {
+        assert_eq!(
+            chosen(DefaultCursorStyle::SteadyBlock, NativeCursorShape::Bar, false),
+            CursorShape::SteadyBar
+        );
+        assert_eq!(
+            chosen(DefaultCursorStyle::SteadyBlock, NativeCursorShape::Underline, true),
+            CursorShape::BlinkingUnderline
+        );
+    }
+
+    /// Block leaves the configured shape alone; another shape keeps the
+    /// blink the configuration asked for.
+    #[test]
+    fn the_configuration_s_shape_and_blink_survive_where_they_can() {
+        assert_eq!(
+            chosen(DefaultCursorStyle::SteadyUnderline, NativeCursorShape::Block, false),
+            CursorShape::SteadyUnderline
+        );
+        assert_eq!(
+            chosen(DefaultCursorStyle::BlinkingBlock, NativeCursorShape::Bar, false),
+            CursorShape::BlinkingBar
         );
     }
 }

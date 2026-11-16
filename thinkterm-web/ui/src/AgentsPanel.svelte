@@ -12,6 +12,7 @@
   import SnippetsList from './SnippetsList.svelte';
   import { handle } from './client';
   import { refreshViews, s, sCount, views } from './client.svelte';
+  import { iconClass } from './tabicons.svelte';
   import {
     agentIcon,
     chevronDown,
@@ -229,7 +230,7 @@
   <div class="list">
     {#each rows as row (row.pane)}
       <div class="ag" class:elsewhere={!row.here} data-pane={row.pane} title={row.place}>
-        <span class="ic">{@html agentIcon(row.icon)}</span>
+        <span class="ic">{#if iconClass(row.card)}<span class="ticon {iconClass(row.card)}"><i></i></span>{:else}{@html agentIcon(row.icon)}{/if}</span>
         <span class="tx">
           <span class="n">{row.name}{#if row.title !== ''}<span class="d"> · {row.title}</span>{/if}</span>
           <span class="p">{row.state_label}{#if row.place !== ''} · {row.place}{/if}</span>

@@ -1,7 +1,7 @@
 use crate::domain::DomainId;
 use crate::pane::{
-    CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, PaneSummary,
-    Pattern, SearchResult, WithPaneLines,
+    BatchRead, CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId,
+    PaneSummary, Pattern, SearchResult, WithPaneLines,
 };
 use crate::renderable::*;
 use crate::tmux::{TmuxDomain, TmuxDomainState};
@@ -36,6 +36,68 @@ use wezterm_term::{
 };
 
 const PROC_INFO_CACHE_TTL: Duration = Duration::from_millis(300);
+
+fn connect_plain_text(
+    term: &Terminal,
+    options: thinkterm_reverse_access::protocol::ReadOptions,
+) -> thinkterm_reverse_access::Result<String> {
+    use thinkterm_reverse_access::{Error, MAX_READ_BYTES, MAX_READ_LINES};
+    let screen = term.screen();
+    let rows = screen.scrollback_rows();
+    let top = rows.saturating_sub(screen.physical_rows);
+    let row = |relative: i64| (top as i128 + relative as i128).max(0);
+    let start = options.start.map(row).unwrap_or(top as i128);
+    let end = options.end.map(row).unwrap_or(rows as i128);
+    if start > end {
+        return Err(Error::Protocol);
+    }
+    let start = start.min(rows as i128) as usize;
+    let end = (end + 1).min(rows as i128) as usize;
+    if end - start > MAX_READ_LINES {
+        return Err(Error::TooLarge);
+    }
+    let mut text = String::with_capacity(MAX_READ_BYTES);
+    let mut result = Ok(());
+    let mut logical_start = 0;
+    let mut keep = 0;
+    let mut last_nonempty_end = 0;
+    screen.with_phys_lines(start..end, |lines| {
+        for (index, line) in lines.iter().enumerate() {
+            for cell in line.visible_cells() {
+                let value = cell.str();
+                if value.len() >= MAX_READ_BYTES - text.len() {
+                    result = Err(Error::TooLarge);
+                    return;
+                }
+                text.push_str(value);
+                if !value.trim().is_empty() {
+                    keep = text.len();
+                }
+            }
+            if !options.unwrap || !line.last_cell_was_wrapped() || index + 1 == lines.len() {
+                if options.trim {
+                    text.truncate(keep.max(logical_start));
+                }
+                if text.len() == MAX_READ_BYTES {
+                    result = Err(Error::TooLarge);
+                    return;
+                }
+                let nonempty = text.len() > logical_start;
+                text.push('\n');
+                if nonempty {
+                    last_nonempty_end = text.len();
+                }
+                logical_start = text.len();
+                keep = logical_start;
+            }
+        }
+    });
+    result?;
+    if options.trim {
+        text.truncate(last_nonempty_end);
+    }
+    Ok(text)
+}
 
 #[derive(Debug)]
 enum ProcessState {
@@ -339,6 +401,9 @@ pub struct LocalPane {
     /// The progress the terminal last reported, for `get_progress` while
     /// the parser holds the terminal.
     last_progress: Mutex<Progress>,
+    /// Waiting for the batch of output being applied to end; see
+    /// `Pane::read_after_batch`.
+    batch_reads: Mutex<Vec<BatchRead>>,
     /// What the shell last reported about its commands, for `run_state`
     /// while the parser holds the terminal.
     last_shell_commands: Mutex<wezterm_term::ShellCommands>,
@@ -395,6 +460,11 @@ impl Pane for LocalPane {
         // The parser thread holds this for the whole of a batch of output;
         // a probe that fails is the batch still being applied.
         self.terminal.try_lock().is_none()
+    }
+
+    fn read_after_batch(&self, read: BatchRead) -> Result<(), BatchRead> {
+        self.batch_reads.lock().push(read);
+        Ok(())
     }
 
     fn hold_render_state_for_the_test(&self, hold: Duration) {
@@ -459,6 +529,10 @@ impl Pane for LocalPane {
 
     fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
         crate::pane::impl_get_lines_via_with_lines(self, lines)
+    }
+
+    fn get_screen_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
+        terminal_get_screen_lines(&mut self.terminal.lock(), lines)
     }
 
     fn get_logical_lines(&self, lines: Range<StableRowIndex>) -> Vec<LogicalLine> {
@@ -720,13 +794,19 @@ impl Pane for LocalPane {
         term.perform_actions_in_place(actions);
         self.apply_pending_and_store(&mut term);
         drop(term);
+        // This thread is the one that would take the terminal next, so
+        // these find it free without having to be lucky.
+        let reads = std::mem::take(&mut *self.batch_reads.lock());
+        for read in reads {
+            read(self);
+        }
         // A resize that arrived after that last look, while the terminal
-        // was still held here, found both of its own probes failing and
-        // left its note; nothing else would read it until the next batch,
-        // which a quiet program may never write. Looked at again with the
-        // terminal free, for as long as notes keep arriving: one left
-        // after the last look is applied by the resize's own second
-        // probe, which finds the terminal free.
+        // was still held here or read just now, found both of its own
+        // probes failing and left its note; nothing else would read it
+        // until the next batch, which a quiet program may never write.
+        // Looked at again with the terminal free, for as long as notes
+        // keep arriving: one left after the last look is applied by the
+        // resize's own second probe, which finds the terminal free.
         while self.anything_pending() {
             let mut term = self.terminal.lock();
             self.apply_pending_and_store(&mut term);
@@ -812,6 +892,10 @@ impl Pane for LocalPane {
         } else {
             self.terminal.lock().send_paste(text)
         }
+    }
+
+    fn bracketed_paste(&self) -> Option<bool> {
+        Some(self.terminal.lock().bracketed_paste_enabled())
     }
 
     fn get_title(&self) -> String {
@@ -1574,6 +1658,127 @@ fn open_child_process(pid: u32) -> std::io::Result<std::os::windows::io::OwnedHa
 }
 
 impl LocalPane {
+    pub fn quiesce_connect_input(&self) -> anyhow::Result<()> {
+        self.pty.lock().quiesce_input()
+    }
+
+    pub(crate) fn connect_eligible(&self) -> thinkterm_reverse_access::Result<()> {
+        use thinkterm_reverse_access::Error;
+        if self.tmux_domain.try_lock().ok_or(Error::Busy)?.is_some() {
+            return Err(Error::Unavailable);
+        }
+        match &*self.process.try_lock().ok_or(Error::Busy)? {
+            ProcessState::Running {
+                pid: Some(_),
+                killed: false,
+                ..
+            } => Ok(()),
+            _ => Err(Error::Unavailable),
+        }
+    }
+
+    pub(crate) fn connect_read(
+        &self,
+        options: thinkterm_reverse_access::protocol::ReadOptions,
+    ) -> thinkterm_reverse_access::Result<String> {
+        let term = self
+            .terminal
+            .try_lock()
+            .ok_or(thinkterm_reverse_access::Error::Busy)?;
+        connect_plain_text(&term, options)
+    }
+
+    pub(crate) fn connect_title(&self) -> thinkterm_reverse_access::Result<String> {
+        let term = self
+            .terminal
+            .try_lock()
+            .ok_or(thinkterm_reverse_access::Error::Busy)?;
+        Ok(thinkterm_reverse_access::protocol::display_text(
+            term.get_title(),
+            128,
+        ))
+    }
+
+    pub(crate) fn connect_input(
+        &self,
+        input: &crate::connect::Input,
+    ) -> thinkterm_reverse_access::Result<(
+        Box<dyn portable_pty::TryInputWriter>,
+        crate::connect::EncodedInput,
+    )> {
+        use crate::connect::{EncodedInput, Input};
+        use thinkterm_reverse_access::{Error, MAX_INPUT_BYTES, MAX_KEYS};
+        let term = self.terminal.try_lock().ok_or(Error::Busy)?;
+        let (mut bytes, enter, paste) = match input {
+            Input::Text {
+                text,
+                no_paste,
+                enter,
+            } => {
+                if text.len() > MAX_INPUT_BYTES {
+                    return Err(Error::TooLarge);
+                }
+                let paste = !no_paste && term.bracketed_paste_enabled();
+                let bytes = if *no_paste {
+                    text.clone().into_bytes()
+                } else {
+                    term.encode_paste(text).into_bytes()
+                };
+                (bytes, *enter, paste)
+            }
+            Input::Keys(keys) => {
+                if keys.is_empty() || keys.len() > MAX_KEYS {
+                    return Err(Error::TooLarge);
+                }
+                let mut bytes = Vec::new();
+                for (key, modifiers) in keys {
+                    let encoded = term
+                        .encode_key(key.clone(), *modifiers, true)
+                        .map_err(|_| Error::Protocol)?;
+                    if encoded.len() > MAX_INPUT_BYTES - bytes.len() {
+                        return Err(Error::TooLarge);
+                    }
+                    bytes.extend_from_slice(encoded.as_bytes());
+                }
+                (bytes, false, false)
+            }
+        };
+        let text_end = bytes.len();
+        if enter {
+            let key = term
+                .encode_key(KeyCode::Enter, KeyModifiers::NONE, true)
+                .map_err(|_| Error::Protocol)?;
+            bytes.extend_from_slice(key.as_bytes());
+        }
+        let writer = self
+            .pty
+            .try_lock()
+            .ok_or(Error::Busy)?
+            .try_input_writer()
+            .map_err(|_| Error::Unavailable)?;
+        Ok((
+            writer,
+            EncodedInput {
+                bytes,
+                text_end,
+                enter,
+                enter_delay: thinkterm_reverse_access::protocol::enter_delay(text_end),
+                paste,
+            },
+        ))
+    }
+
+    /// Takes `submit` only once the terminal is free, so Busy can be retried.
+    pub(crate) fn connect_queue(
+        &self,
+        submit: &mut Option<Box<dyn FnOnce() + Send>>,
+    ) -> thinkterm_reverse_access::Result<()> {
+        use thinkterm_reverse_access::Error;
+        let mut term = self.terminal.try_lock().ok_or(Error::Busy)?;
+        term.queue_checked_input(submit.take().ok_or(Error::Protocol)?)
+            .map_err(|_| Error::Unavailable)
+    }
+
     /// The pieces a successor server needs to adopt this pane, or None
     /// for a pane that cannot travel: one over a channel rather than a
     /// pty (ssh, tmux), or one whose process has already exited.
@@ -1725,6 +1930,7 @@ impl LocalPane {
             pending_seen: Mutex::new(false),
             shell_idle: Mutex::new(None),
             last_progress: Mutex::new(Progress::default()),
+            batch_reads: Mutex::new(Vec::new()),
             last_shell_commands,
             exit: Mutex::new(None),
         }
@@ -1964,6 +2170,681 @@ impl Drop for LocalPane {
 }
 
 #[cfg(test)]
+mod connect_read_tests {
+    use super::*;
+    use thinkterm_reverse_access::protocol::ReadOptions;
+
+    #[derive(Debug)]
+    struct TestConfig;
+    impl TerminalConfiguration for TestConfig {
+        fn scrollback_size(&self) -> usize {
+            32
+        }
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+    }
+
+    fn terminal(cols: usize, rows: usize) -> Terminal {
+        Terminal::new(
+            TerminalSize {
+                cols,
+                rows,
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 96,
+            },
+            Arc::new(TestConfig),
+            "ThinkTerm",
+            "test",
+            Box::new(Vec::new()),
+        )
+    }
+
+    #[test]
+    fn connect_plain_text_preserves_wrap_trim_and_inclusive_ranges() {
+        let mut terminal = terminal(4, 4);
+        terminal.advance_bytes(b"abcde\r\nx   \r\n");
+        let trim = ReadOptions {
+            trim: true,
+            ..ReadOptions::default()
+        };
+        assert_eq!(connect_plain_text(&terminal, trim).unwrap(), "abcd\ne\nx\n");
+        assert_eq!(
+            connect_plain_text(
+                &terminal,
+                ReadOptions {
+                    unwrap: true,
+                    ..trim
+                }
+            )
+            .unwrap(),
+            "abcde\nx\n"
+        );
+        assert_eq!(
+            connect_plain_text(
+                &terminal,
+                ReadOptions {
+                    start: Some(1),
+                    end: Some(1),
+                    ..trim
+                }
+            )
+            .unwrap(),
+            "e\n"
+        );
+        assert!(connect_plain_text(
+            &terminal,
+            ReadOptions {
+                start: Some(2),
+                end: Some(1),
+                ..trim
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn connect_plain_text_uses_current_screen_coordinates_and_bounds_history() {
+        let mut terminal = terminal(8, 2);
+        terminal.advance_bytes(b"first\r\nsecond\r\nthird");
+        let trim = ReadOptions {
+            trim: true,
+            ..ReadOptions::default()
+        };
+        assert_eq!(
+            connect_plain_text(&terminal, trim).unwrap(),
+            "second\nthird\n"
+        );
+        assert_eq!(
+            connect_plain_text(
+                &terminal,
+                ReadOptions {
+                    start: Some(-1),
+                    end: Some(-1),
+                    ..trim
+                }
+            )
+            .unwrap(),
+            "first\n"
+        );
+        terminal.advance_bytes(b"\x1b[?1049hALT");
+        assert_eq!(
+            connect_plain_text(
+                &terminal,
+                ReadOptions {
+                    start: Some(-100),
+                    ..trim
+                }
+            )
+            .unwrap(),
+            "ALT\n"
+        );
+        assert!(connect_plain_text(
+            &terminal,
+            ReadOptions {
+                start: Some(i64::MAX),
+                ..trim
+            }
+        )
+        .is_err());
+    }
+
+    /// Once the scrollback is full the line store wraps around in memory,
+    /// wherever a read's range falls in it.
+    #[test]
+    fn connect_plain_text_reads_a_full_scrollback() {
+        let trim = ReadOptions {
+            trim: true,
+            ..ReadOptions::default()
+        };
+        let mut terminal = terminal(16, 4);
+        for line in 0..2000 {
+            terminal.advance_bytes(format!("line-{line}\r\n").as_bytes());
+            if line < 40 {
+                continue;
+            }
+            assert_eq!(
+                connect_plain_text(&terminal, trim).unwrap(),
+                format!("line-{}\nline-{}\nline-{}\n", line - 2, line - 1, line)
+            );
+            assert_eq!(
+                connect_plain_text(
+                    &terminal,
+                    ReadOptions {
+                        start: Some(-8),
+                        end: Some(-1),
+                        ..trim
+                    }
+                )
+                .unwrap(),
+                (line - 10..=line - 3)
+                    .map(|line| format!("line-{line}\n"))
+                    .collect::<String>()
+            );
+        }
+    }
+
+    #[test]
+    fn connect_plain_text_rejects_a_view_over_the_line_limit() {
+        let terminal = terminal(1, thinkterm_reverse_access::MAX_READ_LINES + 1);
+        assert_eq!(
+            connect_plain_text(&terminal, ReadOptions::default()),
+            Err(thinkterm_reverse_access::Error::TooLarge)
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod connect_host_tests {
+    use super::*;
+    use crate::client::ClientId;
+    use crate::connect::{Host, HostRoute};
+    use crate::tab::Tab;
+    use crate::Mux;
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use smol::io::{AsyncRead, AsyncWrite};
+    use std::future::Future;
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use thinkterm_reverse_access::budget::Budgets;
+    use thinkterm_reverse_access::channel::{Channel, Deadline};
+    use thinkterm_reverse_access::exchange::receive_reply;
+    use thinkterm_reverse_access::protocol::{Command, ExportRef, InputStatus, ReadOptions, Reply};
+    use thinkterm_reverse_access::wire::{Assembly, Payload};
+    use thinkterm_reverse_access::{Error, Id, Permission};
+
+    /// Stands in for the native window, which needs a person: approves
+    /// whatever it is asked, and keeps the session monitor's heartbeat.
+    const HELPER: &str = r#"#!/bin/sh
+case "$1" in
+--monitor)
+    printf '{"kind":"ready","id":null}\n'
+    while :; do
+        printf '{"kind":"alive","id":null}\n'
+        sleep 1
+    done
+    ;;
+--authenticate)
+    IFS= read -r line
+    id=${line#*\"Id\":\"}
+    printf '{"kind":"approved","id":"%s"}\n' "${id%%\"*}"
+    ;;
+esac
+"#;
+
+    struct InstalledHelper(PathBuf);
+    impl InstalledHelper {
+        fn new() -> Self {
+            let path = std::env::current_exe()
+                .unwrap()
+                .with_file_name("thinkterm-connect-auth");
+            std::fs::write(&path, HELPER).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for InstalledHelper {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestConfig;
+    impl TerminalConfiguration for TestConfig {
+        fn scrollback_size(&self) -> usize {
+            32
+        }
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+    }
+
+    struct Fixture {
+        mux: Arc<Mux>,
+        pane: Arc<LocalPane>,
+        connect: Arc<Host>,
+        client: ClientId,
+        route: Arc<HostRoute>,
+        reader: Box<dyn Read + Send>,
+        sequence: u64,
+        _helper: InstalledHelper,
+        _serial: parking_lot::MutexGuard<'static, ()>,
+    }
+
+    fn fixture() -> Fixture {
+        static SCHEDULER: std::sync::Once = std::sync::Once::new();
+        SCHEDULER.call_once(|| {
+            promise::spawn::SimpleExecutor::new();
+        });
+        // Which also keeps these to the helper's one path, one at a time.
+        let serial = crate::GLOBAL_MUX_TESTS.lock();
+        let helper = InstalledHelper::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let size = TerminalSize {
+            cols: 40,
+            rows: 6,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 96,
+        };
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 6,
+                cols: 40,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let child = pair
+            .slave
+            .spawn_command(CommandBuilder::new("/bin/cat"))
+            .unwrap();
+        let reader = pair.master.try_clone_reader().unwrap();
+        let terminal = Terminal::new(
+            size,
+            Arc::new(TestConfig),
+            "ThinkTerm",
+            "test",
+            pair.master.take_writer().unwrap(),
+        );
+        let pane = Arc::new(LocalPane::new(
+            crate::pane::alloc_pane_id(),
+            terminal,
+            child,
+            pair.master,
+            Box::new(Vec::new()),
+            0,
+            "test".into(),
+        ));
+        let dyn_pane: Arc<dyn Pane> = pane.clone();
+        let tab = Arc::new(Tab::new(&size));
+        tab.assign_pane(&dyn_pane);
+        mux.panes.write().insert(pane.pane_id(), dyn_pane);
+        mux.add_tab_no_panes(&tab);
+        let mut window = crate::window::Window::new(Some("default".into()), None, None);
+        window.push(&tab);
+        mux.windows.write().insert(window.window_id(), window);
+        let client = ClientId {
+            hostname: "devbox".into(),
+            username: "user".into(),
+            pid: std::process::id(),
+            epoch: 0,
+            id: 0,
+            ssh_auth_sock: None,
+        };
+        mux.register_client(Arc::new(client.clone()));
+        let connect = Host::new(&mux).unwrap();
+        let route = connect
+            .open(client.clone(), "user@server-a:22", "zh-CN")
+            .unwrap();
+        route.heartbeat().unwrap();
+        route
+            .begin_all_local_approval(Permission::ReadAndInput, 60, None)
+            .unwrap();
+        let deadline = Deadline::request().unwrap();
+        while route.status().grants.is_empty() {
+            assert!(route.status().error.is_none());
+            deadline.remaining().unwrap();
+            route.heartbeat().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Fixture {
+            mux,
+            pane,
+            connect,
+            client,
+            route,
+            reader,
+            sequence: 0,
+            _helper: helper,
+            _serial: serial,
+        }
+    }
+
+    impl Fixture {
+        /// One request through the host and over a real socket, as the data
+        /// connection carries it.
+        fn exchange(
+            &mut self,
+            command: Command,
+            payload: Option<Payload>,
+        ) -> thinkterm_reverse_access::Result<(Reply, Option<Payload>)> {
+            self.sequence += 1;
+            let sequence = self.sequence;
+            let route = Arc::clone(&self.route);
+            route.heartbeat()?;
+            smol::block_on(async move {
+                let budgets = Budgets::new()?;
+                let budget = budgets.open_route(Id::random()?)?;
+                let (near, far) = smol::Async::<UnixStream>::pair().unwrap();
+                let mut near = Channel::new(near, budget.acquire(1024 * 1024)?)?;
+                let mut far = Channel::new(far, budget.acquire(1024 * 1024)?)?;
+                let deadline = Deadline::request()?;
+                let reply = route
+                    .prepare_reply(sequence, command, payload, &deadline, &deadline)
+                    .await?;
+                let (sent, received) = smol::future::zip(
+                    reply.send(&mut near, sequence, &deadline, &deadline),
+                    receive_reply(
+                        &mut far,
+                        sequence,
+                        |bytes| Assembly::text(bytes, &budget),
+                        &deadline,
+                    ),
+                )
+                .await;
+                sent?;
+                received?
+            })
+        }
+
+        fn list(&mut self) -> Vec<ExportRef> {
+            match self
+                .exchange(Command::List { after: None }, None)
+                .unwrap()
+                .0
+            {
+                Reply::List { exports, .. } => exports.iter().map(|item| item.export).collect(),
+                _ => panic!("not a list"),
+            }
+        }
+
+        fn read(&mut self, export: ExportRef) -> String {
+            let command = Command::Read {
+                export,
+                options: ReadOptions {
+                    trim: true,
+                    ..ReadOptions::default()
+                },
+            };
+            let (reply, payload) = self.exchange(command, None).unwrap();
+            assert!(matches!(reply, Reply::Text { .. }));
+            payload.unwrap().text().to_string()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.route.close();
+            self.mux.panes.write().clear();
+        }
+    }
+
+    /// Takes a frame's first byte and then nothing until `opens`, as a
+    /// connection that has slowed down leaves a frame partly written.
+    struct Stalled {
+        socket: smol::Async<UnixStream>,
+        opens: smol::Timer,
+        started: bool,
+        open: bool,
+    }
+    impl AsyncRead for Stalled {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.socket).poll_read(cx, bytes)
+        }
+    }
+    impl AsyncWrite for Stalled {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if !self.started {
+                self.started = true;
+                return Pin::new(&mut self.socket).poll_write(cx, &bytes[..1]);
+            }
+            if !self.open {
+                if Pin::new(&mut self.opens).poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                self.open = true;
+            }
+            Pin::new(&mut self.socket).poll_write(cx, bytes)
+        }
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.socket).poll_flush(cx)
+        }
+        fn poll_close(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.socket).poll_close(cx)
+        }
+    }
+
+    #[test]
+    fn a_grant_lists_reads_and_types_into_a_real_terminal() {
+        let mut host = fixture();
+        let exports = host.list();
+        assert_eq!(exports.len(), 1);
+        assert_eq!(exports[0].target.pane, host.pane.pane_id() as u64);
+
+        // Past the scrollback, where a read used to end the whole host.
+        {
+            let mut terminal = host.pane.terminal.lock();
+            for line in 0..500 {
+                terminal.advance_bytes(format!("line-{line}\r\n").as_bytes());
+            }
+        }
+        assert!(host.read(exports[0]).ends_with("line-499\n"));
+
+        // A terminal in the middle of its output is waited for, not failed.
+        let pane = Arc::clone(&host.pane);
+        let (locked, is_locked) = std::sync::mpsc::channel();
+        let parser = std::thread::spawn(move || {
+            let terminal = pane.terminal.lock();
+            locked.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            drop(terminal);
+        });
+        is_locked.recv().unwrap();
+        assert!(host.read(exports[0]).ends_with("line-499\n"));
+        parser.join().unwrap();
+        let pane = Arc::clone(&host.pane);
+        let (locked, is_locked) = std::sync::mpsc::channel();
+        let parser = std::thread::spawn(move || {
+            let terminal = pane.terminal.lock();
+            locked.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            drop(terminal);
+        });
+        is_locked.recv().unwrap();
+        assert_eq!(host.list(), exports);
+        parser.join().unwrap();
+
+        // Text, then its Enter after the delay, reach the program.
+        let started = Instant::now();
+        let budgets = Budgets::new().unwrap();
+        let budget = budgets.open_route(Id::random().unwrap()).unwrap();
+        let mut payload = Assembly::input(5, &budget).unwrap();
+        payload.append(0, b"hello").unwrap();
+        let (reply, _) = host
+            .exchange(
+                Command::Text {
+                    export: exports[0],
+                    bytes: 5,
+                    no_paste: true,
+                    enter: true,
+                },
+                Some(payload.finish().unwrap()),
+            )
+            .unwrap();
+        let Reply::Input(result) = reply else {
+            panic!("not an input result");
+        };
+        assert_eq!(result.status, InputStatus::Submitted);
+        assert!(result.enter_submitted);
+        assert!(started.elapsed() >= thinkterm_reverse_access::protocol::enter_delay(5));
+        let mut seen = Vec::new();
+        let mut bytes = [0; 256];
+        while !String::from_utf8_lossy(&seen).contains("hello") {
+            let count = host.reader.read(&mut bytes).unwrap();
+            assert!(count > 0);
+            seen.extend_from_slice(&bytes[..count]);
+        }
+
+        // Revoked is over, for reads as for the next list.
+        let grant = host.route.status().grants[0].grant;
+        host.route.revoke(grant).unwrap();
+        assert!(host
+            .exchange(
+                Command::Read {
+                    export: exports[0],
+                    options: ReadOptions::default(),
+                },
+                None,
+            )
+            .is_err());
+        assert!(host.route.status().grants.is_empty());
+    }
+
+    #[test]
+    fn a_read_out_of_time_partway_through_a_frame_finishes_it_and_cancels() {
+        let mut host = fixture();
+        let exports = host.list();
+        host.pane.terminal.lock().advance_bytes(b"example\r\n");
+        host.route.heartbeat().unwrap();
+        host.sequence += 1;
+        let sequence = host.sequence;
+        let command = Command::Read {
+            export: exports[0],
+            options: ReadOptions::default(),
+        };
+        let route = Arc::clone(&host.route);
+        let received = smol::block_on(async move {
+            let budgets = Budgets::new()?;
+            let budget = budgets.open_route(Id::random()?)?;
+            let (near, far) = smol::Async::<UnixStream>::pair().unwrap();
+            // Still stuck in the reply's first frame when the operation ends.
+            let near = Stalled {
+                socket: near,
+                opens: smol::Timer::after(Duration::from_millis(600)),
+                started: false,
+                open: false,
+            };
+            let mut near = Channel::new(near, budget.acquire(1024 * 1024)?)?;
+            let mut far = Channel::new(far, budget.acquire(1024 * 1024)?)?;
+            let deadline = Deadline::request()?;
+            let operation = Deadline::after(Duration::from_millis(400))?;
+            let reply = route
+                .prepare_reply(sequence, command, None, &operation, &deadline)
+                .await?;
+            let (sent, received) = smol::future::zip(
+                reply.send(&mut near, sequence, &operation, &deadline),
+                receive_reply(
+                    &mut far,
+                    sequence,
+                    |bytes| Assembly::text(bytes, &budget),
+                    &deadline,
+                ),
+            )
+            .await;
+            sent?;
+            received
+        })
+        .unwrap();
+        assert!(matches!(received, Err(Error::Unavailable)));
+
+        // That was one request: the route and its grant carry on.
+        assert!(host.read(exports[0]).contains("example"));
+    }
+
+    #[test]
+    fn a_second_press_of_authenticate_is_the_approval_already_running() {
+        let host = fixture();
+        let grant = host.route.status().grants[0].grant;
+        std::fs::write(
+            &host._helper.0,
+            "#!/bin/sh\nIFS= read -r line\nid=${line#*\\\"Id\\\":\\\"}\nsleep 1\n\
+             printf '{\"kind\":\"approved\",\"id\":\"%s\"}\\n' \"${id%%\\\"*}\"\n",
+        )
+        .unwrap();
+        for _ in 0..2 {
+            host.route
+                .begin_all_local_approval(Permission::Read, 60, Some(grant))
+                .unwrap();
+            let status = host.route.status();
+            assert!(status.authenticating);
+            assert!(status.error.is_none());
+        }
+
+        // Another route has not asked yet, and has to wait for this one.
+        let other = host
+            .connect
+            .open(host.client.clone(), "user@server-b:22", "zh-CN")
+            .unwrap();
+        assert!(matches!(
+            other.begin_all_local_approval(Permission::Read, 60, None),
+            Err(Error::Busy)
+        ));
+        assert!(other.status().error.is_some());
+        assert!(host.route.status().error.is_none());
+
+        let deadline = Deadline::request().unwrap();
+        while host.route.status().authenticating {
+            deadline.remaining().unwrap();
+            host.route.heartbeat().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = host.route.status();
+        assert!(status.error.is_none());
+        assert_eq!(status.grants.len(), 1);
+        assert_ne!(status.grants[0].grant, grant);
+    }
+
+    #[test]
+    fn a_refused_dialog_is_not_a_failure_and_a_missing_one_stays_reported() {
+        let host = fixture();
+        let grant = host.route.status().grants[0].grant;
+        std::fs::write(
+            &host._helper.0,
+            "#!/bin/sh\nIFS= read -r line\nid=${line#*\\\"Id\\\":\\\"}\n\
+             printf '{\"kind\":\"rejected\",\"id\":\"%s\"}\\n' \"${id%%\\\"*}\"\n",
+        )
+        .unwrap();
+        host.route
+            .begin_all_local_approval(Permission::Read, 60, Some(grant))
+            .unwrap();
+        let deadline = Deadline::request().unwrap();
+        while host.route.status().authenticating {
+            deadline.remaining().unwrap();
+            host.route.heartbeat().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = host.route.status();
+        assert!(status.error.is_none());
+        assert_eq!(status.grants[0].grant, grant);
+
+        std::fs::remove_file(&host._helper.0).unwrap();
+        host.route.revoke(grant).unwrap();
+        // The monitor ended with the last grant, so this needs a new helper.
+        assert!(host
+            .route
+            .begin_all_local_approval(Permission::Read, 60, None)
+            .is_err());
+        assert!(host.route.status().error.is_some());
+        assert!(host.route.status().error.is_some());
+        host.route.cancel_approval();
+        assert!(host.route.status().error.is_none());
+    }
+}
+
+#[cfg(test)]
 mod summary_tests {
     use super::*;
     use portable_pty::PtySize;
@@ -2124,6 +3005,35 @@ mod summary_tests {
         assert_eq!(summary.title, title_before);
         assert_eq!(summary.dimensions.cols, 80);
         drop(guard);
+    }
+
+    /// The alternate screen numbers its rows from nought, so bounds taken
+    /// on it name the primary screen's oldest history once the program
+    /// has left it. Rows held to the screen are read with the screen.
+    #[test]
+    fn rows_held_to_the_screen_are_read_with_it() {
+        let (pane, _sizes, _exit) = pane();
+        let feed = |text: &str| {
+            let mut parser = termwiz::escape::parser::Parser::new();
+            let mut actions = vec![];
+            parser.parse(text.as_bytes(), |action| actions.push(action));
+            pane.perform_actions(actions);
+        };
+        for row in 0..60 {
+            feed(&format!("history {row}\r\n"));
+        }
+        feed("\x1b[?1049hfull screen");
+        let alt = pane.get_dimensions();
+        let asked = alt.physical_top..alt.physical_top + alt.viewport_rows as StableRowIndex;
+        let (_, lines) = pane.get_screen_lines(asked.clone());
+        assert!(lines[0].as_str().starts_with("full screen"));
+
+        // The program leaves its screen between the bounds and the rows.
+        feed("\x1b[?1049l");
+        let (_, unheld) = pane.get_lines(asked.clone());
+        assert!(unheld[0].as_str().starts_with("history 0"));
+        let (_, held) = pane.get_screen_lines(asked);
+        assert!(held.is_empty());
     }
 
     #[cfg(unix)]
@@ -2377,12 +3287,191 @@ mod summary_tests {
         }
     }
 
+    /// A pane with its reader running, and the end of the pipe it reads from.
+    #[cfg(unix)]
+    fn pane_on_a_pipe(
+        id: PaneId,
+    ) -> (
+        Arc<dyn Pane>,
+        filedescriptor::FileDescriptor,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        use std::os::unix::io::AsRawFd;
+        ensure_scheduler();
+        let pipe = filedescriptor::Pipe::new().unwrap();
+        let raw = pipe.read.as_raw_fd();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let terminal = Terminal::new(
+            size(80, 24),
+            Arc::new(config::TermConfig::new()),
+            "ThinkTerm",
+            "test",
+            Box::new(Vec::new()),
+        );
+        let pane: Arc<dyn Pane> = Arc::new(LocalPane::new(
+            id,
+            terminal,
+            Box::new(SleepingChild(exit_rx)),
+            Box::new(PipePty { read: pipe.read }),
+            Box::new(Vec::new()),
+            0,
+            "test".into(),
+        ));
+        let reader = pane.reader().unwrap().unwrap();
+        let weak = Arc::downgrade(&pane);
+        std::thread::spawn(move || crate::read_from_pane_pty(weak, None, reader, Some(raw)));
+        (pane, pipe.write, exit_tx)
+    }
+
+    #[cfg(unix)]
+    fn wait_for_title(pane: &Arc<dyn Pane>, want: &str) {
+        let title = || pane.summary_without_waiting().title;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while title() != want && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(title(), want);
+    }
+
+    /// A reader going through a flood has no wait to be woken from, and stops
+    /// for a pause all the same.
+    #[cfg(unix)]
+    #[test]
+    fn a_reader_in_a_flood_stops_for_a_pause() {
+        let (pane, mut program, _exit_tx) = pane_on_a_pipe(4244);
+        program.write_all(b"\x1b]0;started\x07").unwrap();
+        wait_for_title(&pane, "started");
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flood = std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    program.write_all(&[b' '; 4096]).unwrap();
+                }
+                program
+            }
+        });
+        std::thread::sleep(Duration::from_millis(20));
+
+        let paused = crate::pause_pane_reader(4244, Duration::from_secs(2)).expect("pause");
+        // The program stops only once the reader has gone on and made room.
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(20));
+        drop(paused);
+        let mut program = flood.join().unwrap();
+
+        program.write_all(b"\x1b]0;after\x07").unwrap();
+        wait_for_title(&pane, "after");
+    }
+
+    /// A full read says that more is coming, and what it parses to waits to
+    /// go on with the rest of its batch. When nothing more comes, it goes
+    /// on all the same, before the reader waits for what may never come.
+    #[cfg(unix)]
+    #[test]
+    fn a_full_read_with_nothing_after_it_is_applied() {
+        let (pane, mut program, _exit_tx) = pane_on_a_pipe(4245);
+        let mut output = vec![b' '; 4096];
+        output.extend_from_slice(b"\x1b]0;whole\x07");
+        program.write_all(&output).unwrap();
+        wait_for_title(&pane, "whole");
+    }
+
     /// While a reader is paused, what the program writes stays in the pty;
     /// resuming applies it, and a kept pause never does.
     #[cfg(unix)]
     #[test]
     fn a_paused_reader_leaves_the_pty_output_where_it_is() {
+        let (pane, mut program, _exit_tx) = pane_on_a_pipe(4242);
+        let title = |pane: &Arc<dyn Pane>| pane.summary_without_waiting().title;
+
+        program.write_all(b"\x1b]0;first\x07").unwrap();
+        wait_for_title(&pane, "first");
+
+        let paused = crate::pause_pane_reader(4242, Duration::from_secs(2)).expect("pause");
+        program.write_all(b"\x1b]0;second\x07").unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(title(&pane), "first", "nothing is read while paused");
+        drop(paused);
+        wait_for_title(&pane, "second");
+
+        let paused = crate::pause_pane_reader(4242, Duration::from_secs(2)).expect("pause again");
+        program.write_all(b"\x1b]0;third\x07").unwrap();
+        paused.keep();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(title(&pane), "second", "a kept pause never resumes");
+    }
+
+    /// What a busy pane's parser is asked to read runs when the batch it is
+    /// on ends, once, on the thread that applied the batch, with the batch
+    /// in it and the terminal there for the taking.
+    #[test]
+    fn a_read_left_for_the_parser_runs_after_its_batch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (pane, _sizes, _exit) = pane();
+        let batch = |text: &str| {
+            let mut parser = termwiz::escape::parser::Parser::new();
+            let mut actions = vec![];
+            parser.parse(text.as_bytes(), |action| actions.push(action));
+            pane.perform_actions(actions);
+        };
+        let parser_thread = std::thread::current().id();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&runs);
+        pane.read_after_batch(Box::new(move |pane| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(std::thread::current().id(), parser_thread);
+            assert!(!pane.render_state_is_contended(), "the terminal is free");
+            let (_, lines) = pane.get_lines(0..1);
+            assert!(lines[0].as_str().starts_with("first"), "the batch is in it");
+        }))
+        .ok()
+        .expect("a local pane has a parser to ask");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "no batch yet");
+
+        batch("first");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "after the batch");
+        batch(" second");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "and only once");
+    }
+
+    /// A resize that lands while a read has the terminal finds both of its
+    /// probes failing and leaves its note, and with no output to follow
+    /// nothing would come back for it.
+    #[test]
+    fn a_note_left_during_a_read_is_not_left_behind() {
+        let (pane, _sizes, _exit) = pane();
+        pane.read_after_batch(Box::new(|pane| {
+            let pane = pane.downcast_ref::<LocalPane>().unwrap();
+            *pane.pending_focus.lock() = Some(true);
+        }))
+        .ok()
+        .expect("a local pane has a parser to ask");
+
+        pane.perform_actions(vec![]);
+        assert!(!pane.anything_pending(), "the batch saw to it");
+    }
+
+    /// A pane keeps these, so one that held its pane would never be freed.
+    #[test]
+    fn a_read_that_never_runs_goes_with_its_pane() {
+        let (pane, _sizes, _exit) = pane();
+        let held = Arc::new(());
+        let kept = Arc::clone(&held);
+        pane.read_after_batch(Box::new(move |_| drop(kept)))
+            .ok()
+            .expect("a local pane has a parser to ask");
+        assert_eq!(Arc::strong_count(&held), 2, "waiting for a batch");
+        drop(pane);
+        assert_eq!(Arc::strong_count(&held), 1, "gone with the pane");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn synchronized_output_survives_reader_pause_and_eof() {
         use std::os::unix::io::AsRawFd;
+        use std::sync::atomic::Ordering;
         ensure_scheduler();
         let pipe = filedescriptor::Pipe::new().unwrap();
         let mut program = pipe.write;
@@ -2396,7 +3485,7 @@ mod summary_tests {
             Box::new(Vec::new()),
         );
         let pane: Arc<dyn Pane> = Arc::new(LocalPane::new(
-            4242,
+            4243,
             terminal,
             Box::new(SleepingChild(exit_rx)),
             Box::new(PipePty { read: pipe.read }),
@@ -2406,31 +3495,42 @@ mod summary_tests {
         ));
         let reader = pane.reader().unwrap().unwrap();
         let weak = Arc::downgrade(&pane);
-        std::thread::spawn(move || crate::read_from_pane_pty(weak, None, reader, Some(raw)));
-
+        let reader_thread =
+            std::thread::spawn(move || crate::read_from_pane_pty(weak, None, reader, Some(raw)));
         let title = |pane: &Arc<dyn Pane>| pane.summary_without_waiting().title;
-        let wait_for = |pane: &Arc<dyn Pane>, want: &str| {
+        let wait_for = |want: &str| {
             let deadline = Instant::now() + Duration::from_secs(5);
-            while title(pane) != want && Instant::now() < deadline {
+            while title(&pane) != want && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            assert_eq!(title(pane), want);
+            assert_eq!(title(&pane), want);
         };
 
-        program.write_all(b"\x1b]0;first\x07").unwrap();
-        wait_for(&pane, "first");
-
-        let paused = crate::pause_pane_reader(4242, Duration::from_secs(2)).expect("pause");
-        program.write_all(b"\x1b]0;second\x07").unwrap();
-        std::thread::sleep(Duration::from_millis(150));
-        assert_eq!(title(&pane), "first", "nothing is read while paused");
+        program.write_all(b"\x1b]0;initial\x07").unwrap();
+        wait_for("initial");
+        program.write_all(b"\x1b[?2026h").unwrap();
+        program.write_all(&vec![b'x'; 256 * 1024 + 17]).unwrap();
+        program.write_all(b"\x1b]0;held\x07").unwrap();
+        let control = crate::PANE_READERS.lock().get(&4243).cloned().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !control.holding.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(control.holding.load(Ordering::SeqCst));
+        let paused = crate::pause_pane_reader(4243, Duration::from_secs(2)).unwrap();
+        assert_eq!(title(&pane), "initial");
+        program.write_all(b"\x1b[?2026l").unwrap();
         drop(paused);
-        wait_for(&pane, "second");
+        wait_for("held");
 
-        let paused = crate::pause_pane_reader(4242, Duration::from_secs(2)).expect("pause again");
-        program.write_all(b"\x1b]0;third\x07").unwrap();
-        paused.keep();
-        std::thread::sleep(Duration::from_millis(150));
-        assert_eq!(title(&pane), "second", "a kept pause never resumes");
+        program.write_all(b"\x1b[?2026h\x1b]0;final\x07").unwrap();
+        drop(program);
+        wait_for("final");
+        reader_thread.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while control.pending_bytes() != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(control.pending_bytes(), 0);
     }
 }

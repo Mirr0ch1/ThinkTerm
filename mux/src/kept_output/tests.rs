@@ -733,9 +733,21 @@ fn the_switch_is_a_file_that_says_on() {
     assert!(enabled_at(&switch));
     assert_eq!(std::fs::read_to_string(&switch).unwrap(), "on\n");
     set_enabled_at(&switch, false).unwrap();
-    assert!(!switch.exists());
+    assert!(!enabled_at(&switch));
+    assert_eq!(std::fs::read_to_string(&switch).unwrap(), "off\n");
     // Off twice is still off; anything but "on" is off.
     set_enabled_at(&switch, false).unwrap();
     std::fs::write(&switch, "yes").unwrap();
+    assert!(!enabled_at(&switch));
+}
+
+#[test]
+fn the_desktop_turns_on_only_a_switch_never_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let switch = dir.path().join("thinkterm").join("restore-pane-output");
+    on_by_default_at(&switch).unwrap();
+    assert!(enabled_at(&switch));
+    set_enabled_at(&switch, false).unwrap();
+    on_by_default_at(&switch).unwrap();
     assert!(!enabled_at(&switch));
 }

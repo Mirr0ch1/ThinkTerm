@@ -47,10 +47,10 @@ extern "C" fn application_should_terminate(
             WindowCloseConfirmation::AlwaysPrompt => {
                 let alert: id = msg_send![class!(NSAlert), alloc];
                 let alert: id = msg_send![alert, init];
-                let message_text = nsstring("Terminate ThinkTerm?");
-                let info_text = nsstring("Detach and close all panes and terminate ThinkTerm?");
-                let cancel = nsstring("Cancel");
-                let ok = nsstring("Ok");
+                let message_text = nsstring(&thinkterm_i18n::tr("quit-confirm-title"));
+                let info_text = nsstring(&thinkterm_i18n::tr("quit-confirm-detail"));
+                let cancel = nsstring(&thinkterm_i18n::tr("quit-confirm-cancel"));
+                let ok = nsstring(&thinkterm_i18n::tr("quit-confirm-ok"));
 
                 let () = msg_send![alert, setMessageText: message_text];
                 let () = msg_send![alert, setInformativeText: info_text];
@@ -255,8 +255,11 @@ extern "C" fn application_dock_menu(
     _app: *mut Object,
 ) -> *mut Object {
     let dock_menu = Menu::new_with_title("");
-    let new_window_item =
-        MenuItem::new_with("New Window", Some(sel!(weztermPerformKeyAssignment:)), "");
+    let new_window_item = MenuItem::new_with(
+        &thinkterm_i18n::tr("command-new-window"),
+        Some(sel!(weztermPerformKeyAssignment:)),
+        "",
+    );
     new_window_item
         .set_represented_item(RepresentedItem::KeyAssignment(KeyAssignment::SpawnWindow));
     dock_menu.add_item(&new_window_item);

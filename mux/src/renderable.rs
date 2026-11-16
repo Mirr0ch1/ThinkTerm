@@ -86,6 +86,20 @@ pub fn terminal_get_lines(
     (first, lines)
 }
 
+/// Implements Pane::get_screen_lines for Terminal: the screen's bounds and
+/// its rows, read in the one hold the caller has of it.
+pub fn terminal_get_screen_lines(
+    term: &mut Terminal,
+    lines: Range<StableRowIndex>,
+) -> (StableRowIndex, Vec<Line>) {
+    let lines = crate::pane::on_screen(&terminal_get_dimensions(term), lines);
+    // Not asked: a screen can answer an empty range with a row.
+    if lines.is_empty() {
+        return (lines.start, vec![]);
+    }
+    terminal_get_lines(term, lines)
+}
+
 /// Implements Pane::get_dimensions for Terminal
 pub fn terminal_get_dimensions(term: &mut Terminal) -> RenderableDimensions {
     let size = term.get_size();

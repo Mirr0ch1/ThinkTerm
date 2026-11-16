@@ -16,6 +16,7 @@ use mux::{
 };
 use promise::spawn::spawn_into_main_thread;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use termwiz::surface::SequenceNo;
@@ -98,6 +99,7 @@ pub(crate) struct PerPane {
     mouse_grabbed: bool,
     alt_screen: bool,
     keyboard_encoding: WireKeyboardEncoding,
+    bracketed_paste: bool,
     /// Outer None means that this connection has never received application
     /// palette state for the pane. Inner None is an explicit reset to the
     /// client's own configured palette.
@@ -114,6 +116,17 @@ pub(crate) struct PerPane {
     frame_subscription: Option<Box<dyn mux::pane::KittyFrameSubscription>>,
     /// A push task exists for this pane and has not yet read the pane.
     push_scheduled: bool,
+    /// Something asked for a push since the reading on its way was asked
+    /// for, and may not be in it: see `finish_push`.
+    push_wanted: bool,
+    /// Output landed on a push on its way; see `FLOOD_FRAMES_PER_PUSH`.
+    output_landed: bool,
+    /// Moves whenever what a reading is held against changes, so a reading
+    /// made away from the main thread can tell it was overtaken.
+    reading_generation: u64,
+    /// When this connection last had output sent, or a reading made by the
+    /// parser; see `push_pause`.
+    last_push: Option<Instant>,
     /// Terminal input from this connection for this pane, in the order it
     /// was sent, waiting for the pane to be free. See `drain_pane_inputs`.
     inputs: VecDeque<QueuedInput>,
@@ -124,6 +137,9 @@ pub(crate) struct PerPane {
     /// The connection subscribed to events: a push carries the pane's
     /// alerts and nothing of what it shows.
     events_only: bool,
+    /// The connection is a viewer of a shared pane: a push reads its rows
+    /// with the screen they are on (see `Pane::get_screen_lines`).
+    viewer: bool,
 }
 
 /// What may wait for one pane from one connection before further input is
@@ -131,6 +147,10 @@ pub(crate) struct PerPane {
 /// reading it. The client's own write queue stops at four megabytes;
 /// pastes and `cli send-text` do not pass through it.
 const INPUT_QUEUE_LIMIT: usize = 8 * 1024 * 1024;
+
+/// A viewer's coalesced wheel event is replayed on the main thread, so
+/// its small wire representation must not ask for unbounded work.
+const SHARE_WHEEL_NOTCH_LIMIT: usize = 256;
 
 /// One piece of terminal input a client sent for a pane.
 enum PaneInput {
@@ -188,6 +208,8 @@ struct InputSource {
     client_id: Option<Arc<ClientId>>,
     registration: Option<ClientRegistrationId>,
     palette_session_id: Option<PaletteSessionId>,
+    /// A viewer on the share socket: its share and its place in it.
+    share: Option<ShareWatch>,
 }
 
 impl PerPane {
@@ -196,6 +218,7 @@ impl PerPane {
         self.frame_revision = None;
         self.scene_seqno = 0;
         self.frame_epoch += 1;
+        self.reading_generation += 1;
         if !subscribe {
             self.frame_subscription = None;
         }
@@ -205,13 +228,69 @@ impl PerPane {
     /// Claim the one push slot; false when a push is already on its way,
     /// which will carry whatever the caller wanted sent.
     fn claim_push(&mut self) -> bool {
+        self.push_wanted = self.push_scheduled;
         !std::mem::replace(&mut self.push_scheduled, true)
+    }
+
+    /// `claim_push` for what the pane's output sets off, the only thing
+    /// that tells a flood from a keystroke landing on a push.
+    fn claim_push_for_output(&mut self) -> bool {
+        let claimed = self.claim_push();
+        self.output_landed = !claimed;
+        claimed
     }
 
     /// Give the slot back. Done just before the pane is read, so output
     /// that lands during the read schedules the next push.
     fn release_push(&mut self) {
         self.push_scheduled = false;
+        self.push_wanted = false;
+        self.output_landed = false;
+    }
+
+    /// End a push whose reading was made before now, by the pane's parser:
+    /// what asked for a push since then may not be in it, and the slot was
+    /// taken. True when that happened and the caller keeps the slot and
+    /// goes round again; false and the slot is free otherwise. Decided
+    /// under the one lock, so that nothing lands between the two.
+    fn finish_push(&mut self) -> bool {
+        // Found or not: it came off the output's throughput, and a flood that
+        // shows nothing would pay for one after every batch.
+        self.last_push = Some(Instant::now());
+        self.output_landed = false;
+        if std::mem::take(&mut self.push_wanted) {
+            return true;
+        }
+        self.push_scheduled = false;
+        false
+    }
+
+    /// What a reading of the pane needs from here.
+    fn push_inputs(&self) -> PushInputs {
+        PushInputs {
+            last: self.last_sent(),
+            frame_control: self.frame_control,
+            frame_revision: self.frame_revision,
+            scene_seqno: self.scene_seqno,
+            viewer: self.viewer,
+            generation: self.reading_generation,
+        }
+    }
+
+    /// How long before this connection's next push of the pane is due, a
+    /// `frame` after the last one that counts. A push of a free pane that
+    /// found nothing does not: one sets out as soon as a key is written, and
+    /// holding the output that key sets off behind it would be what a
+    /// flood's frame costs, on every keystroke.
+    fn push_pause(&self, frame: Duration, now: Instant) -> Duration {
+        let interval = if self.output_landed {
+            frame * FLOOD_FRAMES_PER_PUSH
+        } else {
+            frame
+        };
+        self.last_push.map_or(Duration::ZERO, |last| {
+            interval.saturating_sub(now.saturating_duration_since(last))
+        })
     }
 
     /// Queue `item`; Ok(true) when the caller has to start the drain.
@@ -239,19 +318,41 @@ impl PerPane {
 
     fn record_application_palette(&mut self, palette: Option<ColorPalette>) {
         self.last_sent_application_palette = Some(palette);
+        self.reading_generation += 1;
     }
 
     /// The pane as this connection last described it.
     fn last_sent(&self) -> LastSent {
         LastSent {
             cursor_position: self.cursor_position,
-            title: self.title.clone(),
-            working_dir: self.working_dir.clone(),
             dimensions: self.dimensions,
             mouse_grabbed: self.mouse_grabbed,
             alt_screen: self.alt_screen,
             keyboard_encoding: self.keyboard_encoding,
+            bracketed_paste: self.bracketed_paste,
             seqno: self.seqno,
+        }
+    }
+
+    /// Whether `labels` have anything this connection has not been told.
+    fn labels_are_news(&self, labels: &PaneLabels) -> bool {
+        self.title != labels.title || self.working_dir != labels.working_dir
+    }
+
+    /// A reading of the pane as this connection last described it, for
+    /// labels that are all there is to say.
+    fn reading_of_nothing_new(&self) -> PaneReading {
+        PaneReading {
+            mouse_grabbed: self.mouse_grabbed,
+            alt_screen: self.alt_screen,
+            keyboard_encoding: self.keyboard_encoding,
+            bracketed_paste: self.bracketed_paste,
+            dimensions: self.dimensions,
+            cursor_position: self.cursor_position,
+            seqno: self.seqno,
+            dirty_lines: Default::default(),
+            bonus_lines: Vec::new(),
+            input_serial: None,
         }
     }
 
@@ -260,20 +361,21 @@ impl PerPane {
         &mut self,
         pane_id: PaneId,
         reading: PaneReading,
+        labels: PaneLabels,
     ) -> GetPaneRenderChangesResponse {
         let PaneReading {
             mouse_grabbed,
             alt_screen,
             keyboard_encoding,
+            bracketed_paste,
             dimensions,
             cursor_position,
-            title,
-            working_dir,
             seqno,
             dirty_lines,
             bonus_lines,
             input_serial,
         } = reading;
+        let PaneLabels { title, working_dir } = labels;
         self.cursor_position = cursor_position;
         self.title = title.clone();
         self.working_dir = working_dir.clone();
@@ -281,7 +383,14 @@ impl PerPane {
         self.mouse_grabbed = mouse_grabbed;
         self.alt_screen = alt_screen;
         self.keyboard_encoding = keyboard_encoding;
+        self.bracketed_paste = bracketed_paste;
         self.seqno = seqno;
+        self.reading_generation += 1;
+        // The push for a key goes out with the key, whatever it found. The
+        // output the key sets off comes next, and that is not to wait for it.
+        if input_serial.is_none() {
+            self.last_push = Some(Instant::now());
+        }
 
         self.sent_images.remember(&bonus_lines);
         let bonus_lines = bonus_lines.into();
@@ -290,6 +399,7 @@ impl PerPane {
             mouse_grabbed,
             alt_screen,
             keyboard_encoding,
+            bracketed_paste,
             dirty_lines: dirty_lines.iter().cloned().collect(),
             dimensions,
             cursor_position,
@@ -313,12 +423,11 @@ impl PerPane {
 #[derive(Clone)]
 struct LastSent {
     cursor_position: StableCursorPosition,
-    title: String,
-    working_dir: Option<Url>,
     dimensions: RenderableDimensions,
     mouse_grabbed: bool,
     alt_screen: bool,
     keyboard_encoding: WireKeyboardEncoding,
+    bracketed_paste: bool,
     seqno: SequenceNo,
 }
 
@@ -327,14 +436,90 @@ struct PaneReading {
     mouse_grabbed: bool,
     alt_screen: bool,
     keyboard_encoding: WireKeyboardEncoding,
+    bracketed_paste: bool,
     dimensions: RenderableDimensions,
     cursor_position: StableCursorPosition,
-    title: String,
-    working_dir: Option<Url>,
     seqno: SequenceNo,
     dirty_lines: rangeset::RangeSet<StableRowIndex>,
     bonus_lines: Vec<(StableRowIndex, wezterm_term::Line)>,
     input_serial: Option<InputSerial>,
+}
+
+/// The viewport's rows and the cursor's, as a reading copied them.
+struct RowsRead {
+    first: StableRowIndex,
+    viewport: Vec<wezterm_term::Line>,
+    cursor: Option<(StableRowIndex, wezterm_term::Line)>,
+}
+
+/// A `PaneReading` whose rows have not been gone through yet.
+struct RawReading {
+    reading: PaneReading,
+    rows: Option<RowsRead>,
+}
+
+impl RawReading {
+    /// Pick the rows to send. Compressing them is most of the cost of a push
+    /// of text with anything in it but ASCII, so it is done here, apart from
+    /// the reading: a reading can be made by the pane's parser, whose time
+    /// goes straight off the output's throughput.
+    fn select_rows(self) -> PaneReading {
+        let Self { mut reading, rows } = self;
+        if let Some(RowsRead {
+            first,
+            viewport,
+            cursor,
+        }) = rows
+        {
+            reading.bonus_lines = select_dirty_lines(first, viewport, &mut reading.dirty_lines);
+            // Always send the cursor's row with ordinary changes, as that
+            // tends to be the busiest row.
+            if let Some((row, mut line)) = cursor {
+                line.compress_for_scrollback();
+                reading.bonus_lines.push((row, line));
+            }
+        }
+        reading
+    }
+}
+
+/// A pane's title and directory. Either can take a look at the pane's
+/// processes, which is not for its parser to do, so these are read on the
+/// main thread, and after the rest of a reading, not before: a title's alert
+/// goes out with the push, and the window redraws its title from what the
+/// push said. A reading can be asked for in the middle of the batch that set
+/// the title, which only the end of that batch makes readable from here.
+struct PaneLabels {
+    title: String,
+    working_dir: Option<Url>,
+}
+
+impl PaneLabels {
+    fn read(pane: &Arc<dyn Pane>) -> Self {
+        Self {
+            title: pane.title_without_waiting(),
+            working_dir: pane.working_dir_without_waiting(CachePolicy::AllowStale),
+        }
+    }
+}
+
+/// What a reading of the pane needs from `PerPane`, copied out for the same
+/// reason `LastSent` is, and so that it can be read off the main thread.
+struct PushInputs {
+    last: LastSent,
+    frame_control: bool,
+    frame_revision: Option<u64>,
+    scene_seqno: u64,
+    viewer: bool,
+    generation: u64,
+}
+
+/// Everything one push sends, read from the pane by `read_for_push`.
+struct PushReading {
+    application_palette: Option<ColorPalette>,
+    frames: Option<(u64, u64, Vec<wezterm_term::KittyFrameSelection>)>,
+    scene_seqno: u64,
+    changes: Option<RawReading>,
 }
 
 /// Select from owned rows after the pane's terminal lock has been released.
@@ -370,13 +555,16 @@ fn select_dirty_lines(
 
 /// Read `pane` against what was `last` sent: None when nothing changed and
 /// nothing forces a push. Takes the pane's terminal lock, several times;
-/// no `PerPane` lock may be held by the caller.
+/// no `PerPane` lock may be held by the caller. A `viewer`'s rows are read
+/// with the screen they are on: the bounds read here before them may be
+/// of the other screen by then.
 fn read_pane_changes(
-    pane: &Arc<dyn Pane>,
+    pane: &dyn Pane,
     last: &LastSent,
     force_with_input_serial: Option<InputSerial>,
     scene_seqno: u64,
-) -> Option<PaneReading> {
+    viewer: bool,
+) -> Option<RawReading> {
     let mut changed = false;
     let mouse_grabbed = pane.is_mouse_grabbed();
     if mouse_grabbed != last.mouse_grabbed {
@@ -393,6 +581,11 @@ fn read_pane_changes(
         changed = true;
     }
 
+    let bracketed_paste = pane.bracketed_paste().unwrap_or(false);
+    if bracketed_paste != last.bracketed_paste {
+        changed = true;
+    }
+
     let dims = pane.get_dimensions();
     if dims != last.dimensions {
         changed = true;
@@ -403,18 +596,8 @@ fn read_pane_changes(
         changed = true;
     }
 
-    let title = pane.get_title();
-    if title != last.title {
-        changed = true;
-    }
-
-    let working_dir = pane.get_current_working_dir(CachePolicy::AllowStale);
-    if working_dir != last.working_dir {
-        changed = true;
-    }
-
     let seqno = pane.get_current_seqno();
-    let mut all_dirty_lines = pane.get_changed_since(
+    let all_dirty_lines = pane.get_changed_since(
         0..dims.physical_top + dims.viewport_rows as StableRowIndex,
         last.seqno,
     );
@@ -425,38 +608,43 @@ fn read_pane_changes(
     let sequence_only = !changed && force_with_input_serial.is_none();
     if sequence_only && !((last.seqno as u64) < scene_seqno && seqno as u64 >= scene_seqno) { return None; }
 
-    let bonus_lines = if sequence_only {
+    let rows = if sequence_only {
         // A relative placement can move without touching text or the cursor.
         // Acknowledge its terminal sequence without copying unchanged rows.
-        Vec::new()
+        None
     } else {
+        let read = |lines| {
+            if viewer {
+                pane.get_screen_lines(lines)
+            } else {
+                pane.get_lines(lines)
+            }
+        };
         let viewport_range =
             dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex;
-        let (first_line, lines) = pane.get_lines(viewport_range);
-        let mut bonus_lines = select_dirty_lines(first_line, lines, &mut all_dirty_lines);
-
-        // Always send the cursor's row with ordinary changes, as that tends
-        // to be the busiest row.
-        let (cursor_line_idx, mut lines) = pane.get_lines(cursor_position.y..cursor_position.y + 1);
-        let mut cursor_line = lines.remove(0);
-        cursor_line.compress_for_scrollback();
-        bonus_lines.push((cursor_line_idx, cursor_line));
-        bonus_lines
+        let (first, viewport) = read(viewport_range);
+        // A viewer's cursor row may have left the screen.
+        let (row, lines) = read(cursor_position.y..cursor_position.y + 1);
+        Some(RowsRead {
+            first,
+            viewport,
+            cursor: lines.into_iter().next().map(|line| (row, line)),
+        })
     };
 
-    Some(PaneReading {
+    let reading = PaneReading {
+        bracketed_paste,
         mouse_grabbed,
         alt_screen,
         keyboard_encoding,
         dimensions: dims,
         cursor_position,
-        title,
-        working_dir,
         seqno,
         dirty_lines: all_dirty_lines,
-        bonus_lines,
+        bonus_lines: Vec::new(),
         input_serial: force_with_input_serial,
-    })
+    };
+    Some(RawReading { reading, rows })
 }
 
 /// How long a push waits for a busy pane before looking again: short at
@@ -468,6 +656,26 @@ fn read_pane_changes(
 const PUSH_RETRY_MIN: Duration = Duration::from_millis(2);
 const PUSH_RETRY_MAX: Duration = Duration::from_millis(50);
 const PUSH_DEFERRAL_LIMIT: Duration = Duration::from_secs(30);
+
+/// The least time between two pushes of a pane to one connection: a frame
+/// at `max_fps`, the fastest a window draws. A flood gives a push for every
+/// batch, up to a thousand a second, and a client has to take in every one
+/// of them to draw at most every eighth: a window behind on rows of
+/// many-codepoint cells stopped drawing for seconds. A push waiting here
+/// holds the pane's slot, so output landing meanwhile is in what it reads
+/// when its time comes, the last of it included. Output after a pause is not
+/// held back, and neither is what a key sends: `drain_pane_inputs` pushes
+/// that itself.
+fn push_interval() -> Duration {
+    Duration::from_millis(1000 / config::configuration().max_fps.clamp(1, 1000))
+}
+
+/// How many of those a push waits while output goes on landing during the
+/// wait: a flood, not a program drawing frames. Half the window's frame rate
+/// is all anyone can follow of one, and the other half came straight off the
+/// throughput: a frame drawn costs the mux a reading and the machine the
+/// drawing of it, for Unicode text 5% of what `kitten __benchmark__` measures.
+const FLOOD_FRAMES_PER_PUSH: u32 = 2;
 
 /// The one push slot of a pane, given back however the push ends: a task
 /// dropped without running, a bail, a panic -- a slot left taken would
@@ -486,6 +694,13 @@ impl PushSlot {
             }
         }
     }
+
+    /// `PerPane::finish_push`: true when the slot is still held.
+    fn finish(&mut self) -> bool {
+        let held = self.per_pane.lock().unwrap().finish_push();
+        self.released = !held;
+        held
+    }
 }
 
 impl Drop for PushSlot {
@@ -494,18 +709,78 @@ impl Drop for PushSlot {
     }
 }
 
-/// Push `pane_id`'s changes to this connection once its render state can
-/// be read without waiting.
+/// A reading asked of a busy pane's parser, and how the two sides agree on
+/// which of them makes it.
+struct ReadAfterBatch {
+    /// Set by whichever side reads: the parser after its batch, or this
+    /// side, if it finds the pane free first.
+    taken: Arc<AtomicBool>,
+    reading: smol::channel::Receiver<PushReading>,
+    generation: u64,
+}
+
+/// Ask `pane`'s parser to read for this connection after its batch. None for
+/// a pane without a parser to ask, and for a connection that reads nothing
+/// of the pane.
+fn ask_parser_to_read(
+    pane: &Arc<dyn Pane>,
+    per_pane: &Arc<Mutex<PerPane>>,
+) -> Option<ReadAfterBatch> {
+    let inputs = {
+        let mut per_pane = per_pane.lock().unwrap();
+        if per_pane.events_only {
+            return None;
+        }
+        // What asked for a push until now will be in this reading.
+        per_pane.push_wanted = false;
+        per_pane.push_inputs()
+    };
+    let generation = inputs.generation;
+    let (found, reading) = smol::channel::bounded(1);
+    let taken = Arc::new(AtomicBool::new(false));
+    let claim = Arc::clone(&taken);
+    pane.read_after_batch(Box::new(move |pane| {
+        if found.is_closed() || claim.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        found.try_send(read_for_push(pane, &inputs, None)).ok();
+    }))
+    .ok()?;
+    Some(ReadAfterBatch {
+        taken,
+        reading,
+        generation,
+    })
+}
+
+/// The pane, unless it or the connection has gone while waiting for it.
+fn pane_still_wanted(pane_id: PaneId, sender: &PduSender) -> anyhow::Result<Arc<dyn Pane>> {
+    if sender.is_closed() {
+        anyhow::bail!("connection closed while pane {pane_id} was busy");
+    }
+    Mux::get()
+        .get_pane(pane_id)
+        .ok_or_else(|| anyhow!("no such pane {pane_id}"))
+}
+
+/// Push `pane_id`'s changes to this connection, reading the pane without
+/// the main thread ever waiting for it.
 ///
 /// Pushes run on the main thread with the rest of the mux's work, while
 /// each pane's parser holds the pane's terminal lock for as long as a
 /// batch of output takes to apply. Reading here while a pane was busy
 /// with, say, a very large image stalled every other pane's pushes and
 /// every request that needs the main thread until that batch was done --
-/// with a runaway pane, for good. So the lock is probed first, and a busy
-/// pane's push is put off: that pane's own output is what waits, nobody
-/// else's. The probe is a moment's glance, not a reservation; a pane that
-/// takes the lock back right after it still has to be waited for, once.
+/// with a runaway pane, for good. So the lock is probed first. The probe
+/// is a moment's glance, not a reservation; a pane that takes the lock
+/// back right after it still has to be waited for, once.
+///
+/// A probe alone is not enough for a pane that is merely busy. Under a
+/// flood the lock is free for a tenth of a millisecond between batches of
+/// a millisecond, and a retry on a timer lands in that gap by luck: output
+/// went a second at a time without reaching the screen. So the first probe
+/// to fail leaves the reading with the pane's parser, which makes it right
+/// after its batch. The timer stays, for the batch that was the last.
 async fn push_pane_changes_when_free(
     pane_id: PaneId,
     sender: PduSender,
@@ -515,47 +790,236 @@ async fn push_pane_changes_when_free(
         per_pane: Arc::clone(&per_pane),
         released: false,
     };
-    let Some(pane) =
-        pane_when_free(pane_id, &sender, "this push", Some(PUSH_DEFERRAL_LIMIT)).await?
-    else {
-        // Its next output will try again.
-        return Ok(());
+    let mut delay = PUSH_RETRY_MIN;
+    let mut started = Instant::now();
+    let mut asked: Option<ReadAfterBatch> = None;
+    loop {
+        let pane = pane_still_wanted(pane_id, &sender)?;
+        if asked.is_none() {
+            let pause = per_pane
+                .lock()
+                .unwrap()
+                .push_pause(push_interval(), Instant::now());
+            if !pause.is_zero() {
+                smol::Timer::after(pause).await;
+                continue;
+            }
+        }
+        if !pane.render_state_is_contended() {
+            // Unless the parser has this reading in hand already.
+            if !asked
+                .as_ref()
+                .is_some_and(|asked| asked.taken.swap(true, Ordering::AcqRel))
+            {
+                // Released before the read, so output that lands during it
+                // schedules the next push rather than being carried by
+                // nobody.
+                slot.release();
+                let pushed_at = Instant::now();
+                let pushed = maybe_push_pane_changes(&pane, sender, per_pane, None);
+                metrics::histogram!("mux_server.push.latency").record(pushed_at.elapsed());
+                return pushed;
+            }
+        } else {
+            if started.elapsed() > PUSH_DEFERRAL_LIMIT {
+                log::warn!(
+                    "pane {pane_id} has been busy for {:?}; giving up on this push",
+                    started.elapsed()
+                );
+                // Its next output will try again.
+                return Ok(());
+            }
+            if asked.is_none() {
+                asked = ask_parser_to_read(&pane, &per_pane);
+            }
+        }
+        metrics::counter!("mux_server.push.deferred").increment(1);
+        let waited = match &asked {
+            Some(asked) => {
+                smol::future::or(async { Some(asked.reading.recv().await) }, async {
+                    smol::Timer::after(delay).await;
+                    None
+                })
+                .await
+            }
+            None => {
+                smol::Timer::after(delay).await;
+                None
+            }
+        };
+        delay = (delay * 2).min(PUSH_RETRY_MAX);
+        let (Some(waited), Some(asked_for)) = (waited, &asked) else {
+            continue;
+        };
+        let generation = asked_for.generation;
+        asked = None;
+        // An error is the reading dropped unmade, with its pane: the next
+        // look round finds out.
+        let Ok(reading) = waited else {
+            continue;
+        };
+        delay = PUSH_RETRY_MIN;
+        started = Instant::now();
+        metrics::counter!("mux_server.push.after_batch").increment(1);
+        // A push made here since overtook this one, which would put an older
+        // screen on top of it. The next look round reads afresh.
+        if per_pane.lock().unwrap().reading_generation != generation {
+            continue;
+        }
+        let labels = PaneLabels::read(&pane);
+        send_push_reading(pane_id, reading, labels, &sender, &per_pane)?;
+        if !slot.finish() {
+            return Ok(());
+        }
+    }
+}
+
+/// How long a pane's output waits between two batches for the main thread
+/// to take the turn it asked for, and then again for it to be done with it.
+/// The main thread gets there in a fraction of this unless it is busy, and
+/// output kept waiting longer would be output held up for input.
+const TURN_LIMIT: Duration = Duration::from_millis(2);
+
+/// After a turn that nobody came for, how long a pane's output goes on
+/// without offering another: a main thread too busy to take one is not
+/// waited for again by everything else that asked, nor after every batch.
+const TURN_REST: Duration = Duration::from_millis(16);
+
+thread_local! {
+    /// When a turn offered by this thread, which applies a pane's output,
+    /// last went untaken.
+    static TURN_UNTAKEN: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// A pane found free, or given a turn by the thread that applies its
+/// output: with a turn that thread waits between two batches, the terminal
+/// free, until this is dropped or `TURN_LIMIT` has passed.
+struct FreePane {
+    pane: Arc<dyn Pane>,
+    _turn: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl FreePane {
+    fn without_a_turn(pane: Arc<dyn Pane>) -> Self {
+        Self { pane, _turn: None }
+    }
+}
+
+impl std::ops::Deref for FreePane {
+    type Target = Arc<dyn Pane>;
+
+    fn deref(&self) -> &Arc<dyn Pane> {
+        &self.pane
+    }
+}
+
+/// Ask `pane`'s parser for a turn at the terminal after its batch: what is
+/// received is the turn, kept for as long as the terminal is wanted. None
+/// for a pane without a parser to ask.
+///
+/// A flood leaves the terminal free for a moment between batches and no
+/// longer, and a probe on a timer finds that moment by luck, if at all:
+/// a key typed at a pane in a flood waited for it, sometimes for a second.
+///
+/// The turn is an offer until it is taken (see `take_turn`): one that the
+/// main thread comes to late has run out, and the terminal is no longer
+/// free behind it.
+fn ask_parser_for_a_turn(
+    pane: &Arc<dyn Pane>,
+) -> Option<smol::channel::Receiver<std::sync::mpsc::Sender<()>>> {
+    let (go, went) = smol::channel::bounded(1);
+    let asked_from = std::thread::current().id();
+    pane.read_after_batch(Box::new(move |_pane| offer_turn(&go, asked_from)))
+        .ok()?;
+    Some(went)
+}
+
+/// Between two batches, on the thread that applies a pane's output: offer
+/// the turn asked for from `asked_from`, and wait while it is used.
+fn offer_turn(
+    go: &smol::channel::Sender<std::sync::mpsc::Sender<()>>,
+    asked_from: std::thread::ThreadId,
+) {
+    use std::sync::mpsc::RecvTimeoutError;
+    // Whoever asked has stopped waiting, for this one at least.
+    if go.is_closed() {
+        return;
+    }
+    // A batch applied by the thread that asked, which has the terminal to
+    // itself once it is back at its tasks: nothing could take a turn while
+    // that thread waited here.
+    if std::thread::current().id() == asked_from {
+        return;
+    }
+    if TURN_UNTAKEN.with(|at| at.get().is_some_and(|at| at.elapsed() < TURN_REST)) {
+        return;
+    }
+    let (turn, heard) = std::sync::mpsc::channel::<()>();
+    if go.try_send(turn).is_err() {
+        return;
+    }
+    // The first thing heard is that the turn was taken, and the only thing
+    // after it is the turn being dropped.
+    let taken = match heard.recv_timeout(TURN_LIMIT) {
+        Ok(()) => true,
+        // Taken just as the time ran out counts.
+        Err(RecvTimeoutError::Timeout) => {
+            let taken = heard.try_recv().is_ok();
+            if !taken {
+                TURN_UNTAKEN.with(|at| at.set(Some(Instant::now())));
+            }
+            taken
+        }
+        Err(RecvTimeoutError::Disconnected) => false,
     };
-    // Released before the read, so output that lands during it
-    // schedules the next push rather than being carried by nobody.
-    slot.release();
-    let pushed_at = Instant::now();
-    let pushed = maybe_push_pane_changes(&pane, sender, per_pane, None);
-    metrics::histogram!("mux_server.push.latency").record(pushed_at.elapsed());
-    pushed
+    if taken {
+        let _ = heard.recv_timeout(TURN_LIMIT);
+    }
+}
+
+/// Take a turn that was offered: false if it ran out first, and the output
+/// has gone on to its next batch with the terminal.
+fn take_turn(turn: &std::sync::mpsc::Sender<()>) -> bool {
+    turn.send(()).is_ok()
 }
 
 /// The pane, once its render state can be read without waiting on its
-/// parser. With a `limit`, None after that long of nothing but
+/// parser: found free, or with a turn its parser gives between two batches
+/// (see `FreePane`). With a `limit`, None after that long of nothing but
 /// contention, with a warning naming `what` gave up; without one the wait
 /// is for as long as it takes, and the warning says so once. Every read
-/// of a pane on the main thread goes through here, so a pane wedged in
-/// its parser costs its own readers a wait and nobody else anything. The
-/// probe is a moment's glance, not a reservation; a pane that takes the
-/// lock back right after it still has to be waited for, once.
+/// of a pane on the main thread but a push's goes through here, so a pane
+/// wedged in its parser costs its own readers a wait and nobody else
+/// anything. The probe is a moment's glance, not a reservation; a pane that
+/// takes the lock back right after it still has to be waited for, once.
 async fn pane_when_free(
     pane_id: PaneId,
     sender: &PduSender,
     what: &str,
     limit: Option<Duration>,
-) -> anyhow::Result<Option<Arc<dyn Pane>>> {
+) -> anyhow::Result<Option<FreePane>> {
     let mut delay = PUSH_RETRY_MIN;
     let started = Instant::now();
     let mut warned = false;
+    // The turn asked for and not yet offered: asked for once, however many
+    // times the timer comes round before the batch ends.
+    let mut asked: Option<smol::channel::Receiver<std::sync::mpsc::Sender<()>>> = None;
     loop {
-        if sender.is_closed() {
-            anyhow::bail!("connection closed while pane {pane_id} was busy");
-        }
-        let Some(pane) = Mux::get().get_pane(pane_id) else {
-            anyhow::bail!("no such pane {pane_id}");
-        };
+        let pane = pane_still_wanted(pane_id, sender)?;
         if !pane.render_state_is_contended() {
-            return Ok(Some(pane));
+            // The terminal may be free because a turn was offered while
+            // this was not looking: it is taken then, rather than left for
+            // the output to wait out as one nobody came for.
+            if let Some(turn) = asked.as_ref().and_then(|went| went.try_recv().ok()) {
+                if take_turn(&turn) {
+                    metrics::counter!("mux_server.turn.given").increment(1);
+                    return Ok(Some(FreePane {
+                        pane,
+                        _turn: Some(turn),
+                    }));
+                }
+            }
+            return Ok(Some(FreePane::without_a_turn(pane)));
         }
         if started.elapsed() > limit.unwrap_or(PUSH_DEFERRAL_LIMIT) {
             if limit.is_some() {
@@ -574,8 +1038,45 @@ async fn pane_when_free(
             }
         }
         metrics::counter!("mux_server.push.deferred").increment(1);
-        smol::Timer::after(delay).await;
-        delay = (delay * 2).min(PUSH_RETRY_MAX);
+        // The timer stays, for the batch that was the last: a parser with
+        // nothing more to apply gives no turns.
+        if asked.is_none() {
+            asked = ask_parser_for_a_turn(&pane);
+        }
+        match &asked {
+            Some(went) => {
+                let offered = smol::future::or(async { Some(went.recv().await) }, async {
+                    smol::Timer::after(delay).await;
+                    None
+                })
+                .await;
+                match offered {
+                    Some(Ok(turn)) => {
+                        asked = None;
+                        if take_turn(&turn) {
+                            metrics::counter!("mux_server.turn.given").increment(1);
+                            return Ok(Some(FreePane {
+                                pane,
+                                _turn: Some(turn),
+                            }));
+                        }
+                        // It ran out before this got to it: look again.
+                        metrics::counter!("mux_server.turn.missed").increment(1);
+                    }
+                    // The batch ended without a turn to offer.
+                    Some(Err(_)) => {
+                        asked = None;
+                        smol::future::yield_now().await;
+                    }
+                    // The timer came round first: the next wait is longer.
+                    None => delay = (delay * 2).min(PUSH_RETRY_MAX),
+                }
+            }
+            None => {
+                smol::Timer::after(delay).await;
+                delay = (delay * 2).min(PUSH_RETRY_MAX);
+            }
+        }
     }
 }
 
@@ -622,6 +1123,7 @@ async fn drain_pane_inputs(
         } else {
             Mux::get()
                 .get_pane(pane_id)
+                .map(FreePane::without_a_turn)
                 .ok_or_else(|| anyhow!("no such pane {pane_id}"))
         };
         let pane = match pane {
@@ -633,6 +1135,9 @@ async fn drain_pane_inputs(
             }
         };
         let result = apply_pane_input(&pane, &sender, &per_pane, &source, item.input);
+        // The turn, if this had one, ends with the input applied: the
+        // output goes on while the rest of the main thread has its turn.
+        drop(pane);
         (item.respond)(result);
         // A burst typed while the pane was busy is applied a piece per
         // turn of the main thread, not all in one.
@@ -708,13 +1213,25 @@ fn apply_pane_input(
         pane.erase_scrollback(erase_mode);
         return Ok(Pdu::UnitResponse(UnitResponse {}));
     }
-    claim_viewport_for_pane(
-        &mux,
-        source.client_id.as_ref(),
-        source.registration,
-        pane.pane_id(),
-    )?;
-    activate_client_palette(&mux, pane, source.palette_session_id)?;
+    match source.share {
+        // A viewer types only while the owner lets it -- asked again now,
+        // since the wait for the pane may have outlasted the grant -- and
+        // is none of the owner's frontends: it claims no layout, sizes
+        // nothing, and brings no palette.
+        Some(watch) => anyhow::ensure!(
+            crate::share::may_type(watch.viewer_id, watch.share_id, pane.pane_id()),
+            "the owner has taken typing back"
+        ),
+        None => {
+            claim_viewport_for_pane(
+                &mux,
+                source.client_id.as_ref(),
+                source.registration,
+                pane.pane_id(),
+            )?;
+            activate_client_palette(&mux, pane, source.palette_session_id)?;
+        }
+    }
     let input_serial = match input {
         PaneInput::Key {
             event,
@@ -730,29 +1247,9 @@ fn apply_pane_input(
             None
         }
         PaneInput::Mouse(event) => {
-            // The client coalesces rapid wheel motion into a single
-            // event with an accumulated amount, but the terminal
-            // emits one report per event regardless of the amount;
-            // replay it per notch so mouse-mode apps scroll the
-            // full distance.
-            use wezterm_term::MouseButton as MB;
-            let notches = match event.button {
-                MB::WheelUp(n) if n > 1 => Some((MB::WheelUp(1), n)),
-                MB::WheelDown(n) if n > 1 => Some((MB::WheelDown(1), n)),
-                MB::WheelLeft(n) if n > 1 => Some((MB::WheelLeft(1), n)),
-                MB::WheelRight(n) if n > 1 => Some((MB::WheelRight(1), n)),
-                _ => None,
-            };
-            match notches {
-                Some((notch, n)) => {
-                    let mut single = event;
-                    single.button = notch;
-                    for _ in 0..n {
-                        pane.mouse_event(single.clone())?;
-                    }
-                }
-                None => pane.mouse_event(event)?,
-            }
+            apply_mouse_input(pane.pane_id(), source.share, event, |event| {
+                pane.mouse_event(event)
+            })?;
             None
         }
         PaneInput::Write(data) => {
@@ -775,9 +1272,162 @@ fn apply_pane_input(
     Ok(Pdu::UnitResponse(UnitResponse {}))
 }
 
+fn validate_share_mouse_input(event: &wezterm_term::input::MouseEvent) -> anyhow::Result<()> {
+    use wezterm_term::MouseButton as MB;
+    if let MB::WheelUp(n) | MB::WheelDown(n) | MB::WheelLeft(n) | MB::WheelRight(n) = event.button {
+        anyhow::ensure!(
+            n <= SHARE_WHEEL_NOTCH_LIMIT,
+            "a shared pane accepts at most {SHARE_WHEEL_NOTCH_LIMIT} wheel notches per event"
+        );
+    }
+    Ok(())
+}
+
+fn apply_mouse_input(
+    pane_id: PaneId,
+    share: Option<ShareWatch>,
+    event: wezterm_term::input::MouseEvent,
+    mut send: impl FnMut(wezterm_term::input::MouseEvent) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if share.is_some() {
+        validate_share_mouse_input(&event)?;
+    }
+    let mut send = |event| {
+        if let Some(watch) = share {
+            anyhow::ensure!(
+                crate::share::may_type(watch.viewer_id, watch.share_id, pane_id),
+                "the owner has taken typing back"
+            );
+        }
+        send(event)
+    };
+    // The client coalesces rapid wheel motion into a single event, but
+    // the terminal emits one report per event regardless of the amount.
+    // Replay each notch, checking the viewer's grant throughout.
+    use wezterm_term::MouseButton as MB;
+    let notches = match event.button {
+        MB::WheelUp(n) if n > 1 => Some((MB::WheelUp(1), n)),
+        MB::WheelDown(n) if n > 1 => Some((MB::WheelDown(1), n)),
+        MB::WheelLeft(n) if n > 1 => Some((MB::WheelLeft(1), n)),
+        MB::WheelRight(n) if n > 1 => Some((MB::WheelRight(1), n)),
+        _ => None,
+    };
+    match notches {
+        Some((notch, n)) => {
+            let mut single = event;
+            single.button = notch;
+            for _ in 0..n {
+                send(single)?;
+            }
+            Ok(())
+        }
+        None => send(event),
+    }
+}
+
 fn relative_scene_seqno(selections: &[wezterm_term::KittyFrameSelection]) -> u64 {
     selections.iter().flat_map(|image| &image.relative_placements)
         .map(|placement| placement.source_seqno).max().unwrap_or(0)
+}
+
+/// Read `pane` against `inputs`, on whichever thread: nothing here touches
+/// `PerPane` (see `LastSent`).
+fn read_for_push(
+    pane: &dyn Pane,
+    inputs: &PushInputs,
+    force_with_input_serial: Option<InputSerial>,
+) -> PushReading {
+    // Application palette provenance must arrive even when the state is
+    // `None`: that explicit reset prevents a server's configured/advisory
+    // palette from taking over client rendering.
+    let application_palette = pane.palette_override();
+    let frames = inputs
+        .frame_control
+        .then(|| pane.kitty_frame_selections(inputs.frame_revision))
+        .flatten();
+    let scene_seqno = frames
+        .as_ref()
+        .map_or(inputs.scene_seqno, |(_, _, selections)| {
+            relative_scene_seqno(selections)
+        });
+    let changes = read_pane_changes(
+        pane,
+        &inputs.last,
+        force_with_input_serial,
+        scene_seqno,
+        inputs.viewer,
+    );
+    PushReading {
+        application_palette,
+        frames,
+        scene_seqno,
+        changes,
+    }
+}
+
+/// Send what `read_for_push` found, and `labels`, read since then. This runs
+/// on the main thread, where every writer of a `PerPane`'s state runs. The
+/// palette goes before the line changes, so a real application override is
+/// installed before those lines paint.
+fn send_push_reading(
+    pane_id: PaneId,
+    reading: PushReading,
+    labels: PaneLabels,
+    sender: &PduSender,
+    per_pane: &Arc<Mutex<PerPane>>,
+) -> anyhow::Result<()> {
+    let PushReading {
+        application_palette,
+        frames,
+        scene_seqno,
+        changes,
+    } = reading;
+    let needs_palette = per_pane
+        .lock()
+        .unwrap()
+        .needs_application_palette(&application_palette);
+    if needs_palette {
+        sender.send(DecodedPdu {
+            pdu: Pdu::SetApplicationPalette(SetApplicationPalette {
+                pane_id,
+                palette: application_palette.clone(),
+            }),
+            serial: 0,
+        })?;
+        per_pane
+            .lock()
+            .unwrap()
+            .record_application_palette(application_palette);
+    }
+
+    if let Some((revision, image_epoch, selections)) = frames {
+        sender.send(DecodedPdu {
+            pdu: Pdu::KittyFrameSelections(KittyFrameSelections {
+                pane_id, image_epoch, now_ms: wezterm_term::kitty_animation::monotonic_ms(), revision, selections,
+            }.fitted()),
+            serial: 0,
+        })?;
+        let mut per_pane = per_pane.lock().unwrap();
+        per_pane.frame_revision = Some(revision);
+        per_pane.scene_seqno = scene_seqno;
+        per_pane.reading_generation += 1;
+    }
+    let changes = changes.map(RawReading::select_rows);
+    let mut per_pane = per_pane.lock().unwrap();
+    let changes = changes.or_else(|| {
+        per_pane
+            .labels_are_news(&labels)
+            .then(|| per_pane.reading_of_nothing_new())
+    });
+    if let Some(changes) = changes {
+        let resp = per_pane.commit_changes(pane_id, changes, labels);
+        sender.send(DecodedPdu {
+            pdu: Pdu::GetPaneRenderChangesResponse(resp),
+            serial: 0,
+        })?;
+    }
+
+    send_pane_alerts(pane_id, sender, &mut per_pane)
 }
 
 /// Read `pane` and push what changed. Nothing of the pane is read while
@@ -790,68 +1440,18 @@ fn maybe_push_pane_changes(
     per_pane: Arc<Mutex<PerPane>>,
     force_with_input_serial: Option<InputSerial>,
 ) -> anyhow::Result<()> {
-    {
+    let inputs = {
         // A connection subscribed to events gets the pane's alerts and
         // none of what it shows.
         let mut per_pane = per_pane.lock().unwrap();
         if per_pane.events_only {
             return send_pane_alerts(pane.pane_id(), &sender, &mut per_pane);
         }
-    }
-    // Application palette provenance must arrive even when the state is
-    // `None`: that explicit reset prevents a server's configured/advisory
-    // palette from taking over client rendering. Send it before line changes
-    // so a real application override is installed before those lines paint.
-    let application_palette = pane.palette_override();
-    let (needs_palette, last, frame_control, frame_revision, mut scene_seqno) = {
-        let per_pane = per_pane.lock().unwrap();
-        (
-            per_pane.needs_application_palette(&application_palette),
-            per_pane.last_sent(),
-            per_pane.frame_control,
-            per_pane.frame_revision,
-            per_pane.scene_seqno,
-        )
+        per_pane.push_inputs()
     };
-    if needs_palette {
-        sender.send(DecodedPdu {
-            pdu: Pdu::SetApplicationPalette(SetApplicationPalette {
-                pane_id: pane.pane_id(),
-                palette: application_palette.clone(),
-            }),
-            serial: 0,
-        })?;
-        per_pane
-            .lock()
-            .unwrap()
-            .record_application_palette(application_palette);
-    }
-
-    if frame_control {
-        if let Some((revision, image_epoch, selections)) = pane.kitty_frame_selections(frame_revision) {
-            scene_seqno = relative_scene_seqno(&selections);
-            sender.send(DecodedPdu {
-                pdu: Pdu::KittyFrameSelections(KittyFrameSelections {
-                    pane_id: pane.pane_id(), image_epoch, now_ms: wezterm_term::kitty_animation::monotonic_ms(), revision, selections,
-                }.fitted()),
-                serial: 0,
-            })?;
-            let mut per_pane = per_pane.lock().unwrap();
-            per_pane.frame_revision = Some(revision);
-            per_pane.scene_seqno = scene_seqno;
-        }
-    }
-    let reading = read_pane_changes(pane, &last, force_with_input_serial, scene_seqno);
-    let mut per_pane = per_pane.lock().unwrap();
-    if let Some(reading) = reading {
-        let resp = per_pane.commit_changes(pane.pane_id(), reading);
-        sender.send(DecodedPdu {
-            pdu: Pdu::GetPaneRenderChangesResponse(resp),
-            serial: 0,
-        })?;
-    }
-
-    send_pane_alerts(pane.pane_id(), &sender, &mut per_pane)
+    let reading = read_for_push(pane.as_ref(), &inputs, force_with_input_serial);
+    let labels = PaneLabels::read(pane);
+    send_push_reading(pane.pane_id(), reading, labels, &sender, &per_pane)
 }
 
 fn send_pane_alerts(
@@ -1026,6 +1626,8 @@ fn requires_existing_frontend_access(pdu: &Pdu) -> bool {
             | Pdu::SpawnV2(_)
             | Pdu::SplitPane(_)
             | Pdu::SpawnPaneInStack(_)
+            | Pdu::SpawnPage(_)
+            | Pdu::ChangePage(_)
             | Pdu::ActivatePaneInStack(_)
             | Pdu::MovePaneToStack(_)
             | Pdu::SwapPanes(_)
@@ -1088,6 +1690,9 @@ pub enum ConnectionPeer {
     /// is not a thing to be able to arrange from off it.
     Tls,
     Web(WebPeer),
+    /// The share socket: another account on this machine, as the kernel
+    /// named it, watching a pane shared with it. See `crate::share`.
+    Share(crate::share::SharePeer),
 }
 
 fn peer_may_import_sessions(peer: &ConnectionPeer) -> bool {
@@ -1156,6 +1761,8 @@ fn web_peer_may_send(pdu: &Pdu) -> bool {
             | Pdu::GetPaneDirection(_)
             | Pdu::AdjustPaneSize(_)
             | Pdu::SpawnPaneInStack(_)
+            | Pdu::SpawnPage(_)
+            | Pdu::ChangePage(_)
             | Pdu::ActivatePaneInStack(_)
             | Pdu::MovePaneToStack(_)
             | Pdu::SwapPanes(_)
@@ -1173,6 +1780,40 @@ fn web_peer_may_send(pdu: &Pdu) -> bool {
     )
 }
 
+/// What a viewer on the share socket may ask for: to see what is shared
+/// with it, to join one share, to read that pane's rows, and to type into
+/// it while its owner lets it. Which pane, and whether typing is allowed
+/// now, is checked again per request (`SessionHandler::share_gate`). The
+/// list names what is allowed, so a request added later is refused here
+/// until someone decides it belongs.
+fn share_peer_may_send(pdu: &Pdu) -> bool {
+    matches!(
+        pdu,
+        Pdu::Ping(_)
+            | Pdu::Pong(_)
+            | Pdu::GetCodecVersion(_)
+            | Pdu::SetClientId(_)
+            | Pdu::ShareIncoming(_)
+            | Pdu::ShareJoin(_)
+            | Pdu::ShareRequestControl(_)
+            | Pdu::ShareReleaseControl(_)
+            | Pdu::GetPaneRenderChanges(_)
+            | Pdu::GetPaneRenderableDimensions(_)
+            | Pdu::GetLines(_)
+            | Pdu::WriteToPane(_)
+            | Pdu::SendKeyDown(_)
+            | Pdu::SendMouseEvent(_)
+            | Pdu::SendPaste(_)
+    )
+}
+
+/// The share a viewer's connection has joined.
+#[derive(Debug, Clone, Copy)]
+struct ShareWatch {
+    share_id: u64,
+    viewer_id: u64,
+}
+
 pub struct SessionHandler {
     to_write_tx: PduSender,
     peer: ConnectionPeer,
@@ -1188,10 +1829,30 @@ pub struct SessionHandler {
     /// The client sent `SubscribeEvents`: it hears of panes appearing,
     /// and its pane pushes carry alerts only.
     pub(crate) events_subscribed: bool,
+    /// On the share socket, once the viewer has joined a share.
+    share_watch: Option<ShareWatch>,
+    /// The pane a viewer watches, `NO_PANE` until it joins: read by the
+    /// connection's notification filter, which runs on whatever thread
+    /// notifies, without a lock.
+    share_pane: Arc<std::sync::atomic::AtomicUsize>,
+    /// A viewer's ask after what is shared with it is being answered.
+    share_asking: Arc<std::sync::atomic::AtomicBool>,
+    /// The person's desktop, once it shared a pane here: what it shared
+    /// ends when this connection does.
+    sharer: Option<crate::share::Sharer>,
 }
+
+/// `SessionHandler::share_pane` before the viewer joins a share.
+pub(crate) const NO_PANE: usize = usize::MAX;
 
 impl Drop for SessionHandler {
     fn drop(&mut self) {
+        if let Some(watch) = self.share_watch.take() {
+            crate::share::leave(watch.viewer_id, watch.share_id);
+        }
+        if let Some(sharer) = self.sharer.take() {
+            sharer.left();
+        }
         for pane in self.per_pane.values() {
             pane.lock().unwrap().set_frame_control(false);
         }
@@ -1222,7 +1883,68 @@ impl SessionHandler {
             proxy_client_id: None,
             plugin_pipe: None,
             events_subscribed: false,
+            share_watch: None,
+            share_pane: Arc::new(std::sync::atomic::AtomicUsize::new(NO_PANE)),
+            share_asking: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sharer: None,
         }
+    }
+
+    /// The pane this connection's viewer watches, for the notification
+    /// filter set up before any request is read.
+    pub(crate) fn share_pane(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.share_pane)
+    }
+
+    /// Whether this connection is a viewer on the share socket.
+    pub(crate) fn is_share_viewer(&self) -> bool {
+        matches!(self.peer, ConnectionPeer::Share(_))
+    }
+
+    /// Whether this viewer may hear about `pane_id`: the pane of the share
+    /// it joined. A viewer removed from it is dropped with its connection.
+    pub(crate) fn share_may_read(&self, pane_id: PaneId) -> bool {
+        self.share_pane.load(std::sync::atomic::Ordering::Relaxed) == pane_id
+    }
+
+    /// For a viewer: refuse what it may not read or type.
+    fn share_gate(&self, pdu: &Pdu) -> anyhow::Result<()> {
+        let (pane_id, typing) = match pdu {
+            Pdu::GetPaneRenderChanges(req) => (req.pane_id, false),
+            Pdu::GetPaneRenderableDimensions(req) => (req.pane_id, false),
+            Pdu::GetLines(req) => (req.pane_id, false),
+            Pdu::WriteToPane(req) => (req.pane_id, true),
+            Pdu::SendKeyDown(req) => (req.pane_id, true),
+            Pdu::SendMouseEvent(req) => {
+                validate_share_mouse_input(&req.event)?;
+                (req.pane_id, true)
+            }
+            Pdu::SendPaste(req) => (req.pane_id, true),
+            _ => return Ok(()),
+        };
+        let watch = self
+            .share_watch
+            .ok_or_else(|| anyhow!("join a share before reading its pane"))?;
+        if typing {
+            anyhow::ensure!(
+                crate::share::may_type(watch.viewer_id, watch.share_id, pane_id),
+                "you can only watch this pane; ask its owner to let you type"
+            );
+            return Ok(());
+        }
+        crate::share::may_read(watch.viewer_id, watch.share_id, pane_id)
+            .ok_or_else(|| anyhow!("pane {pane_id} is not shared with you"))?;
+        Ok(())
+    }
+
+    /// Whether the rows this connection reads of `pane_id` are cut to its
+    /// screen: a viewer of a share made without its history.
+    /// Whether a viewer reads only the screen of `pane_id`: unless its share
+    /// gives it the history, which one it has just left no longer does.
+    fn screen_only(&self, pane_id: PaneId) -> bool {
+        self.share_watch.is_some_and(|watch| {
+            crate::share::may_read(watch.viewer_id, watch.share_id, pane_id) != Some(true)
+        })
     }
 
     /// The pid of the client registered on this connection, when it
@@ -1297,9 +2019,11 @@ impl SessionHandler {
 
     pub(crate) fn per_pane(&mut self, pane_id: PaneId) -> Arc<Mutex<PerPane>> {
         let events_only = self.events_subscribed;
+        let viewer = self.is_share_viewer();
         Arc::clone(self.per_pane.entry(pane_id).or_insert_with(|| {
             Arc::new(Mutex::new(PerPane {
                 events_only,
+                viewer,
                 ..PerPane::default()
             }))
         }))
@@ -1309,7 +2033,9 @@ impl SessionHandler {
     fn subscribe_events(&mut self) {
         self.events_subscribed = true;
         for per_pane in self.per_pane.values() {
-            per_pane.lock().unwrap().events_only = true;
+            let mut per_pane = per_pane.lock().unwrap();
+            per_pane.events_only = true;
+            per_pane.reading_generation += 1;
         }
     }
 
@@ -1344,6 +2070,7 @@ impl SessionHandler {
                 client_id: self.client_id.clone(),
                 registration: self.client_registration,
                 palette_session_id: self.palette_session_id,
+                share: self.share_watch,
             };
             spawn_into_main_thread(drain_pane_inputs(
                 pane_id,
@@ -1361,10 +2088,24 @@ impl SessionHandler {
         // One push on its way per pane. A burst of output notifications
         // used to queue a task each, and all but the first found nothing
         // new to send.
-        if !per_pane.lock().unwrap().claim_push() {
+        if !per_pane.lock().unwrap().claim_push_for_output() {
             return;
         }
         spawn_into_main_thread(push_pane_changes_when_free(pane_id, sender, per_pane)).detach();
+    }
+
+    fn connect_endpoint(&self) -> anyhow::Result<Pdu> {
+        if !matches!(self.peer, ConnectionPeer::Local) {
+            anyhow::bail!("Connect local endpoint is unavailable");
+        }
+        let mux = Mux::get();
+        let service = mux.connect_service()?;
+        Ok(Pdu::GetConnectEndpointResponse(
+            GetConnectEndpointResponse {
+                server_id: mux.runtime_server_id().to_string(),
+                address: service.name().to_string(),
+            },
+        ))
     }
 
     pub fn process_one(&mut self, decoded: DecodedPdu) {
@@ -1402,6 +2143,27 @@ impl SessionHandler {
                 "{} is not available to a web session",
                 decoded.pdu.pdu_name()
             )));
+            return;
+        }
+
+        if self.is_share_viewer() {
+            if !share_peer_may_send(&decoded.pdu) {
+                send_response(Err(anyhow!(
+                    "{} is not available to a viewer of a shared pane",
+                    decoded.pdu.pdu_name()
+                )));
+                return;
+            }
+            if let Err(err) = self.share_gate(&decoded.pdu) {
+                send_response(Err(err));
+                return;
+            }
+        }
+
+        // The terminals of the machines a window is connected to, as far as
+        // its Settings let the programs on this one have them.
+        if let Err(err) = crate::foreign_panes::gate(&decoded.pdu) {
+            send_response(Err(err));
             return;
         }
 
@@ -1444,6 +2206,12 @@ impl SessionHandler {
                     )
                 })
                 .detach();
+            }
+            // A viewer is not one of the owner's frontends: it is not
+            // registered, so it holds no lease and sizes nothing, and it
+            // is not told the owner's frontend state or palette.
+            Pdu::SetClientId(_) if self.is_share_viewer() => {
+                send_response(Ok(Pdu::UnitResponse(UnitResponse {})));
             }
             Pdu::SetClientId(SetClientId {
                 mut client_id,
@@ -1586,6 +2354,9 @@ impl SessionHandler {
                                 let Some(status) = pane.agent_status() else {
                                     continue;
                                 };
+                                if crate::foreign_panes::hidden(pane.pane_id()) {
+                                    continue;
+                                }
                                 agents.push((pane.pane_id(), status, pane.get_title()));
                             }
                             if agents.is_empty() {
@@ -1640,6 +2411,9 @@ impl SessionHandler {
                                 .iter_panes()
                                 .into_iter()
                                 .filter_map(|pane| {
+                                    if crate::foreign_panes::hidden(pane.pane_id()) {
+                                        return None;
+                                    }
                                     let program = pane.foreground_program()?;
                                     Some(ForegroundProgramEntry {
                                         pane_id: pane.pane_id(),
@@ -1679,20 +2453,47 @@ impl SessionHandler {
                             let mut tabs = vec![];
                             let mut tab_titles = vec![];
                             let mut window_titles = HashMap::new();
+                            let mut pane_machines = HashMap::new();
+                            let mut pane_pages = HashMap::new();
                             for window_id in mux.iter_windows().into_iter() {
                                 let window = mux.get_window(window_id).unwrap();
                                 window_titles.insert(window_id, window.get_title().to_string());
                                 for tab in window.iter() {
-                                    tabs.push(tab.codec_pane_tree());
+                                    let tree = crate::foreign_panes::visible_tree(
+                                        tab.codec_pane_tree(),
+                                        &crate::foreign_panes::hidden,
+                                    );
+                                    if matches!(tree, mux::tab::PaneNode::Empty) {
+                                        continue;
+                                    }
+                                    for pane in tree.entries() {
+                                        if let Some(machine) =
+                                            crate::foreign_panes::machine(pane.pane_id)
+                                        {
+                                            pane_machines.insert(pane.pane_id, machine);
+                                        }
+                                        let page = mux
+                                            .get_pane(pane.pane_id)
+                                            .and_then(|pane| pane.page());
+                                        if let Some(page) = page {
+                                            pane_pages.insert(pane.pane_id, page);
+                                        }
+                                    }
+                                    tabs.push(tree);
                                     tab_titles.push(tab.get_title());
                                 }
                             }
                             log::trace!("ListPanes {tabs:#?} {tab_titles:?}");
+                            let mut pane_labels = mux.pane_labels();
+                            pane_labels
+                                .retain(|pane_id, _| !crate::foreign_panes::hidden(*pane_id));
                             Ok(Pdu::ListPanesResponse(ListPanesResponse {
                                 tabs,
                                 tab_titles,
                                 window_titles,
-                                pane_labels: mux.pane_labels(),
+                                pane_labels,
+                                pane_machines,
+                                pane_pages,
                             }))
                         },
                         send_response,
@@ -2063,6 +2864,16 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::SpawnPage(request) => {
+                spawn_into_main_thread(async move {
+                    promise::spawn::spawn(async move {
+                        send_response(spawn_page(request).await)
+                    })
+                    .detach();
+                })
+                .detach();
+            }
+
             Pdu::ActivatePaneInStack(request) => {
                 let client_id = self.client_id.clone();
                 let registration = self.client_registration;
@@ -2399,6 +3210,13 @@ impl SessionHandler {
 
             Pdu::GetPaneRenderableDimensions(GetPaneRenderableDimensions { pane_id }) => {
                 spawn_into_main_thread(async move {
+                    // Another machine's pane, as that machine has it.
+                    if let Some(fetched) =
+                        crate::foreign_panes::dimensions_from_its_machine(pane_id).await
+                    {
+                        send_response(fetched.map(Pdu::GetPaneRenderableDimensionsResponse));
+                        return;
+                    }
                     catch(
                         move || {
                             let mux = Mux::get();
@@ -2486,6 +3304,7 @@ impl SessionHandler {
                         }
                         state.frame_revision = Some(snapshot.0);
                         state.scene_seqno = relative_scene_seqno(&snapshot.2);
+                        state.reading_generation += 1;
                         (snapshot.0, snapshot.1, snapshot.2, state.scene_seqno != 0)
                     };
                     send_response(Ok(Pdu::KittyFrameSelections(KittyFrameSelections { pane_id, image_epoch, now_ms: wezterm_term::kitty_animation::monotonic_ms(), revision, selections }.fitted())));
@@ -2500,7 +3319,28 @@ impl SessionHandler {
             Pdu::GetLines(GetLines { pane_id, lines }) => {
                 let per_pane = self.per_pane(pane_id);
                 let sender = self.to_write_tx.clone();
+                let screen_only = self.screen_only(pane_id);
+                // A viewer's ask is held to what a viewer needs: each row
+                // once, and not without end (see `share::viewer_rows`).
+                let lines = if self.is_share_viewer() {
+                    crate::share::viewer_rows(lines)
+                } else {
+                    lines
+                };
                 spawn_into_main_thread(async move {
+                    // The upstream connection belongs to the owner and
+                    // does not carry this viewer's history restriction.
+                    // Screen-only shares must use get_screen_lines below.
+                    if !screen_only {
+                        if let Some(fetched) =
+                            crate::foreign_panes::lines_from_its_machine(pane_id, lines.clone()).await
+                        {
+                            send_response(fetched.map(|lines| {
+                                Pdu::GetLinesResponse(GetLinesResponse { pane_id, lines })
+                            }));
+                            return;
+                        }
+                    }
                     // Read once the pane can be read without waiting, like
                     // a push: the client asks again for rows it does not
                     // get, and the main thread has everyone else's work.
@@ -2533,7 +3373,17 @@ impl SessionHandler {
                                 if range.start > range.end {
                                     continue;
                                 }
-                                let (first_row, lines) = pane.get_lines(range);
+                                // A viewer without the history gets what is
+                                // on the screen as the rows are read: rows
+                                // are numbered afresh on the alternate
+                                // screen and move when the pane is
+                                // reflowed, so no row number marks where
+                                // the share began.
+                                let (first_row, lines) = if screen_only {
+                                    pane.get_screen_lines(range)
+                                } else {
+                                    pane.get_lines(range)
+                                };
                                 for (idx, mut line) in lines.into_iter().enumerate() {
                                     let stable_row = first_row + idx as StableRowIndex;
                                     line.compress_for_scrollback();
@@ -2680,6 +3530,17 @@ impl SessionHandler {
                 .detach();
             }
 
+            // Where the owner's executable and config live is nothing a
+            // viewer needs.
+            Pdu::GetCodecVersion(_) if self.is_share_viewer() => {
+                send_response(Ok(Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                    codec_vers: CODEC_VERSION,
+                    version_string: config::wezterm_version().to_owned(),
+                    server_id: Mux::get().runtime_server_id().to_string(),
+                    executable_path: std::path::PathBuf::new(),
+                    config_file_path: None,
+                })))
+            }
             Pdu::GetCodecVersion(_) => {
                 match std::env::current_exe().context("resolving current_exe") {
                     Err(err) => send_response(Err(err)),
@@ -2695,6 +3556,8 @@ impl SessionHandler {
                     }
                 }
             }
+
+            Pdu::GetConnectEndpoint(_) => send_response(self.connect_endpoint()),
 
             // Carried to the plugin host unread; see plugin_relay.
             Pdu::PluginFrame(PluginFrame { data }) => {
@@ -2883,6 +3746,21 @@ impl SessionHandler {
                 })
                 .detach();
             }
+            Pdu::ChangePage(ChangePage { pane_id, edit }) => {
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            Mux::get()
+                                .get_pane(pane_id)
+                                .ok_or_else(|| anyhow!("no such pane {pane_id}"))?
+                                .change_page(edit)?;
+                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
             Pdu::GetWorkspaceNames(GetWorkspaceNames {}) => {
                 // The desktop's namer reads its own store, which its main
                 // thread keeps.
@@ -2960,6 +3838,188 @@ impl SessionHandler {
                 .detach();
             }
 
+            // The owner's side. Not on the web or viewer allowlists, so
+            // only this machine's own clients and mTLS reach these.
+            // The accounts and groups it names are looked up, maybe in a
+            // directory slow to answer: on a thread of its own, not the main
+            // one every pane goes through.
+            Pdu::ShareStart(request) => {
+                let sender = self.to_write_tx.clone();
+                let sharer = self.sharer.get_or_insert_with(Default::default).clone();
+                let spawned = std::thread::Builder::new()
+                    .name("share-start".into())
+                    .spawn(move || {
+                        let pdu = match crate::share::start(request, sharer) {
+                            Ok(info) => Pdu::ShareListResponse(ShareListResponse {
+                                shares: vec![info],
+                            }),
+                            Err(err) => Pdu::ErrorResponse(ErrorResponse {
+                                reason: format!("Error: {err:#}"),
+                            }),
+                        };
+                        let _ = sender.send(DecodedPdu { serial, pdu });
+                    });
+                if let Err(err) = spawned {
+                    send_response(Err(anyhow!("cannot start sharing: {err:#}")));
+                }
+            }
+            Pdu::ShareList(_) => send_response(Ok(Pdu::ShareListResponse(ShareListResponse {
+                shares: crate::share::list(),
+            }))),
+            Pdu::ShareStop(ShareStop { share_id }) => send_response(
+                crate::share::stop(share_id).map(|()| Pdu::UnitResponse(UnitResponse {})),
+            ),
+            Pdu::ShareKick(ShareKick {
+                share_id,
+                viewer_id,
+            }) => send_response(
+                crate::share::kick(share_id, viewer_id)
+                    .map(|()| Pdu::UnitResponse(UnitResponse {})),
+            ),
+            Pdu::ShareGrant(ShareGrant {
+                share_id,
+                viewer_id,
+                for_secs,
+                from_desktop,
+            }) => send_response(
+                crate::share::grant(share_id, viewer_id, for_secs, from_desktop)
+                    .map(|()| Pdu::UnitResponse(UnitResponse {})),
+            ),
+            Pdu::ShareRevoke(ShareRevoke { share_id }) => send_response(
+                crate::share::revoke(share_id).map(|()| Pdu::UnitResponse(UnitResponse {})),
+            ),
+            // Looked up off the main thread: the directory service may be
+            // slow to answer.
+            Pdu::ShareCandidates(_) => {
+                let sender = self.to_write_tx.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("share-candidates".into())
+                    .spawn(move || {
+                        let _ = sender.send(DecodedPdu {
+                            serial,
+                            pdu: Pdu::ShareCandidatesResponse(
+                                crate::share::candidates_to_share_with(),
+                            ),
+                        });
+                    });
+                if let Err(err) = spawned {
+                    send_response(Err(anyhow!("cannot list the accounts here: {err:#}")));
+                }
+            }
+            Pdu::ShareDeny(ShareDeny {
+                share_id,
+                viewer_id,
+            }) => send_response(
+                crate::share::deny(share_id, viewer_id)
+                    .map(|()| Pdu::UnitResponse(UnitResponse {})),
+            ),
+
+            // What other accounts here share with ours. Each of their
+            // servers is asked in turn, which may take a few seconds when
+            // one does not answer: done on a thread of its own.
+            Pdu::ShareDiscover(_) => {
+                let sender = self.to_write_tx.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("share-discover".into())
+                    .spawn(move || {
+                        let incoming = smol::block_on(wezterm_client::share::incoming());
+                        let owners = incoming
+                            .found
+                            .into_iter()
+                            .map(|(_, response)| response)
+                            .collect();
+                        let watch_program = std::env::current_exe()
+                            .ok()
+                            .and_then(|exe| exe.parent().map(|dir| dir.join("thinkterm")))
+                            .filter(|program| program.exists());
+                        let _ = sender.send(DecodedPdu {
+                            serial,
+                            pdu: Pdu::ShareDiscoverResponse(ShareDiscoverResponse {
+                                owners,
+                                other_version: incoming.other_version,
+                                watch_program,
+                            }),
+                        });
+                    });
+                if let Err(err) = spawned {
+                    send_response(Err(anyhow!("cannot look for shared panes: {err:#}")));
+                }
+            }
+
+            // The viewer's side, on the share socket only: who the viewer
+            // is comes from there.
+            // A group is looked up to answer, maybe in a directory slow to
+            // answer: on a thread of its own, one at a time, so that no
+            // viewer holds up the threads every connection shares.
+            Pdu::ShareIncoming(_) => {
+                let ConnectionPeer::Share(peer) = &self.peer else {
+                    send_response(Err(anyhow!("ask for shared panes on the share socket")));
+                    return;
+                };
+                if self.share_asking.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    send_response(Err(anyhow!("still answering the last ask")));
+                    return;
+                }
+                let peer = peer.clone();
+                let asking = Arc::clone(&self.share_asking);
+                let sender = self.to_write_tx.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("share-incoming".into())
+                    .spawn(move || {
+                        let response = crate::share::incoming(&peer);
+                        asking.store(false, std::sync::atomic::Ordering::SeqCst);
+                        let _ = sender.send(DecodedPdu {
+                            serial,
+                            pdu: Pdu::ShareIncomingResponse(response),
+                        });
+                    });
+                if let Err(err) = spawned {
+                    self.share_asking
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    send_response(Err(anyhow!("cannot look for shared panes: {err:#}")));
+                }
+            }
+            Pdu::ShareJoin(ShareJoin { share_id }) => {
+                let ConnectionPeer::Share(peer) = &self.peer else {
+                    send_response(Err(anyhow!("join a share on the share socket")));
+                    return;
+                };
+                if self.share_watch.is_some() {
+                    send_response(Err(anyhow!("this connection already watches a share")));
+                    return;
+                }
+                match crate::share::join(peer, share_id, self.to_write_tx.clone()) {
+                    Ok(joined) => {
+                        self.share_watch = Some(ShareWatch {
+                            share_id,
+                            viewer_id: joined.viewer_id,
+                        });
+                        self.share_pane
+                            .store(joined.pane_id, std::sync::atomic::Ordering::Relaxed);
+                        send_response(Ok(Pdu::ShareJoinResponse(joined)));
+                    }
+                    Err(err) => send_response(Err(err)),
+                }
+            }
+            Pdu::ShareRequestControl(ShareRequestControl { share_id }) => {
+                let result = match self.share_watch {
+                    Some(watch) if watch.share_id == share_id => {
+                        crate::share::request_control(watch.viewer_id, share_id)
+                    }
+                    _ => Err(anyhow!("you are not watching share {share_id}")),
+                };
+                send_response(result.map(|()| Pdu::UnitResponse(UnitResponse {})));
+            }
+            Pdu::ShareReleaseControl(ShareReleaseControl { share_id }) => {
+                let result = match self.share_watch {
+                    Some(watch) if watch.share_id == share_id => {
+                        crate::share::release_control(watch.viewer_id, share_id)
+                    }
+                    _ => Err(anyhow!("you are not watching share {share_id}")),
+                };
+                send_response(result.map(|()| Pdu::UnitResponse(UnitResponse {})));
+            }
+
             Pdu::Invalid { .. } => send_response(Err(anyhow!("invalid PDU {:?}", decoded.pdu))),
             // The answer to this connection's liveness probe. Arriving at
             // all is the answer; there is nothing to reply, and replying
@@ -2982,6 +4042,8 @@ impl SessionHandler {
             | Pdu::SetClipboard { .. }
             | Pdu::NotifyAlert { .. }
             | Pdu::SpawnResponse { .. }
+            | Pdu::SpawnPageResponse { .. }
+            | Pdu::PageChanged { .. }
             | Pdu::GetPaneRenderChangesResponse { .. }
             | Pdu::GetServerOsReleaseResponse { .. }
             | Pdu::UnitResponse { .. }
@@ -2990,6 +4052,7 @@ impl SessionHandler {
             | Pdu::SearchScrollbackResponse { .. }
             | Pdu::GetLinesResponse { .. }
             | Pdu::GetCodecVersionResponse { .. }
+            | Pdu::GetConnectEndpointResponse { .. }
             | Pdu::WindowWorkspaceChanged { .. }
             | Pdu::GetTlsCredsResponse { .. }
             | Pdu::WebTokenMintResponse { .. }
@@ -3014,6 +4077,12 @@ impl SessionHandler {
             | Pdu::EnsureThinkTermThreadResponse { .. }
             | Pdu::ClientViewportState { .. }
             | Pdu::FrontendAccessState { .. }
+            | Pdu::ShareListResponse { .. }
+            | Pdu::ShareIncomingResponse { .. }
+            | Pdu::ShareJoinResponse { .. }
+            | Pdu::ShareStateChanged { .. }
+            | Pdu::ShareDiscoverResponse { .. }
+            | Pdu::ShareCandidatesResponse { .. }
             | Pdu::ErrorResponse { .. } => {
                 send_response(Err(anyhow!("expected a request, got {:?}", decoded.pdu)))
             }
@@ -3230,6 +4299,87 @@ async fn spawn_pane_in_stack(request: SpawnPaneInStack) -> anyhow::Result<Pdu> {
     }))
 }
 
+/// Opens a plugin's page where the request says: a pane that runs nothing,
+/// placed as a terminal would be.
+async fn spawn_page(request: SpawnPage) -> anyhow::Result<Pdu> {
+    let mux = Mux::get();
+    // No identity, as for the spawns above: the workspace of a new window
+    // is on the wire, and none is read.
+    let SpawnPage { page, place, size } = request;
+    match place {
+        PagePlace::Tab {
+            window_id,
+            workspace,
+            pane_id,
+        } => {
+            crate::session_import::ensure_not_pending(&workspace)?;
+            let domain = config::keyassignment::SpawnTabDomain::CurrentPaneDomain;
+            let (tab, pane, window_id) = mux
+                .spawn_page_tab(window_id, domain, page, size, pane_id, workspace)
+                .await?;
+            spawned_page(&pane, tab.tab_id(), window_id, tab.get_size())
+        }
+        PagePlace::Stack { pane_id } => {
+            let (_, window_id, tab_id) = mux
+                .resolve_pane_id(pane_id)
+                .ok_or_else(|| anyhow!("pane_id {} invalid", pane_id))?;
+            // It joins the stack in the base pane's place, at its size.
+            let base = mux
+                .get_pane(pane_id)
+                .ok_or_else(|| anyhow!("pane_id {} invalid", pane_id))?;
+            let dims = base.get_dimensions();
+            let size = ::wezterm_term::TerminalSize {
+                rows: dims.viewport_rows,
+                cols: dims.cols,
+                pixel_width: dims.pixel_width,
+                pixel_height: dims.pixel_height,
+                dpi: dims.dpi,
+            };
+            let pane = mux
+                .spawn_page_in_stack(pane_id, SpawnTabDomain::CurrentPaneDomain, page, size)
+                .await?;
+            spawned_page(&pane, tab_id, window_id, size)
+        }
+        PagePlace::Split {
+            pane_id,
+            split_request,
+        } => {
+            let (_, window_id, tab_id) = mux
+                .resolve_pane_id(pane_id)
+                .ok_or_else(|| anyhow!("pane_id {} invalid", pane_id))?;
+            let (pane, size) = mux
+                .split_pane(
+                    pane_id,
+                    split_request,
+                    SplitSource::Page(page),
+                    config::keyassignment::SpawnTabDomain::CurrentPaneDomain,
+                )
+                .await?;
+            spawned_page(&pane, tab_id, window_id, size)
+        }
+    }
+}
+
+/// What the page in `pane`, just opened, is said to be: the page as this
+/// mux keeps it, with its id and where it was opened from.
+fn spawned_page(
+    pane: &Arc<dyn Pane>,
+    tab_id: TabId,
+    window_id: mux::window::WindowId,
+    size: ::wezterm_term::TerminalSize,
+) -> anyhow::Result<Pdu> {
+    let page = pane
+        .page()
+        .ok_or_else(|| anyhow!("pane {} opened as a page holds none", pane.pane_id()))?;
+    Ok(Pdu::SpawnPageResponse(SpawnPageResponse {
+        pane_id: pane.pane_id(),
+        tab_id,
+        window_id,
+        size,
+        page,
+    }))
+}
+
 async fn split_pane(split: SplitPane) -> anyhow::Result<Pdu> {
     let mux = Mux::get();
     // No identity: `Mux::split_pane` reads none, and a guard held across the
@@ -3391,15 +4541,235 @@ mod web_server_address_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        claim_viewport_for_pane, requires_existing_frontend_access, workspace_for_moved_pane,
-        InputDrain, PaneInput, PerPane, QueuedInput,
+        claim_viewport_for_pane, requires_existing_frontend_access, send_push_reading,
+        workspace_for_moved_pane, InputDrain, PaneInput, PaneLabels, PaneReading, PduSender,
+        PerPane, PushReading, QueuedInput,
     };
-    use codec::{EnsureThinkTermThread, Pdu};
+    use codec::{EnsureThinkTermThread, Pdu, WireKeyboardEncoding};
     use mux::client::ClientId;
+    use mux::renderable::{RenderableDimensions, StableCursorPosition};
     use mux::Mux;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use termwiz::surface::SequenceNo;
     use wezterm_term::color::ColorPalette;
     use wezterm_term::TerminalSize;
+
+    fn mouse_input(
+        kind: wezterm_term::MouseEventKind,
+        button: wezterm_term::MouseButton,
+    ) -> wezterm_term::MouseEvent {
+        wezterm_term::MouseEvent {
+            kind,
+            x: 3,
+            y: 4,
+            x_pixel_offset: 1,
+            y_pixel_offset: 2,
+            button,
+            modifiers: termwiz::input::Modifiers::SHIFT,
+        }
+    }
+
+    fn typing_viewer(sender: super::PduSender) -> super::SessionHandler {
+        let peer = crate::share::SharePeer::new(u32::MAX - 1, "viewer".into(), u32::MAX - 1);
+        let (share_id, viewer_id) = crate::share::share_for_test(7, false, &peer);
+        let mut handler =
+            super::SessionHandler::for_peer(sender, super::ConnectionPeer::Share(peer));
+        handler.share_watch = Some(super::ShareWatch {
+            share_id,
+            viewer_id,
+        });
+        handler
+            .share_pane
+            .store(7, std::sync::atomic::Ordering::Relaxed);
+        crate::share::grant_for_test(share_id, viewer_id);
+        handler
+    }
+
+    #[test]
+    fn a_viewers_wheel_count_is_bounded_before_queueing_and_replay() {
+        use super::{apply_mouse_input, PduSender, SHARE_WHEEL_NOTCH_LIMIT};
+        use std::sync::Mutex;
+        use wezterm_term::{MouseButton as MB, MouseEventKind as MK};
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&sent);
+        let mut handler = typing_viewer(PduSender::new(move |pdu| {
+            sink.lock().unwrap().push(pdu);
+            Ok(())
+        }));
+        for kind in [MK::Press, MK::Release, MK::Move] {
+            for wheel in [
+                MB::WheelUp as fn(usize) -> MB,
+                MB::WheelDown,
+                MB::WheelLeft,
+                MB::WheelRight,
+            ] {
+                for count in [
+                    0,
+                    1,
+                    2,
+                    SHARE_WHEEL_NOTCH_LIMIT,
+                    SHARE_WHEEL_NOTCH_LIMIT + 1,
+                    usize::MAX,
+                ] {
+                    let event = mouse_input(kind, wheel(count));
+                    let request = Pdu::SendMouseEvent(codec::SendMouseEvent { pane_id: 7, event });
+                    let mut wire = Vec::new();
+                    request.encode(&mut wire, 19).unwrap();
+                    let decoded = Pdu::decode(&wire[..]).unwrap();
+                    assert_eq!(decoded.pdu, request);
+                    let mut applied = Vec::new();
+                    let replay = apply_mouse_input(7, handler.share_watch, event, |event| {
+                        anyhow::ensure!(
+                            applied.len() <= SHARE_WHEEL_NOTCH_LIMIT,
+                            "stop a regressed replay before the test exhausts memory"
+                        );
+                        applied.push(event);
+                        Ok(())
+                    });
+                    if count > SHARE_WHEEL_NOTCH_LIMIT {
+                        assert!(replay.is_err());
+                        assert!(applied.is_empty(), "no partial replay of an invalid count");
+                        handler.process_one(decoded);
+                        let response = sent.lock().unwrap().pop().unwrap();
+                        assert_eq!(response.serial, 19);
+                        assert!(matches!(response.pdu, Pdu::ErrorResponse(ref err)
+                            if err.reason.contains("at most 256 wheel notches")));
+                        assert!(
+                            handler.per_pane.is_empty(),
+                            "refused before creating a queue"
+                        );
+                    } else {
+                        handler.share_gate(&decoded.pdu).unwrap();
+                        replay.unwrap();
+                        let expected = mouse_input(kind, wheel(if count > 1 { 1 } else { count }));
+                        assert_eq!(applied, vec![expected; count.max(1)]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_replay_preserves_nonwheel_events_and_nonviewer_counts() {
+        use super::{apply_mouse_input, PduSender, SHARE_WHEEL_NOTCH_LIMIT};
+        use wezterm_term::{MouseButton as MB, MouseEventKind as MK};
+
+        let handler = typing_viewer(PduSender::new(|_| Ok(())));
+        for kind in [MK::Press, MK::Release, MK::Move] {
+            for button in [MB::Left, MB::Middle, MB::Right, MB::None] {
+                let event = mouse_input(kind, button);
+                for share in [None, handler.share_watch] {
+                    let mut applied = Vec::new();
+                    apply_mouse_input(7, share, event, |event| {
+                        applied.push(event);
+                        Ok(())
+                    })
+                    .unwrap();
+                    assert_eq!(applied, vec![event]);
+                }
+            }
+        }
+        let count = SHARE_WHEEL_NOTCH_LIMIT + 1;
+        let mut applied = Vec::new();
+        apply_mouse_input(
+            7,
+            None,
+            mouse_input(MK::Press, MB::WheelUp(count)),
+            |event| {
+                applied.push(event);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(applied, vec![mouse_input(MK::Press, MB::WheelUp(1)); count]);
+    }
+
+    #[test]
+    fn a_viewers_wheel_replay_stops_when_typing_is_revoked() {
+        use super::{apply_mouse_input, PduSender};
+        use wezterm_term::{MouseButton as MB, MouseEventKind as MK};
+
+        let handler = typing_viewer(PduSender::new(|_| Ok(())));
+        let watch = handler.share_watch.unwrap();
+        let event = mouse_input(MK::Press, MB::WheelDown(4));
+        let request = Pdu::SendMouseEvent(codec::SendMouseEvent { pane_id: 7, event });
+        handler.share_gate(&request).unwrap();
+        let mut applied = 0;
+        let err = apply_mouse_input(7, Some(watch), event, |_| {
+            applied += 1;
+            if applied == 2 {
+                crate::share::revoke(watch.share_id)?;
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("taken typing back"));
+        assert_eq!(applied, 2);
+        assert!(handler.share_gate(&request).is_err());
+        assert!(apply_mouse_input(7, Some(watch), event, |_| {
+            panic!("input revoked while queued must not be applied")
+        })
+        .is_err());
+    }
+
+    // A single range is what a viewer asks for here.
+    #[allow(clippy::single_range_in_vec_init)]
+    #[test]
+    fn a_viewer_reads_only_its_pane_and_types_only_when_let() {
+        use codec::{GetLines, GetPaneRenderChanges, SendPaste};
+        let peer = crate::share::SharePeer::new(u32::MAX - 1, "viewer".into(), u32::MAX - 1);
+        let (share_id, viewer_id) = crate::share::share_for_test(7, false, &peer);
+        let mut handler = super::SessionHandler::for_peer(
+            super::PduSender::new(|_| Ok(())),
+            super::ConnectionPeer::Share(peer),
+        );
+
+        // Before joining, nothing of any pane.
+        let lines = Pdu::GetLines(GetLines {
+            pane_id: 7,
+            lines: vec![0..200],
+        });
+        assert!(handler.share_gate(&lines).is_err());
+        assert!(!handler.share_may_read(7));
+
+        handler.share_watch = Some(super::ShareWatch {
+            share_id,
+            viewer_id,
+        });
+        handler
+            .share_pane
+            .store(7, std::sync::atomic::Ordering::Relaxed);
+        // Its pane, cut to the screen when the rows are read.
+        handler.share_gate(&lines).unwrap();
+        assert!(handler.screen_only(7));
+        // Another pane is not shared with it.
+        let other = Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id: 8 });
+        assert!(handler.share_gate(&other).is_err());
+        assert!(handler.share_may_read(7));
+        assert!(!handler.share_may_read(8));
+
+        // Typing waits for the owner.
+        let paste = Pdu::SendPaste(SendPaste {
+            pane_id: 7,
+            data: "rm -rf ~\n".into(),
+        });
+        assert!(handler.share_gate(&paste).is_err());
+        crate::share::grant_for_test(share_id, viewer_id);
+        handler.share_gate(&paste).unwrap();
+
+        // Nothing off the list gets as far as the gate.
+        assert!(!super::share_peer_may_send(&Pdu::KillPane(codec::KillPane { pane_id: 7 })));
+        assert!(!super::share_peer_may_send(&Pdu::ListPanes(codec::ListPanes {})));
+        assert!(!super::share_peer_may_send(&Pdu::GetTlsCreds(codec::GetTlsCreds {})));
+        assert!(!super::share_peer_may_send(&Pdu::ShareList(codec::ShareList {})));
+        assert!(super::share_peer_may_send(&Pdu::ShareJoin(codec::ShareJoin { share_id })));
+
+        // Leaving takes the viewer out of the share.
+        drop(handler);
+        assert_eq!(crate::share::may_read(viewer_id, share_id, 7), None);
+    }
 
     #[test]
     fn only_a_client_registered_on_the_socket_itself_is_direct() {
@@ -3689,6 +5059,244 @@ mod tests {
     }
 
     #[test]
+    fn a_reading_made_by_the_parser_is_followed_by_what_landed_after_it() {
+        let mut state = PerPane::default();
+        assert!(state.claim_push());
+        assert!(
+            !state.finish_push(),
+            "nothing landed: the push is over and the slot free"
+        );
+
+        assert!(state.claim_push(), "the slot was free");
+        assert!(!state.claim_push(), "output lands on a push on its way");
+        assert!(
+            state.finish_push(),
+            "it may not be in the reading, and nothing else will carry it"
+        );
+        assert!(
+            !state.claim_push(),
+            "going round keeps the slot, so there is one push at a time"
+        );
+        state.release_push();
+        assert!(
+            !state.finish_push(),
+            "a release reads past what landed before it"
+        );
+    }
+
+    fn no_labels() -> PaneLabels {
+        PaneLabels {
+            title: String::new(),
+            working_dir: None,
+        }
+    }
+
+    #[test]
+    fn a_reading_overtaken_on_its_way_back_can_tell() {
+        let mut state = PerPane::default();
+        let asked = state.push_inputs();
+        assert_eq!(state.reading_generation, asked.generation);
+
+        state.set_frame_control(true);
+        assert_ne!(
+            state.reading_generation, asked.generation,
+            "what the reading was held against has moved"
+        );
+
+        let asked = state.push_inputs();
+        state.commit_changes(1, reading_at(7), no_labels());
+        assert_ne!(
+            state.reading_generation, asked.generation,
+            "a push made here since would be covered up by an older screen"
+        );
+
+        let asked = state.push_inputs();
+        state.record_application_palette(Some(ColorPalette::default()));
+        assert_ne!(
+            state.reading_generation, asked.generation,
+            "an older reading would put the palette back"
+        );
+    }
+
+    #[test]
+    fn a_reading_overtaken_by_a_subscription_to_events_can_tell() {
+        use super::SessionHandler;
+        let mut handler = SessionHandler::new(PduSender::new(|_| Ok(())));
+        let per_pane = handler.per_pane(1);
+        let asked = per_pane.lock().unwrap().push_inputs();
+        handler.subscribe_events();
+        let generation = per_pane.lock().unwrap().reading_generation;
+        assert_ne!(
+            generation, asked.generation,
+            "the connection no longer wants what the reading found"
+        );
+    }
+
+    /// What a key sets off is the next thing to go out, however soon: the
+    /// push the key itself made holds nothing back, and neither does one
+    /// that set out when the key was written and found nothing yet.
+    #[test]
+    fn a_push_holds_back_the_next_only_if_it_sent_output() {
+        // Far longer than this could ever take, so only the rule is tested.
+        let frame = Duration::from_secs(3600);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let sender = PduSender::new(|_| Ok(()));
+        let due_now = || {
+            per_pane
+                .lock()
+                .unwrap()
+                .push_pause(frame, Instant::now())
+                .is_zero()
+        };
+
+        let nothing = PushReading {
+            application_palette: None,
+            frames: None,
+            scene_seqno: 0,
+            changes: None,
+        };
+        per_pane.lock().unwrap().claim_push();
+        send_push_reading(1, nothing, no_labels(), &sender, &per_pane).unwrap();
+        per_pane.lock().unwrap().release_push();
+        assert!(due_now(), "nothing went out");
+
+        let mut key = reading_at(1);
+        key.input_serial = Some(codec::InputSerial::now());
+        per_pane.lock().unwrap().commit_changes(1, key, no_labels());
+        assert!(due_now(), "that answered a key");
+
+        per_pane
+            .lock()
+            .unwrap()
+            .commit_changes(1, reading_at(2), no_labels());
+        assert!(!due_now(), "a frame went out");
+    }
+
+    /// The window redraws its title on the alert, from what the last push
+    /// said, and nothing tells it to look again: the alert has to come after
+    /// the title it is about, whatever else there was to say.
+    #[test]
+    fn a_title_goes_out_ahead_of_its_alert() {
+        use codec::DecodedPdu;
+        use wezterm_term::Alert;
+
+        let sent: Arc<Mutex<Vec<DecodedPdu>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&sent);
+        let sender = PduSender::new(move |pdu| {
+            sink.lock().unwrap().push(pdu);
+            Ok(())
+        });
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        per_pane
+            .lock()
+            .unwrap()
+            .notifications
+            .push(Alert::WindowTitleChanged("vim".to_string()));
+        let nothing = PushReading {
+            application_palette: Some(ColorPalette::default()),
+            frames: None,
+            scene_seqno: 0,
+            changes: None,
+        };
+        let labels = PaneLabels {
+            title: "vim".to_string(),
+            working_dir: None,
+        };
+        send_push_reading(1, nothing, labels, &sender, &per_pane).unwrap();
+
+        let sent = sent.lock().unwrap();
+        let names: Vec<&str> = sent.iter().map(|pdu| pdu.pdu.pdu_name()).collect();
+        assert_eq!(
+            names,
+            [
+                "SetApplicationPalette",
+                "GetPaneRenderChangesResponse",
+                "NotifyAlert"
+            ]
+        );
+        let Pdu::GetPaneRenderChangesResponse(push) = &sent[1].pdu else {
+            unreachable!()
+        };
+        assert_eq!(push.title, "vim");
+    }
+
+    /// Output that changes nothing on the screen is no less of a flood, and
+    /// what the parser reads for it comes off the output's throughput.
+    #[test]
+    fn a_reading_the_parser_made_counts_whatever_it_found() {
+        let frame = Duration::from_secs(3600);
+        let mut state = PerPane::default();
+        assert!(state.claim_push());
+        assert!(!state.finish_push());
+        assert!(!state.push_pause(frame, Instant::now()).is_zero());
+    }
+
+    fn reading_at(seqno: SequenceNo) -> PaneReading {
+        PaneReading {
+            mouse_grabbed: false,
+            alt_screen: false,
+            keyboard_encoding: WireKeyboardEncoding::default(),
+            bracketed_paste: false,
+            dimensions: RenderableDimensions::default(),
+            cursor_position: StableCursorPosition::default(),
+            seqno,
+            dirty_lines: Default::default(),
+            bonus_lines: Vec::new(),
+            input_serial: None,
+        }
+    }
+
+    #[test]
+    fn pushes_of_a_pane_are_at_least_a_frame_apart() {
+        let frame = Duration::from_millis(8);
+        let now = Instant::now();
+        let mut state = PerPane::default();
+        assert!(
+            state.push_pause(frame, now).is_zero(),
+            "the first goes at once"
+        );
+
+        state.last_push = Some(now);
+        assert_eq!(state.push_pause(frame, now), frame, "the next waits");
+        assert_eq!(
+            state.push_pause(frame, now + frame / 2),
+            frame / 2,
+            "for what is left of the frame"
+        );
+        assert!(
+            state.push_pause(frame, now + frame).is_zero(),
+            "output after a pause is not held back"
+        );
+    }
+
+    /// Output landing on a push on its way is a flood's mark: a program
+    /// drawing frames gives none while the frame's push waits. Nothing else
+    /// that asks for a push is.
+    #[test]
+    fn a_flood_of_output_is_pushed_half_as_often() {
+        let frame = Duration::from_millis(8);
+        let now = Instant::now();
+        let mut state = PerPane {
+            last_push: Some(now),
+            ..PerPane::default()
+        };
+
+        assert!(state.claim_push_for_output());
+        assert!(!state.claim_push());
+        assert_eq!(state.push_pause(frame, now), frame, "a key is no flood");
+
+        assert!(!state.claim_push_for_output());
+        assert_eq!(state.push_pause(frame, now), 2 * frame);
+
+        assert!(state.finish_push(), "the output landed since the reading");
+        assert_eq!(
+            state.push_pause(frame, now),
+            frame,
+            "and each wait is judged alone"
+        );
+    }
+
+    #[test]
     fn application_palette_delivery_distinguishes_unsent_from_reset() {
         let mut state = PerPane::default();
         assert!(state.needs_application_palette(&None));
@@ -3735,6 +5343,73 @@ mod tests {
             config::keyassignment::ScrollbackEraseMode::ScrollbackOnly
         )
         .needs_the_terminal());
+    }
+
+    /// A turn is an offer: one that is taken keeps the output waiting until
+    /// it is dropped, and taking it says so.
+    #[test]
+    fn a_turn_that_is_taken_is_waited_on_until_it_is_dropped() {
+        use super::{offer_turn, take_turn};
+        let asked_from = std::thread::current().id();
+        let held = super::TURN_LIMIT / 4;
+        // A main thread that is late for one offer asks again, as here.
+        for _ in 0..50 {
+            let (go, went) = smol::channel::bounded(1);
+            let output = std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                offer_turn(&go, asked_from);
+                started.elapsed()
+            });
+            let turn = went.recv_blocking().expect("a turn is offered");
+            if !take_turn(&turn) {
+                output.join().unwrap();
+                continue;
+            }
+            // The output waits for as long as the turn is held, and no
+            // longer than its limit allows once it is dropped.
+            std::thread::sleep(held);
+            drop(turn);
+            let waited = output.join().unwrap();
+            assert!(waited >= held, "{:?}", waited);
+            assert!(waited < std::time::Duration::from_secs(1), "{:?}", waited);
+            return;
+        }
+        panic!("no turn could be taken in fifty tries");
+    }
+
+    /// A turn nobody takes runs out: taking it then says so, the terminal
+    /// being the output's again, and the same thread offers no other for a
+    /// while, so that a busy main thread is waited for once and not after
+    /// every batch, by everything that asked.
+    #[test]
+    fn a_turn_nobody_takes_runs_out_and_is_not_offered_again_at_once() {
+        use super::{offer_turn, take_turn};
+        let asked_from = std::thread::current().id();
+        let (go, went) = smol::channel::bounded(1);
+        let (go_again, went_again) = smol::channel::bounded(1);
+        let output = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            offer_turn(&go, asked_from);
+            let first = started.elapsed();
+            offer_turn(&go_again, asked_from);
+            first
+        });
+        let first = output.join().unwrap();
+        assert!(first >= super::TURN_LIMIT, "{:?}", first);
+        let turn = went.try_recv().expect("the first was offered");
+        assert!(!take_turn(&turn), "and had run out");
+        assert!(went_again.try_recv().is_err(), "the second was not offered");
+    }
+
+    /// The thread that asked may be the one that applies the batch, when it
+    /// applies something of its own: it cannot take a turn while it waits
+    /// for itself, and is not made to.
+    #[test]
+    fn the_thread_that_asked_is_not_kept_waiting_for_its_own_turn() {
+        use super::offer_turn;
+        let (go, went) = smol::channel::bounded(1);
+        offer_turn(&go, std::thread::current().id());
+        assert!(went.try_recv().is_err(), "nothing was offered");
     }
 
     /// Input for a pane waits in its queue in the order it was sent; a

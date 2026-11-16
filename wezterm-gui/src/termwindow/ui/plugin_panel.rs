@@ -30,8 +30,10 @@
 //! the user chose for it (`FocusPluginPanel`).
 
 mod field;
+mod page;
 
 pub(crate) use field::FieldSnapshot;
+pub(crate) use page::is_about_a_terminal;
 
 use crate::plugins::{self, PanelNews};
 use crate::quad::{HeapQuadAllocator, QuadClipRect, QuadTrait, TripleLayerQuadAllocator};
@@ -58,14 +60,15 @@ use std::hash::BuildHasher;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+use thinkterm_plugin_channel::registry::Does;
 use thinkterm_plugin_channel::wire::{PanelRequest, Raw};
 use thinkterm_plugin_panel::player::{
     field_clear_at, field_icon, field_radius, FIELD_ICON, FIELD_INSET,
 };
 use thinkterm_plugin_panel::{
-    feature, Align, Answer, Area, Ask, Bounds, Button, Bytes, CloseButton, Color, Cursor, Draw,
-    Drawn, Entry, EntryKind, Env, FieldPart, Font, Input, Line, Mods, MonoMetrics, Player, Rect,
-    Remote, Size, Text, TextMetrics, Token,
+    feature, Align, Answer, Area, Ask, At, Bounds, Button, Bytes, CloseButton, Color, Cursor,
+    Draw, Drawn, Entry, EntryKind, Env, FieldPart, Font, Input, Line, Mods, MonoMetrics, Player,
+    Rect, Remote, Size, Terminal, Text, TextMetrics, Token,
 };
 use url::Url;
 use wezterm_font::LoadedFont;
@@ -115,6 +118,20 @@ pub(crate) struct PluginPanel {
     /// A field text is being selected in by dragging: in the extended view
     /// or the panel, and which.
     selecting: Option<(bool, String)>,
+    /// For a page in a pane's place rather than the panel in the sidebar
+    /// (`page`), the page as its pane last said: what it is opened with
+    /// when its view is opened again.
+    page: Option<thinkterm_proto::PageSpec>,
+    /// When a page was last painted: of those off show, the ones looked at
+    /// longest ago are let go first.
+    last_shown: Instant,
+    /// A page's: which listing of the plugins it was last looked at under
+    /// (`plugins::actions_heard`), so that one the host stopped serving is
+    /// asked for again when they change.
+    listed: u64,
+    /// A page whose pane another machine's mux keeps: the domain its pane
+    /// is of, whose machine's plugin draws it, over a link there.
+    remote: Option<DomainId>,
 }
 
 /// A view the host serves this window -- a panel, or its extended view --
@@ -142,6 +159,13 @@ struct Shown {
     editors: std::collections::HashMap<String, field::Editor>,
     /// Counts edits and caret moves, which what was recorded is painted for.
     edits: u64,
+    /// Off show for now, as a page behind another tab is: it keeps what it
+    /// shows and what was typed in it, and nothing is drawn or asked for.
+    hidden: bool,
+    /// A frame came while it was hidden, and the host was not told it was
+    /// taken in: the host holds the next back until it is, so a hidden view
+    /// hears of one frame and no more.
+    ack_owed: bool,
 }
 
 /// A machine a plugin needs ThinkTerm connected to, and the source Files
@@ -193,6 +217,8 @@ impl Shown {
             connect: None,
             editors: std::collections::HashMap::new(),
             edits: 0,
+            hidden: false,
+            ack_owed: false,
         }
     }
 
@@ -218,6 +244,33 @@ impl PluginPanel {
             && self.shown.player.extend()
             && !self.dismissed
             && !matches!(self.shown.status, Status::Stopped(_))
+    }
+
+    /// Page `page` of plugin `plugin`, as `shown`.
+    fn page(plugin: &str, page: &thinkterm_proto::PageSpec, shown: Shown) -> Self {
+        Self {
+            plugin: plugin.to_string(),
+            shown,
+            opening: 0,
+            extended: None,
+            extended_width: 0,
+            dismissed: false,
+            selecting: None,
+            page: Some(page.clone()),
+            last_shown: Instant::now(),
+            listed: plugins::actions_heard(),
+            remote: None,
+        }
+    }
+
+    /// Opens its view again, as what it is: the host closed it, or the
+    /// session that had it is gone.
+    fn reopen(&self) {
+        let env = self.shown.player.env();
+        match &self.page {
+            Some(page) => plugins::reopen_page(self.shown.view, &self.plugin, env, page),
+            None => plugins::reopen_panel(self.shown.view, &self.plugin, env),
+        }
     }
 
     /// Whether the panel or its extended view has the keyboard.
@@ -269,12 +322,14 @@ enum Status {
 
 /// What a panel and its extended view are painted with in one frame: the
 /// fonts, pixels to a unit, and where the terminal beside them is -- its
-/// directory here, or the other machine it runs on.
+/// directory here, or the other machine it runs on -- and how `thinkterm
+/// cli` reaches it.
 pub(crate) struct PanelPaint {
     fonts: PanelFonts,
     scale: f32,
     cwd: Option<String>,
     remote: Option<Remote>,
+    terminal: Option<Terminal>,
 }
 
 /// The fonts a panel's text is set in, for one paint.
@@ -388,6 +443,7 @@ impl TermWindow {
             scale: panel_scale(self.dimensions.dpi),
             remote,
             cwd,
+            terminal: self.plugin_panel_terminal(),
         })
     }
 
@@ -416,11 +472,13 @@ impl TermWindow {
             scale,
             cwd,
             remote,
+            terminal,
         } = paint;
         let scale = *scale;
         let mut env = panel_env(fonts, &chrome, content_width as f32, height as f32, scale);
         env.cwd = cwd.clone();
         env.remote = remote.clone();
+        env.terminal = terminal.clone();
         env.can_extend = self.right_sidebar_plugin_can_extend();
         self.follow_plugin_panel(plugin, env);
         // The extended view goes once nothing asks for it, or there is no
@@ -483,11 +541,13 @@ impl TermWindow {
             scale,
             cwd,
             remote,
+            terminal,
         } = paint;
         let scale = *scale;
         let mut env = panel_env(fonts, &chrome, content_width as f32, height as f32, scale);
         env.cwd = cwd.clone();
         env.remote = remote.clone();
+        env.terminal = terminal.clone();
         let (x, y, size) = close;
         env.close = Some(CloseButton {
             x: (x as f32 - content_x as f32) / scale,
@@ -683,6 +743,10 @@ impl TermWindow {
                 extended_width,
                 dismissed: false,
                 selecting: None,
+                page: None,
+                last_shown: Instant::now(),
+                listed: plugins::actions_heard(),
+                remote: None,
             });
             return;
         };
@@ -699,7 +763,7 @@ impl TermWindow {
                 shown.env_told = now;
                 shown.env_due = false;
                 panel.opening = panel.opening.wrapping_add(1);
-                plugins::reopen_panel(shown.view, &panel.plugin, shown.player.env());
+                panel.reopen();
                 if lost {
                     self.hold_plugin_panel_keys();
                 }
@@ -794,6 +858,7 @@ impl TermWindow {
             plugins::close_panel(panel.shown.view);
         }
         self.plugin_panel_domains.clear();
+        self.plugin_panel_terminal = None;
         self.plugin_panel_reach = None;
     }
 
@@ -856,6 +921,177 @@ impl TermWindow {
         }
     }
 
+    /// The terminal beside the panel as `thinkterm cli` reaches it, worked
+    /// out once for each pane in focus. While the window has none -- on
+    /// the way to a new tab's -- the one the panel was told of stays.
+    fn plugin_panel_terminal(&mut self) -> Option<Terminal> {
+        let Some(pane) = self.get_active_pane_no_overlay() else {
+            return self
+                .right_sidebar_plugin
+                .as_ref()
+                .and_then(|panel| panel.shown.player.env().terminal.clone());
+        };
+        let pane_id = pane.pane_id();
+        if let Some((beside, terminal)) = &self.plugin_panel_terminal {
+            if *beside == pane_id {
+                return terminal.clone();
+            }
+        }
+        let terminal = cli_terminal(&pane);
+        self.plugin_panel_terminal = Some((pane_id, terminal.clone()));
+        terminal
+    }
+
+    /// The view numbered `view`, of those this window shows: the sidebar's
+    /// panel, its extended view, or a page. What comes for a view by its
+    /// number -- from the system, or later than it was asked for -- finds
+    /// it here, wherever it is.
+    fn plugin_view_numbered(&mut self, view: u64) -> Option<&mut Shown> {
+        let of_sidebar = self.right_sidebar_plugin.as_ref().is_some_and(|panel| {
+            panel.shown.view == view
+                || panel
+                    .extended
+                    .as_ref()
+                    .is_some_and(|(extended, _)| extended.view == view)
+        });
+        if of_sidebar {
+            let panel = self.right_sidebar_plugin.as_mut()?;
+            return if panel.shown.view == view {
+                Some(&mut panel.shown)
+            } else {
+                panel.extended.as_mut().map(|(extended, _)| extended)
+            };
+        }
+        self.plugin_pages
+            .values_mut()
+            .map(|page| &mut page.shown)
+            .find(|shown| shown.view == view)
+    }
+
+    /// Does the plugin action named `name`, as a key's binding names it:
+    /// opens the plugin's page, or calls the plugin with where the user is
+    /// -- the pane in focus -- added to what its manifest says to call it
+    /// with. One that cannot be done is logged with the reason.
+    pub(crate) fn do_plugin_action(&mut self, name: &str) {
+        let (info, does) = match plugins::action(name) {
+            Ok(found) => found,
+            Err(why) => {
+                log::warn!("plugin action {name}: {why}");
+                return;
+            }
+        };
+        let body = match does {
+            Does::Page(args) => return self.open_plugin_page(&info.id, &args.to_string()),
+            Does::Call(body) => body,
+        };
+        let name = name.to_string();
+        let plugin = info.id.clone();
+        let call = move |at: At| {
+            plugins::call(&info.id, at.added_to(body), move |answer| {
+                if let Err(why) = answer {
+                    log::warn!("plugin action {name}: {why}");
+                }
+            });
+        };
+        let pane = self.get_active_pane_no_overlay();
+        let domain = pane
+            .as_ref()
+            .and_then(|pane| Mux::get().get_domain(pane.domain_id()));
+        let (Some(pane), Some(domain), Some(window)) = (pane, domain, self.window.clone()) else {
+            return call(At::default());
+        };
+        // Where the pane runs is looked at off this thread, as it is for a
+        // panel; the call follows at once.
+        promise::spawn::spawn(async move {
+            let here = promise::spawn::spawn_into_new_thread(move || Ok(runs_here(&domain)))
+                .await
+                .unwrap_or(false);
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                call(term_window.plugin_action_at(&plugin, &pane, here));
+            })));
+        })
+        .detach();
+    }
+
+    /// Where the user is for an action asked for at `pane`, which runs on
+    /// this machine or, `here` not so, on another.
+    fn plugin_action_at(&mut self, plugin: &str, pane: &Arc<dyn Pane>, here: bool) -> At {
+        if let Some(page) = pane.page() {
+            return self.plugin_action_at_page(plugin, pane, &page);
+        }
+        let directory = pane.get_current_working_dir(CachePolicy::AllowStale);
+        let (cwd, remote) = if here {
+            (directory.and_then(|url| local_path(&url)), None)
+        } else {
+            // The machine is found for the pane in focus: none is named
+            // for one the user has left meanwhile.
+            let in_focus = self
+                .get_active_pane_no_overlay()
+                .is_some_and(|now| now.pane_id() == pane.pane_id());
+            match in_focus.then(|| self.plugin_panel_remote(pane.pane_id(), pane)) {
+                Some(Beside::There(remote)) => (None, Some(remote)),
+                _ => (None, None),
+            }
+        };
+        At {
+            cwd,
+            remote,
+            terminal: cli_terminal(pane),
+            page: None,
+        }
+    }
+
+    /// Where the user is, for an action of plugin `plugin` asked for at
+    /// pane `pane`, which holds page `page`: a page is no terminal, so at
+    /// the one it was opened from, in its directory then -- and, to the
+    /// page's own plugin, at the page. A page of another machine's is that
+    /// machine's plugin's, and only where it was opened from is told.
+    fn plugin_action_at_page(
+        &mut self,
+        plugin: &str,
+        pane: &Arc<dyn Pane>,
+        page: &thinkterm_proto::PageSpec,
+    ) -> At {
+        let domain_id = pane.domain_id();
+        let cwd = (!page.cwd.is_empty()).then(|| page.cwd.clone());
+        if page::kept_here(domain_id) {
+            return At {
+                cwd,
+                remote: None,
+                terminal: page.terminal.map(|terminal| page::page_terminal(domain_id, terminal)),
+                page: (page.plugin == plugin).then(|| page.id.clone()),
+            };
+        }
+        // The terminal there is reached through this window, as the ones of
+        // that machine beside a panel are; the machine is found for the pane
+        // in focus only, as there.
+        let mux = Mux::get();
+        let mirror = page.terminal.and_then(|terminal| {
+            let domain = mux.get_domain(domain_id)?;
+            let client = domain.downcast_ref::<wezterm_client::domain::ClientDomain>()?;
+            mux.get_pane(client.remote_to_local_pane_id(terminal as PaneId)?)
+        });
+        let in_focus = self
+            .get_active_pane_no_overlay()
+            .is_some_and(|now| now.pane_id() == pane.pane_id());
+        let remote = match (cwd, in_focus) {
+            (Some(cwd), true) => self.plugin_panel_reach_of(pane.pane_id()).as_ref().ok().map(
+                |reach| Remote {
+                    host: reach.host.clone(),
+                    machine: reach.machine.clone(),
+                    cwd,
+                },
+            ),
+            _ => None,
+        };
+        At {
+            cwd: None,
+            remote,
+            terminal: mirror.as_ref().and_then(cli_terminal),
+            page: None,
+        }
+    }
+
     /// Whether the panes of domain `domain_id` run on this machine: `None`
     /// until a look off this thread says, once for the domain. Another tab
     /// of a domain the panel was beside already is known at once, so the
@@ -903,7 +1139,7 @@ impl TermWindow {
     fn plugin_panel_reach(&mut self) -> Result<Reach, String> {
         let pane_id = self
             .get_active_pane_no_overlay()
-            .ok_or_else(|| "no terminal is beside the panel".to_string())?
+            .ok_or_else(|| crate::i18n::tr("plugin-answer-no-terminal"))?
             .pane_id();
         self.plugin_panel_reach_of(pane_id).clone()
     }
@@ -940,9 +1176,9 @@ impl TermWindow {
         let target = match self.active_remote_project_for_files() {
             Ok(Some(target)) => target,
             found => {
-                let why = found.err().unwrap_or_else(|| {
-                    "the terminal beside the panel runs on this machine".to_string()
-                });
+                let why = found
+                    .err()
+                    .unwrap_or_else(|| crate::i18n::tr("plugin-answer-local-terminal"));
                 self.plugin_panel_reach = Some((pane_id, Instant::now(), Err(why)));
                 return;
             }
@@ -989,7 +1225,7 @@ impl TermWindow {
     fn plugin_remote_reach(&self) -> Result<Reach, String> {
         let target = self
             .active_remote_project_for_files()?
-            .ok_or_else(|| "the terminal beside the panel runs on this machine".to_string())?;
+            .ok_or_else(|| crate::i18n::tr("plugin-answer-local-terminal"))?;
         Self::reach_of(&target)
     }
 
@@ -1022,11 +1258,11 @@ impl TermWindow {
         // Asked for the terminal's machine before it moved to another: not
         // done where it is now.
         if reach.machine != machine {
-            let why = "the terminal beside the panel is on another machine now";
+            let why = crate::i18n::tr("plugin-answer-moved");
             return plugins::answer(view, id, &Answer::failed(why));
         }
         if !remote_source_is_authorized(&reach.source_key) {
-            let why = format!("ThinkTerm is not connected to {}", reach.host);
+            let why = not_connected_to(&reach.host);
             let connect = Connect {
                 host: reach.host,
                 machine: reach.machine,
@@ -1060,20 +1296,6 @@ impl TermWindow {
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
-    }
-
-    /// The view of this window's panel numbered `view`: the panel, or its
-    /// extended view.
-    fn plugin_view_numbered(&mut self, view: u64) -> Option<&mut Shown> {
-        let panel = self.right_sidebar_plugin.as_mut()?;
-        if panel.shown.view == view {
-            return Some(&mut panel.shown);
-        }
-        panel
-            .extended
-            .as_mut()
-            .map(|(extended, _)| extended)
-            .filter(|extended| extended.view == view)
     }
 
     /// Finds out, on a thread of its own, whether the panes of `domain`,
@@ -1117,11 +1339,22 @@ impl TermWindow {
     }
 
     fn plugin_panel_hear(&mut self, view: u64, news: PanelNews) {
+        // About a page: heard as the panel's is, with the page in its place;
+        // what its plugin changed of the page goes to the mux.
+        if let Some(pane_id) = self.plugin_page_of_view(view) {
+            self.with_plugin_page(pane_id, |this| this.plugin_panel_hear(view, news));
+            self.follow_plugin_page_change(pane_id);
+            return;
+        }
         let news = match news {
             PanelNews::Remote { id, machine, ask } => {
                 if self.plugin_view_numbered(view).is_none() {
                     // A view this window let go of meanwhile.
-                    return plugins::answer(view, id, &Answer::failed("the panel closed"));
+                    return plugins::answer(
+                        view,
+                        id,
+                        &Answer::failed(crate::i18n::tr("plugin-answer-closed")),
+                    );
                 }
                 return self.plugin_panel_ask(view, id, machine, ask);
             }
@@ -1140,7 +1373,7 @@ impl TermWindow {
                     shown.env_told = Instant::now();
                     shown.env_due = false;
                     panel.opening = panel.opening.wrapping_add(1);
-                    plugins::reopen_panel(view, &panel.plugin, shown.player.env());
+                    panel.reopen();
                 }
                 news => heard(shown, &panel.plugin, news),
             }
@@ -1159,6 +1392,26 @@ impl TermWindow {
         } else {
             // A view this window let go of meanwhile.
             return;
+        }
+        // A page its plugin asked for in answer to a press: opened as a
+        // tab, with what the plugin said to open it with. Asked by a page,
+        // it opens beside that page, on its machine.
+        let asked = self.right_sidebar_plugin.as_mut().and_then(|panel| {
+            let args = panel.shown.player.take_page_asked().or_else(|| {
+                let (extended, _) = panel.extended.as_mut()?;
+                extended.player.take_page_asked()
+            })?;
+            Some((panel.plugin.clone(), args))
+        });
+        if let Some((plugin, args)) = asked {
+            let args = match args {
+                serde_json::Value::Null => String::new(),
+                args => args.to_string(),
+            };
+            match self.plugin_page_standing {
+                Some(pane_id) => self.open_plugin_page_beside(pane_id, &plugin, &args),
+                None => self.open_plugin_page(&plugin, &args),
+            }
         }
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
@@ -1702,9 +1955,10 @@ impl TermWindow {
         Ok(())
     }
 
-    /// One line of text in its box: centred in its height, placed across
-    /// it as asked, and cut to it -- with an ellipsis in the interface
-    /// font, at the edge in the monospaced one.
+    /// Text in its box: one line, centred in its height -- or, asked to
+    /// wrap, as many as the box holds, from its top -- each placed across
+    /// it as asked and cut to it: with an ellipsis in the interface font,
+    /// at the edge in the monospaced one.
     /// Only the glyphs within `across`, the draw's left and right edges, are
     /// laid: a line far wider than a list scrolled sideways costs what shows.
     #[allow(clippy::too_many_arguments)]
@@ -1723,20 +1977,103 @@ impl TermWindow {
             return Ok(());
         }
         let (font, metrics) = fonts.of(text);
+        let across = (clip_left, clip_right);
+        let mut line = |shown: &str, top: f32, budget: &mut usize| {
+            let at = (area, top);
+            self.paint_panel_text_line(
+                layers, text.align, shown, font, metrics, at, color, across, budget,
+            )
+        };
+        if text.wrap {
+            let line_height = metrics.cell_size.height as f32;
+            let lines = self.panel_text_lines(text, font, metrics, area)?;
+            for (row, shown) in lines.iter().enumerate() {
+                line(shown, area.min_y() + row as f32 * line_height, budget)?;
+            }
+            return Ok(());
+        }
         let top = area.min_y() + (area.height() - metrics.cell_size.height as f32) / 2.0;
         let shown = match text.font {
             Font::Ui => self.ellipsize_ui_text(font, &text.text, area.width() as usize)?,
             Font::Mono => std::borrow::Cow::Borrowed(text.text.as_str()),
         };
+        line(&shown, top, budget)
+    }
+
+    /// `text` broken into the lines its box holds ([`Text::wrap`]), as they
+    /// show: where text is left over, the last ends in an ellipsis in the
+    /// interface font.
+    fn panel_text_lines(
+        &self,
+        text: &Text,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        area: RectF,
+    ) -> anyhow::Result<Vec<String>> {
+        const ELLIPSIS: &str = "...";
+        let line_height = (metrics.cell_size.height as f32).max(1.0);
+        // A box made a whole number of lines tall holds them all, whatever
+        // its pixels round to.
+        let room = ((area.height() + 1.0) / line_height).floor().max(1.0) as usize;
+        let mut lines = Vec::new();
+        let mut left_over = false;
+        let width = area.width();
+        'text: for paragraph in text.text.lines() {
+            if lines.len() == room {
+                left_over = true;
+                break;
+            }
+            let xs = self.boundaries(font, metrics, paragraph)?;
+            let chars: Vec<char> = paragraph.chars().collect();
+            let at: Vec<usize> = paragraph
+                .char_indices()
+                .map(|(at, _)| at)
+                .chain(std::iter::once(paragraph.len()))
+                .collect();
+            for line in thinkterm_plugin_panel::wrap::lines(&chars, &xs, width) {
+                if lines.len() == room {
+                    left_over = true;
+                    break 'text;
+                }
+                let shown = &paragraph[at[line.start]..at[line.end]];
+                lines.push(shown.trim_end().to_string());
+            }
+        }
+        if left_over && text.font == Font::Ui {
+            if let Some(last) = lines.last_mut() {
+                let ended = format!("{last}{ELLIPSIS}");
+                *last = self
+                    .ellipsize_ui_text(font, &ended, area.width() as usize)?
+                    .into_owned();
+            }
+        }
+        Ok(lines)
+    }
+
+    /// One line of a panel's text, `shown`, its top at `top` and placed
+    /// across `area` as `align` says.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_panel_text_line(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        align: Align,
+        shown: &str,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        (area, top): (RectF, f32),
+        color: LinearRgba,
+        (clip_left, clip_right): (f32, f32),
+        budget: &mut usize,
+    ) -> anyhow::Result<()> {
         if shown.is_empty() {
             return Ok(());
         }
-        let (shaped, _) = self.cached_ui_shape(font, metrics, &shown)?;
+        let (shaped, _) = self.cached_ui_shape(font, metrics, shown)?;
         let width: f32 = shaped
             .iter()
             .map(|info| info.glyph.x_advance.get() as f32)
             .sum();
-        let left = match text.align {
+        let left = match align {
             Align::Left => area.min_x(),
             Align::Center => area.min_x() + (area.width() - width) / 2.0,
             Align::Right => area.max_x() - width,
@@ -1883,6 +2220,14 @@ impl TermWindow {
     }
 }
 
+/// Why an ask about another machine is not done: no connection to it yet.
+/// A plugin shows it as it is, so it is in the user's language.
+fn not_connected_to(host: &str) -> String {
+    let mut args = fluent_bundle::FluentArgs::new();
+    args.set("host", host.to_string());
+    crate::i18n::tr_args("plugin-answer-not-connected", &args)
+}
+
 /// Takes `cost` quads from `budget`; none, and false, when it has not that
 /// many left.
 fn spend(budget: &mut usize, cost: usize) -> bool {
@@ -1934,6 +2279,28 @@ fn local_path(url: &Url) -> Option<String> {
     (!path.is_empty()).then(|| path.to_string())
 }
 
+/// Pane `pane` as `thinkterm cli` reaches it. One the session server keeps
+/// for this machine, by its number there and the server's socket: as the
+/// programs in it reach it. Any other by its number here and the socket
+/// this process serves the command line on -- which its programs are given
+/// too, and through which one on another machine is reached.
+fn cli_terminal(pane: &Arc<dyn Pane>) -> Option<Terminal> {
+    if crate::local_sessions::is_host_domain_id(pane.domain_id()) {
+        let client = pane.downcast_ref::<wezterm_client::pane::ClientPane>();
+        let host = crate::local_sessions::candidate(&config::configuration());
+        if let (Some(client), Some(host)) = (client, host) {
+            return Some(Terminal {
+                pane: client.remote_pane_id as u64,
+                socket: Some(host.socket_path().to_string_lossy().into_owned()),
+            });
+        }
+    }
+    Some(Terminal {
+        pane: pane.pane_id() as u64,
+        socket: Some(crate::cli_socket()?.to_string_lossy().into_owned()),
+    })
+}
+
 /// What the plugin is told of a panel this big, set in `fonts`.
 fn panel_env(fonts: &PanelFonts, chrome: &UiPalette, width: f32, height: f32, scale: f32) -> Env {
     let text = |(_, metrics): &(Rc<LoadedFont>, RenderMetrics), size: f64| TextMetrics {
@@ -1957,16 +2324,22 @@ fn panel_env(fonts: &PanelFonts, chrome: &UiPalette, width: f32, height: f32, sc
         locale: crate::i18n::current_locale().to_string(),
         cwd: None,
         remote: None,
+        terminal: None,
         can_extend: false,
         close: None,
-        features: vec![feature::FIELDS.to_string(), feature::KEYS.to_string()],
+        features: vec![
+            feature::FIELDS.to_string(),
+            feature::KEYS.to_string(),
+            feature::WRAP.to_string(),
+        ],
+        pointer: Default::default(),
     }
 }
 
 /// Sends the plugin what the view's lists need next, once it is told the
 /// size they are drawn for.
 fn send_wanted(shown: &mut Shown) {
-    if shown.env_due {
+    if shown.env_due || shown.hidden {
         return;
     }
     for wanted in shown.player.wanted() {
@@ -2004,7 +2377,11 @@ fn heard(shown: &mut Shown, plugin: &str, news: PanelNews) {
         PanelNews::Frame(frame) => {
             shown.player.frame(frame);
             shown.status = Status::Open;
-            plugins::tell_panel(shown.view, PanelRequest::Shown);
+            if shown.hidden {
+                shown.ack_owed = true;
+            } else {
+                plugins::tell_panel(shown.view, PanelRequest::Shown);
+            }
             // The keyboard may have moved with it, or left with a field.
             shown.tell();
             send_wanted(shown);
@@ -2012,6 +2389,9 @@ fn heard(shown: &mut Shown, plugin: &str, news: PanelNews) {
         PanelNews::Rows(rows) => {
             shown.player.rows(rows);
             send_wanted(shown);
+        }
+        PanelNews::Heard => {
+            shown.player.heard();
         }
         PanelNews::Closed { reason, again } => {
             shown.status = if again {
@@ -2042,7 +2422,7 @@ async fn ask_there(reach: Reach, ask: Ask) -> Answer {
         Ok(lease) => lease,
         Err(RemoteAcquireError::Failed(why)) => return Answer::failed(why),
         Err(RemoteAcquireError::NotConnected) => {
-            return Answer::failed(format!("ThinkTerm is not connected to {}", reach.host))
+            return Answer::failed(not_connected_to(&reach.host))
         }
     };
     let backend = lease.backend();

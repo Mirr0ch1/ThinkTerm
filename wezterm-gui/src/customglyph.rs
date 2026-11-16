@@ -7,7 +7,7 @@ pub use thinkterm_render::customglyph::*;
 use tiny_skia::BlendMode;
 use window::bitmaps::atlas::Sprite;
 use window::color::SrgbaPixel;
-use window::{BitmapImage, Image, Point, Rect};
+use window::{BitmapImage, Image, Point, Rect, Size};
 
 pub fn filter_out_synthetic(glyphs: &mut Vec<char>) {
     if config::configuration().custom_block_glyphs {
@@ -34,13 +34,22 @@ impl GlyphCache {
         }
 
         let mut metrics = metrics.scale_cell_width(width as f64);
-        if let Some(d) = &self.fonts.config().cursor_thickness {
-            metrics.underline_height = d.evaluate_as_pixels(DimensionContext {
+        let configured_thickness = self.fonts.config().cursor_thickness.as_ref().map(|d| {
+            d.evaluate_as_pixels(DimensionContext {
                 dpi: self.fonts.get_dpi() as f32,
                 pixel_max: metrics.underline_height as f32,
                 pixel_cell: metrics.cell_size.height as f32,
-            }) as isize;
+            }) as isize
+        });
+        if let Some(thickness) = configured_thickness {
+            metrics.underline_height = thickness;
         }
+        // A bar or underline cursor is a solid strip in whole pixels along
+        // the cell's edge. Stroked along the edge it lost half its width to
+        // the cell and kept a half-covered column that read as a blur.
+        let line_thickness = configured_thickness
+            .unwrap_or_else(|| (metrics.underline_height as f32 * 1.5).round().max(2.) as isize)
+            .clamp(1, metrics.cell_size.width.min(metrics.cell_size.height).max(1));
 
         let mut buffer = Image::new(
             metrics.cell_size.width as usize,
@@ -75,35 +84,21 @@ impl GlyphCache {
                 );
             }
             Some(CursorShape::BlinkingBar | CursorShape::SteadyBar) => {
-                draw_polys(
-                    &block_metrics(&metrics),
-                    &[Poly {
-                        path: &[
-                            PolyCommand::MoveTo(BlockCoord::Zero, BlockCoord::Zero),
-                            PolyCommand::LineTo(BlockCoord::Zero, BlockCoord::One),
-                        ],
-                        intensity: BlockAlpha::Full,
-                        style: PolyStyle::OutlineHeavy,
-                    }],
-                    &mut buffer,
-                    PolyAA::AntiAlias,
-                    BlendMode::default(),
+                buffer.clear_rect(
+                    Rect::new(
+                        Point::new(0, 0),
+                        Size::new(line_thickness, metrics.cell_size.height),
+                    ),
+                    SrgbaPixel::rgba(0xff, 0xff, 0xff, 0xff),
                 );
             }
             Some(CursorShape::BlinkingUnderline | CursorShape::SteadyUnderline) => {
-                draw_polys(
-                    &block_metrics(&metrics),
-                    &[Poly {
-                        path: &[
-                            PolyCommand::MoveTo(BlockCoord::Zero, BlockCoord::One),
-                            PolyCommand::LineTo(BlockCoord::One, BlockCoord::One),
-                        ],
-                        intensity: BlockAlpha::Full,
-                        style: PolyStyle::OutlineHeavy,
-                    }],
-                    &mut buffer,
-                    PolyAA::AntiAlias,
-                    BlendMode::default(),
+                buffer.clear_rect(
+                    Rect::new(
+                        Point::new(0, metrics.cell_size.height - line_thickness),
+                        Size::new(metrics.cell_size.width, line_thickness),
+                    ),
+                    SrgbaPixel::rgba(0xff, 0xff, 0xff, 0xff),
                 );
             }
         }

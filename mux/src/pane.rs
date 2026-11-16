@@ -28,6 +28,10 @@ pub use thinkterm_proto::{PaneId, Pattern, SearchResult};
 /// Dropping the last subscription releases the upstream subscription and cache.
 pub trait KittyFrameSubscription: std::fmt::Debug + Send + Sync {}
 
+/// See `Pane::read_after_batch`. Passed the pane rather than holding it, as
+/// a pane keeps these and must not end up owning itself.
+pub type BatchRead = Box<dyn FnOnce(&dyn Pane) + Send>;
+
 pub type KittyImageFuture = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<thinkterm_proto::image::GetImageCellResponse>> + Send>>;
 
 pub fn alloc_pane_id() -> PaneId {
@@ -63,6 +67,10 @@ pub struct FrontendCellMetrics {
     pub cell_height: usize,
     /// Vertical chrome drawn inside the pane's rect (the pane nav bar), px.
     pub chrome_height: usize,
+    /// Room under the tree the frontend lets a pane along its bottom edge
+    /// run its terminal on into, px: what is left of the window under the
+    /// tree's last row. The tree knows which panes those are.
+    pub extra_height: usize,
     pub dpi: u32,
 }
 
@@ -89,9 +97,14 @@ pub fn frontend_cell_metrics(pane_id: PaneId) -> Option<FrontendCellMetrics> {
 
 /// Convert a split-tree pixel rect into the size the registered frontend
 /// would compute for it. Mirrors the GUI's `terminal_size_for_positioned_pane`
-/// exactly: chrome is clamped so one terminal row always survives, and the
-/// pixel size is re-derived from whole cells.
-pub fn apply_frontend_cell_metrics(pane_id: PaneId, size: TerminalSize) -> TerminalSize {
+/// exactly: chrome is clamped so one terminal row always survives, the room
+/// under the tree is added for a pane `along_bottom` of it, and the pixel
+/// size is re-derived from whole cells.
+pub fn apply_frontend_cell_metrics(
+    pane_id: PaneId,
+    size: TerminalSize,
+    along_bottom: bool,
+) -> TerminalSize {
     let Some(m) = frontend_cell_metrics(pane_id) else {
         return size;
     };
@@ -101,7 +114,10 @@ pub fn apply_frontend_cell_metrics(pane_id: PaneId, size: TerminalSize) -> Termi
         .chrome_height
         .min(size.pixel_height.saturating_sub(cell_height));
     let pixel_width = size.pixel_width.max(cell_width);
-    let pixel_height = size.pixel_height.saturating_sub(chrome).max(cell_height);
+    let room_below = if along_bottom { m.extra_height } else { 0 };
+    let pixel_height = (size.pixel_height + room_below)
+        .saturating_sub(chrome)
+        .max(cell_height);
     let cols = (pixel_width / cell_width).max(1);
     let rows = (pixel_height / cell_height).max(1);
     TerminalSize {
@@ -269,6 +285,27 @@ impl PaneSummary {
 pub trait Pane: Downcast + Send + Sync {
     fn pane_id(&self) -> PaneId;
 
+    /// The plugin's page this pane holds in place of a terminal, for the
+    /// one that does (`crate::pagepane`): none of what is asked of a
+    /// terminal -- its lines, its program, its input -- means anything of
+    /// it. A terminal says none.
+    fn page(&self) -> Option<thinkterm_proto::PageSpec> {
+        None
+    }
+
+    /// Whether this pane holds a page, for those who only ask that: a
+    /// page's description is not copied out for them.
+    fn is_page(&self) -> bool {
+        self.page().is_some()
+    }
+
+    /// Changes what the page this pane holds says of itself, as its plugin
+    /// asked: the mux that keeps the pane keeps the change, and tells every
+    /// client (`MuxNotification::PageChanged`). A terminal has no page.
+    fn change_page(&self, _edit: thinkterm_proto::PageEdit) -> anyhow::Result<()> {
+        anyhow::bail!("pane {} holds no page", self.pane_id())
+    }
+
     /// Returns the 0-based cursor position relative to the top left of
     /// the visible screen
     fn get_cursor_position(&self) -> StableCursorPosition;
@@ -300,6 +337,21 @@ pub trait Pane: Downcast + Send + Sync {
     /// Because of this, we also return the adjusted StableRowIndex for
     /// the first row in the range.
     fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>);
+
+    /// `get_lines`, held to the rows on the screen as they are read. The
+    /// screen's bounds and its rows are read together: the two screens
+    /// number their rows apart, so bounds read before a switch from one
+    /// to the other would name rows of the other one, as like as not its
+    /// oldest history. A pane that cannot read both at once reads them one
+    /// after the other.
+    fn get_screen_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
+        let lines = on_screen(&self.get_dimensions(), lines);
+        // Not asked: a screen can answer an empty range with a row.
+        if lines.is_empty() {
+            return (lines.start, vec![]);
+        }
+        self.get_lines(lines)
+    }
 
     fn with_lines_mut(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines);
 
@@ -338,10 +390,16 @@ pub trait Pane: Downcast + Send + Sync {
         Progress::None
     }
     fn send_paste(&self, text: &str) -> anyhow::Result<()>;
+    /// Whether the program in the pane takes pastes bracketed (DECSET
+    /// 2004), so that a newline pasted to it runs nothing by itself. `None`
+    /// when this side cannot tell.
+    fn bracketed_paste(&self) -> Option<bool> {
+        None
+    }
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>>;
     /// The pty behind `reader`, when there is one: the reader thread waits
     /// for it with poll, which is what lets it be parked (see
-    /// `crate::pause_pane_reader`).
+    /// `crate::pause_pane_reader`), and can read a flood from it directly.
     #[cfg(unix)]
     fn pty_raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
         None
@@ -413,6 +471,19 @@ pub trait Pane: Downcast + Send + Sync {
     /// no.
     fn render_state_is_contended(&self) -> bool {
         false
+    }
+
+    /// Have the thread applying this pane's output run `read` once the
+    /// batch it is on is done, for a reader `render_state_is_contended`
+    /// turned away. Between two batches that thread is the only one that
+    /// will not miss: a probe from anywhere else has to land in a gap of
+    /// about 0.1 ms, and under a flood can go on missing it for a second.
+    /// The read never happens if no batch follows, so the caller keeps
+    /// another way of finding out. Whatever it does comes off the pane's
+    /// throughput, so nothing that looks at the pane's processes belongs
+    /// here. Handed back by a pane with no such thread.
+    fn read_after_batch(&self, read: BatchRead) -> Result<(), BatchRead> {
+        Err(read)
     }
 
     /// Take whatever `render_state_is_contended` reports on and hold it
@@ -805,6 +876,16 @@ pub fn impl_get_logical_lines_via_get_lines<P: Pane + ?Sized>(
     lines
 }
 
+/// The rows of `lines` on the screen `dims` describe.
+pub fn on_screen(
+    dims: &RenderableDimensions,
+    lines: Range<StableRowIndex>,
+) -> Range<StableRowIndex> {
+    let top = dims.physical_top;
+    let start = lines.start.max(top);
+    start..lines.end.min(top + dims.viewport_rows as StableRowIndex).max(start)
+}
+
 /// A helper that allows you to implement Pane::get_lines in terms
 /// of your Pane::with_lines_mut method.
 pub fn impl_get_lines_via_with_lines<P: Pane + ?Sized>(
@@ -984,6 +1065,28 @@ mod test {
             .iter()
             .map(|l| (l.first_row, l.logical.as_str()))
             .collect::<Vec<_>>()
+    }
+
+    // A range that ends before it starts is one of those asked about.
+    #[allow(clippy::reversed_empty_ranges)]
+    #[test]
+    fn only_rows_on_the_screen_are_on_it() {
+        let dims = RenderableDimensions {
+            viewport_rows: 24,
+            physical_top: 100,
+            ..RenderableDimensions::default()
+        };
+        assert_eq!(on_screen(&dims, 90..110), 100..110);
+        assert_eq!(on_screen(&dims, 120..200), 120..124);
+        assert!(on_screen(&dims, 0..100).is_empty());
+        assert!(on_screen(&dims, 124..130).is_empty());
+        assert!(on_screen(&dims, 110..105).is_empty());
+        // The alternate screen numbers its rows from nought.
+        let alt = RenderableDimensions {
+            viewport_rows: 24,
+            ..RenderableDimensions::default()
+        };
+        assert_eq!(on_screen(&alt, 0..5000), 0..24);
     }
 
     #[test]
@@ -1376,5 +1479,38 @@ mod test {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn the_room_under_a_pane_adds_up_with_its_own_remainder_to_another_row() {
+        let pane_id = PaneId::MAX - 7;
+        let metrics = FrontendCellMetrics {
+            cell_width: 10,
+            cell_height: 32,
+            chrome_height: 78,
+            extra_height: 0,
+            dpi: 96,
+        };
+        let rect = TerminalSize {
+            rows: 39,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 39 * 32,
+            dpi: 96,
+        };
+        set_frontend_cell_metrics(pane_id, Some(metrics));
+        // The nav bar takes 78 of the rect's 1248: 36 rows and 18 over.
+        assert_eq!(apply_frontend_cell_metrics(pane_id, rect, true).rows, 36);
+        set_frontend_cell_metrics(
+            pane_id,
+            Some(FrontendCellMetrics {
+                extra_height: 16,
+                ..metrics
+            }),
+        );
+        // With the 16 under the tree, 37 -- for a pane along its bottom.
+        assert_eq!(apply_frontend_cell_metrics(pane_id, rect, true).rows, 37);
+        assert_eq!(apply_frontend_cell_metrics(pane_id, rect, false).rows, 36);
+        set_frontend_cell_metrics(pane_id, None);
     }
 }

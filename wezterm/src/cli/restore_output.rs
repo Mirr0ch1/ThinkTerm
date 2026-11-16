@@ -1,8 +1,8 @@
 //! `thinkterm cli restore-output …`: whether this machine keeps what its
 //! panes show when its terminals stop, and puts it back when their layout is
 //! restored. The desktop's Settings has the same switch for the machine it
-//! runs on; on any other machine, a remote host say, this is how to turn it
-//! on. See `mux::kept_output`.
+//! runs on, where it is on unless turned off; on any other machine, a remote
+//! host say, it is off until this turns it on. See `mux::kept_output`.
 
 use clap::Parser;
 

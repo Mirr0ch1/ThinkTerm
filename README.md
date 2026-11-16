@@ -1,6 +1,6 @@
 # ThinkTerm
 
-**English** · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Français](README.fr-FR.md) · [Deutsch](README.de-DE.md)
+**English** · [简体中文](readme-i18n/README.zh-CN.md) · [日本語](readme-i18n/README.ja-JP.md) · [Français](readme-i18n/README.fr-FR.md) · [Deutsch](readme-i18n/README.de-DE.md) · [Русский](readme-i18n/README.ru-RU.md)
 
 ## 📥 Download
 
@@ -46,7 +46,113 @@ https://github.com/user-attachments/assets/7317e369-db86-463f-9379-a8a2ed4b602b
       <br><strong>Spaces</strong>
     </td>
   </tr>
+  <tr>
+    <td colspan="2" align="center">
+      <img src="assets/screenshots/mobile.jpeg" alt="ThinkTerm on iOS / iPadOS, built with Swift, and on Android, built with Kotlin" width="100%">
+      <br><strong>iOS, iPadOS and Android</strong>
+    </td>
+  </tr>
 </table>
+
+## Performance
+
+Throughput compared with WezTerm, measured with kitty's `kitten __benchmark__` on the same Mac (MB/s, higher is better).
+
+ThinkTerm was measured with its local mux: the shell runs in the mux server, and its output passes through the mux before it reaches the window.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-dark.svg">
+    <img src="assets/performance-light.svg" alt="ThinkTerm throughput compared with WezTerm in six kitten benchmark workloads: ThinkTerm is faster in all six, from 1.1× to 9.8×" width="100%">
+  </picture>
+</p>
+
+<details>
+<summary>Table data</summary>
+
+| Workload | ThinkTerm 0.4.7<br>2026-11-08 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | Ratio |
+| --- | ---: | ---: | ---: |
+| Only ASCII chars | **231.2** | 23.6 | 9.8× |
+| Unicode chars | **207.5** | 46.7 | 4.4× |
+| Unique multi-codepoint Unicode cells | **307.2** | 49.3 | 6.2× |
+| CSI codes with few chars | **89.6** | 15.6 | 5.7× |
+| Long escape codes | **317.9** | 194.9 | 1.6× |
+| Images | **305.8** | 270.5 | 1.1× |
+
+</details>
+
+On Linux, compared with kitty on Ubuntu 20.04 (i9-12900K), at 180×50 with `TERM=xterm-256color`, in Xvfb with CPU software rendering. ThinkTerm again ran through its local mux.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-linux-dark.svg">
+    <img src="assets/performance-linux-light.svg" alt="ThinkTerm throughput compared with kitty on Linux in five kitten benchmark workloads: ThinkTerm is faster in all five, from 1.6× to 3.4×" width="100%">
+  </picture>
+</p>
+
+<details>
+<summary>Table data</summary>
+
+| Workload | ThinkTerm 0.4.2<br>2026-11-05 | kitty 0.47.4<br>2026-11-05 | Ratio |
+| --- | ---: | ---: | ---: |
+| Only ASCII chars | **224.1** | 80.0 | 2.8× |
+| Unicode chars | **186.8** | 79.0 | 2.4× |
+| CSI codes with few chars | **71.1** | 43.2 | 1.6× |
+| Long escape codes | **624.6** | 241.2 | 2.6× |
+| Images | **663.3** | 196.3 | 3.4× |
+
+</details>
+
+Progress across versions on the same Mac. Ratio compares 0.4.3 with the early build.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-progress-dark.svg">
+    <img src="assets/performance-progress-light.svg" alt="ThinkTerm throughput across versions in six kitten benchmark workloads, from an early build through 0.3.0, 0.4.1 and 0.4.2 to 0.4.3: 0.4.3 is ahead of the early build in all six, from 1.3× to 4.9×" width="100%">
+  </picture>
+</p>
+
+<details>
+<summary>Table data</summary>
+
+| Workload | ThinkTerm early<br>2026-09 | ThinkTerm 0.3.0<br>2026-10-21 | ThinkTerm 0.4.1<br>2026-11-04 | ThinkTerm 0.4.2<br>2026-11-05 | ThinkTerm 0.4.3<br>2026-11-06 | Ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Only ASCII chars | 45.3 | 133.0 | 134.0 | 206.1 | **221.4** | 4.9× |
+| Unicode chars | 52.2 | 104.5 | 109.2 | 192.4 | **193.2** | 3.7× |
+| Unique multi-codepoint Unicode cells | 67.8 | 197.5 | 234.4 | 200.9 | **285.3** | 4.2× |
+| CSI codes with few chars | 25.7 | 49.5 | 53.5 | 90.9 | **89.9** | 3.5× |
+| Long escape codes | 219.4 | 213.8 | 257.3 | 219.3 | **278.6** | 1.3× |
+| Images | 218.0 | 257.2 | 271.0 | 216.4 | **278.4** | 1.3× |
+
+</details>
+
+Progress across versions on the same Linux setup. Ratio compares 0.4.2 with 143b60a2.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-linux-progress-dark.svg">
+    <img src="assets/performance-linux-progress-light.svg" alt="ThinkTerm throughput across versions on Linux in five kitten benchmark workloads, from 143b60a2 through 0.4.1 to 0.4.2: 0.4.2 is ahead of 143b60a2 in all five, from 1.2× to 2.2×" width="100%">
+  </picture>
+</p>
+
+<details>
+<summary>Table data</summary>
+
+| Workload | ThinkTerm 143b60a2<br>2026-10-02 | ThinkTerm 0.4.1<br>2026-11-05 | ThinkTerm 0.4.2<br>2026-11-05 | Ratio |
+| --- | ---: | ---: | ---: | ---: |
+| Only ASCII chars | 147.4 | 156.2 | **224.1** | 1.5× |
+| Unicode chars | 85.6 | 96.8 | **186.8** | 2.2× |
+| CSI codes with few chars | 50.0 | 52.2 | **71.1** | 1.4× |
+| Long escape codes | 533.5 | 649.9 | **624.6** | 1.2× |
+| Images | 391.8 | 346.0 | **663.3** | 1.7× |
+
+</details>
+
+## Why ThinkTerm
+
+Running several agents across different projects quickly turns a tab bar into a guessing game: which session is working, which needs input, and where did that build finish? ThinkTerm puts the project structure and work status beside the terminal, with local and remote work visible together.
+
+Rust powers ThinkTerm's terminal core, mux server, desktop client, and TUI. The desktop renders through the GPU without Electron or an embedded web view. GPUI, Zed's UI framework, does not meet ThinkTerm's performance requirements for terminal rendering. Built on WezTerm, this native foundation supports workspace organization, persistent remote sessions, and tools for working alongside agents.
 
 ## A multiplexer at the core
 
@@ -65,61 +171,6 @@ A terminal multiplexer manages multiple terminal sessions and lets clients attac
 - **Update without dropping sessions.** When the desktop updates ThinkTerm on a server, the running mux server hands its sessions to the new version, so shells, builds, and agents keep running.
 
 Session persistence depends on the mux server and its host remaining available; it does not restore running processes after a server restart or host reboot.
-
-## Why ThinkTerm
-
-Running several agents across different projects quickly turns a tab bar into a guessing game: which session is working, which needs input, and where did that build finish? ThinkTerm puts the project structure and work status beside the terminal, with local and remote work visible together.
-
-Rust powers ThinkTerm's terminal core, mux server, desktop client, and TUI. The desktop renders through the GPU without Electron or an embedded web view. GPUI, Zed's UI framework, does not meet ThinkTerm's performance requirements for terminal rendering. Built on WezTerm, this native foundation supports workspace organization, persistent remote sessions, and tools for working alongside agents.
-
-## Performance
-
-Throughput compared with WezTerm, measured with kitty's `kitten __benchmark__` on the same Mac (MB/s, higher is better).
-
-ThinkTerm was measured with its local mux: the shell runs in the mux server, and its output passes through the mux before it reaches the window.
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-dark.svg">
-    <img src="assets/performance-light.svg" alt="ThinkTerm throughput compared with WezTerm in six kitten benchmark workloads: ThinkTerm is faster in five, from 1.1× to 5.6×, and slightly slower on images (0.95×)" width="100%">
-  </picture>
-</p>
-
-<details>
-<summary>Table data</summary>
-
-| Workload | ThinkTerm 0.3.0<br>2026-10-21 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | Ratio |
-| --- | ---: | ---: | ---: |
-| Only ASCII chars | **133.0** | 23.6 | 5.6× |
-| Unicode chars | **104.5** | 46.7 | 2.2× |
-| Unique multi-codepoint Unicode cells | **197.5** | 49.3 | 4.0× |
-| CSI codes with few chars | **49.5** | 15.6 | 3.2× |
-| Long escape codes | **213.8** | 194.9 | 1.1× |
-| Images | 257.2 | **270.5** | 0.95× |
-
-</details>
-
-On Linux, compared with kitty on Ubuntu 20.04 (i9-12900K), at 180×50 with `TERM=xterm-256color`, in Xvfb with CPU software rendering. ThinkTerm again ran through its local mux.
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-linux-dark.svg">
-    <img src="assets/performance-linux-light.svg" alt="ThinkTerm throughput compared with kitty on Linux in five kitten benchmark workloads: ThinkTerm is faster in all five, from 1.1× to 2.2×" width="100%">
-  </picture>
-</p>
-
-<details>
-<summary>Table data</summary>
-
-| Workload | ThinkTerm 143b60a2<br>2026-10-02 | kitty 0.47.4<br>2026-10-02 | Ratio |
-| --- | ---: | ---: | ---: |
-| Only ASCII chars | **147.4** | 79.4 | 1.9× |
-| Unicode chars | **85.6** | 78.7 | 1.1× |
-| CSI codes with few chars | **50.0** | 44.0 | 1.1× |
-| Long escape codes | **533.5** | 238.1 | 2.2× |
-| Images | **391.8** | 181.0 | 2.2× |
-
-</details>
 
 ## Workspaces that follow your work
 
@@ -142,7 +193,7 @@ Local and remote workspaces share the sidebar. Thread status helps distinguish r
 - **Snippets and plugins.** Snippets is built in. Plugins can add sidebar panels to the desktop and browser; the repository includes a [Diff plugin](plugins/diff) for inspecting the adjacent terminal's Git changes. Build your own plugins in Rust with the [ThinkTerm SDK](docs/thinkterm/plugins.md#rust-sdk). Find plugins others share under the GitHub topic [`thinkterm-plugin`](https://github.com/topics/thinkterm-plugin). See the [plugin guide](docs/thinkterm/plugins.md) for setup and development.
 - **A capable terminal core.** Ligatures, color emoji, true color, hyperlinks, inline images, copy mode, and shell integration come from WezTerm. See the [WezTerm feature reference](https://wezterm.org/features.html) for more terminal capabilities.
 - **Native desktop settings.** Adjust themes, UI font sizes, terminal options, and the renderer. Both the main window and settings support WebGPU and OpenGL, with an OpenGL fallback if WebGPU initialization fails.
-- **Five interface languages.** English, 简体中文, 日本語, Français, and Deutsch.
+- **Six interface languages.** English, 简体中文, 日本語, Français, Deutsch, and Русский.
 
 The CLI also exposes panes to automation: `thinkterm cli send-text` sends input, `send-key` presses keys, `get-text` reads terminal output, and `wait` and `events` report when a command finishes or something happens in a pane. Label a pane with `set-pane-label` to address it by name. Agents can use these commands to interact through their terminals. The [collaboration notes](docs/thinkterm/agent-collaboration.md) describe the demonstrated workflow and the limits of terminal input as a messaging mechanism.
 
@@ -175,6 +226,8 @@ See [Browser access](docs/thinkterm/web-access.md) for listener setup, tokens, S
 ### Mobile development
 
 The [iOS](ios) and [Android](android) apps use native interfaces and the shared [mobile core](thinkterm-mobile). They connect over SSH to sessions on another machine. They are under active development and are not presented here as released mobile products.
+
+Android updates: [F-Droid repository](https://github.com/RoversX/fdroid/tree/dist).
 
 ## Getting started
 

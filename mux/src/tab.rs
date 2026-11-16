@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use rangeset::intersects_range;
 use std::collections::HashMap;
 use std::convert::TryInto;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use wezterm_term::TerminalSize;
 
 pub type PaneStackId = usize;
@@ -152,7 +152,9 @@ impl PaneStack {
         self.active = self.panes.len().saturating_sub(1);
     }
 
-    fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
+    /// `along_bottom`: whether the stack runs along the tree's bottom edge,
+    /// where a frontend may let its panes take the room under the tree.
+    fn resize(&self, size: TerminalSize, along_bottom: bool) -> anyhow::Result<()> {
         for pane in &self.panes {
             // Remote mirror panes are sized by the GUI layer, which
             // subtracts per-pane chrome (the pane nav bar) from the cell
@@ -165,7 +167,7 @@ impl PaneStack {
             // registered cell metrics: convert the tree's pixel rect with
             // the pane's own font scale and chrome so this write agrees
             // with the GUI's, instead of fighting it (no entry = raw size).
-            let size = crate::pane::apply_frontend_cell_metrics(pane.pane_id(), size);
+            let size = crate::pane::apply_frontend_cell_metrics(pane.pane_id(), size, along_bottom);
             log::debug!(
                 target: "sizetrace",
                 "stack resize pane {} -> {}x{} ({}x{}px)",
@@ -250,7 +252,11 @@ struct TabInner {
     zoomed: Option<Arc<dyn Pane>>,
     title: String,
     recency: Recency,
+    delegated_panes: HashMap<PaneId, Weak<()>>,
 }
+
+/// A pane's uninterrupted membership in this tab, retained only by exports.
+pub(crate) struct PaneMembership(Arc<()>);
 
 /// A Tab is a container of Panes
 pub struct Tab {
@@ -615,38 +621,43 @@ fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &Termina
                         }
                         return;
                     }
+                    // The lower side first, a row each in turn: its panes run on
+                    // into the window's room under the tree, which a row given
+                    // or taken anywhere else would take from or give to them,
+                    // so that they would lose a row as the window grew and get
+                    // one back as it went on.
                     SplitDirection::Vertical if y_adjust > 0 => {
-                        adjust_y_size(&mut *left, 1, cell_dimensions);
-                        data.first.rows += 1;
-                        data.first.pixel_height =
-                            data.first.rows.saturating_mul(cell_dimensions.pixel_height);
+                        adjust_y_size(&mut *right, 1, cell_dimensions);
+                        data.second.rows += 1;
+                        data.second.pixel_height = data
+                            .second
+                            .rows
+                            .saturating_mul(cell_dimensions.pixel_height);
                         y_adjust -= 1;
                         if y_adjust > 0 {
-                            adjust_y_size(&mut *right, 1, cell_dimensions);
-                            data.second.rows += 1;
-                            data.second.pixel_height = data
-                                .second
-                                .rows
-                                .saturating_mul(cell_dimensions.pixel_height);
+                            adjust_y_size(&mut *left, 1, cell_dimensions);
+                            data.first.rows += 1;
+                            data.first.pixel_height =
+                                data.first.rows.saturating_mul(cell_dimensions.pixel_height);
                             y_adjust -= 1;
                         }
                     }
                     SplitDirection::Vertical => {
                         // y_adjust is negative
-                        if data.first.rows > 1 {
-                            adjust_y_size(&mut *left, -1, cell_dimensions);
-                            data.first.rows -= 1;
-                            data.first.pixel_height =
-                                data.first.rows.saturating_mul(cell_dimensions.pixel_height);
-                            y_adjust += 1;
-                        }
-                        if y_adjust < 0 && data.second.rows > 1 {
+                        if data.second.rows > 1 {
                             adjust_y_size(&mut *right, -1, cell_dimensions);
                             data.second.rows -= 1;
                             data.second.pixel_height = data
                                 .second
                                 .rows
                                 .saturating_mul(cell_dimensions.pixel_height);
+                            y_adjust += 1;
+                        }
+                        if y_adjust < 0 && data.first.rows > 1 {
+                            adjust_y_size(&mut *left, -1, cell_dimensions);
+                            data.first.rows -= 1;
+                            data.first.pixel_height =
+                                data.first.rows.saturating_mul(cell_dimensions.pixel_height);
                             y_adjust += 1;
                         }
                     }
@@ -659,7 +670,12 @@ fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &Termina
     }
 }
 
-fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) -> anyhow::Result<()> {
+/// `along_bottom`: whether `tree` runs along the bottom edge of the whole.
+fn apply_sizes_from_splits(
+    tree: &Tree,
+    size: &TerminalSize,
+    along_bottom: bool,
+) -> anyhow::Result<()> {
     match tree {
         Tree::Empty => return Ok(()),
         Tree::Node { data: None, .. } => return Ok(()),
@@ -668,14 +684,25 @@ fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) -> anyhow::Result<(
             right,
             data: Some(data),
         } => {
-            apply_sizes_from_splits(&*left, &data.first)?;
-            apply_sizes_from_splits(&*right, &data.second)?;
+            // Of two sides stacked one over the other, the upper stops short.
+            let stacked = data.direction == SplitDirection::Vertical;
+            apply_sizes_from_splits(&*left, &data.first, along_bottom && !stacked)?;
+            apply_sizes_from_splits(&*right, &data.second, along_bottom)?;
         }
         Tree::Leaf(stack) => {
-            stack.resize(*size)?;
+            stack.resize(*size, along_bottom)?;
         }
     }
     Ok(())
+}
+
+/// Whether the leaf `cursor` is at runs along the tree's bottom edge: below
+/// the divider of every split above it that stacks its two sides.
+fn runs_along_bottom(cursor: &Cursor) -> bool {
+    cursor.path_to_root().all(|(branch, split)| match split {
+        Some(split) if split.direction == SplitDirection::Vertical => branch == PathBranch::IsRight,
+        _ => true,
+    })
 }
 
 /// If `old` and `new` share the same split topology (node/leaf shape and
@@ -979,14 +1006,22 @@ impl Tab {
     }
 
     pub fn set_title(&self, title: &str) {
-        let mut inner = self.inner.lock();
-        if inner.title != title {
+        let tab_id = {
+            let mut inner = self.inner.lock();
+            if inner.title == title {
+                return;
+            }
             inner.title = title.to_string();
-            Mux::try_get().map(|mux| {
-                mux.notify(MuxNotification::TabTitleChanged {
-                    tab_id: inner.id,
-                    title: title.to_string(),
-                })
+            inner.id
+        };
+        // Notified with the lock released: a subscriber is allowed to read
+        // this tab. The client domain does, deriving a mirror's remote tab
+        // id from its panes when the tab map has no entry, and reading the
+        // tab takes this same lock.
+        if let Some(mux) = Mux::try_get() {
+            mux.notify(MuxNotification::TabTitleChanged {
+                tab_id,
+                title: title.to_string(),
             });
         }
     }
@@ -1047,6 +1082,48 @@ impl Tab {
 
     pub fn contains_pane(&self, pane: PaneId) -> bool {
         self.inner.lock().contains_pane(pane)
+    }
+
+    pub(crate) fn capture_delegated_pane(
+        &self,
+        pane: PaneId,
+    ) -> thinkterm_reverse_access::Result<PaneMembership> {
+        use thinkterm_reverse_access::Error;
+        let mut inner = self.inner.try_lock().ok_or(Error::Busy)?;
+        if !inner.contains_pane(pane) {
+            return Err(Error::Unavailable);
+        }
+        inner
+            .delegated_panes
+            .retain(|_, token| token.strong_count() > 0);
+        if let Some(token) = inner.delegated_panes.get(&pane).and_then(Weak::upgrade) {
+            return Ok(PaneMembership(token));
+        }
+        if inner.delegated_panes.len() >= thinkterm_reverse_access::MAX_TARGETS {
+            return Err(Error::TooLarge);
+        }
+        let token = Arc::new(());
+        inner.delegated_panes.insert(pane, Arc::downgrade(&token));
+        Ok(PaneMembership(token))
+    }
+
+    pub(crate) fn with_delegated_panes<T>(
+        &self,
+        panes: &[(PaneId, &PaneMembership)],
+        submit: impl FnOnce() -> T,
+    ) -> thinkterm_reverse_access::Result<T> {
+        use thinkterm_reverse_access::Error;
+        let inner = self.inner.try_lock().ok_or(Error::Busy)?;
+        if panes.iter().any(|(pane, token)| {
+            !inner.contains_pane(*pane)
+                || !inner
+                    .delegated_panes
+                    .get(pane)
+                    .is_some_and(|current| current.ptr_eq(&Arc::downgrade(&token.0)))
+        }) {
+            return Err(Error::Unavailable);
+        }
+        Ok(submit())
     }
 
     /// Whether a native frontend viewport describes every split leaf in this
@@ -1118,9 +1195,10 @@ impl Tab {
     /// Apply the new size of the tab to the panes contained within.
     /// The delta between the current and the new size is computed,
     /// and is distributed between the splits.  For small resizes
-    /// this algorithm biases towards adjusting the left/top nodes
-    /// first.  For large resizes this tends to proportionally adjust
-    /// the relative sizes of the elements in a split.
+    /// this algorithm biases towards adjusting the left nodes first,
+    /// and the lower ones of a vertical split (see `adjust_y_size`).
+    /// For large resizes this tends to proportionally adjust the
+    /// relative sizes of the elements in a split.
     pub fn resize(&self, size: TerminalSize) -> bool {
         self.inner.lock().resize(size)
     }
@@ -1228,6 +1306,34 @@ impl Tab {
     /// be added to a different tab.
     pub fn remove_pane(&self, pane_id: PaneId) -> Option<Arc<dyn Pane>> {
         self.inner.lock().remove_pane(pane_id)
+    }
+
+    pub(crate) fn move_pane_to_split(
+        &self,
+        pane_id: PaneId,
+        target: PaneId,
+        request: SplitRequest,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        let mut inner = self.inner.lock();
+        let membership = inner.delegated_panes.remove(&pane_id);
+        let pane = inner
+            .remove_pane(pane_id)
+            .ok_or_else(|| anyhow::anyhow!("pane {pane_id} not found in tab"))?;
+        let result = match inner.pane_index_for_pane(target) {
+            Some(index) => inner.split_and_insert(index, request, Arc::clone(&pane)),
+            None => Err(anyhow::anyhow!(
+                "target pane {target} vanished while moving pane"
+            )),
+        };
+        if result.is_err() {
+            inner.push_pane_into_first_stack(&pane);
+        }
+        if let Some(membership) = membership {
+            inner.delegated_panes.insert(pane_id, membership);
+        }
+        result?;
+        inner.set_active_pane(&pane);
+        Ok(pane)
     }
 
     pub fn can_close_without_prompting(&self, reason: CloseReason) -> bool {
@@ -1391,6 +1497,7 @@ impl TabInner {
             zoomed: None,
             title: String::new(),
             recency: Recency::default(),
+            delegated_panes: HashMap::new(),
         }
     }
 
@@ -1505,6 +1612,14 @@ impl TabInner {
         self.recency.tag(self.active);
         self.pane.replace(cursor.tree());
         self.zoomed = zoomed;
+        let retained: Vec<_> = self
+            .delegated_panes
+            .keys()
+            .copied()
+            .filter(|pane| self.contains_pane(*pane))
+            .collect();
+        self.delegated_panes
+            .retain(|pane, token| token.strong_count() > 0 && retained.contains(pane));
 
         // For a changed topology the rebuilt tree carries the peer's cell
         // geometry (derived from its pane dimensions, which for client
@@ -1569,7 +1684,7 @@ impl TabInner {
             // split sizes down to them and say so, the way a real resize
             // would, so the GUI adopts and publishes the new frames.
             if let Some(root) = self.pane.as_ref() {
-                if let Err(err) = apply_sizes_from_splits(root, &self.size) {
+                if let Err(err) = apply_sizes_from_splits(root, &self.size, true) {
                     log::error!("failed to resize panes after topology change: {err:#}");
                 }
             }
@@ -1924,7 +2039,9 @@ impl TabInner {
                 Err(c) => {
                     self.pane.replace(c.tree());
                     let size = self.size;
-                    if let Err(err) = apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size) {
+                    if let Err(err) =
+                        apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size, true)
+                    {
                         log::error!("failed to resize panes after rotation: {err:#}");
                     }
                     break;
@@ -1954,7 +2071,9 @@ impl TabInner {
                 Err(c) => {
                     self.pane.replace(c.tree());
                     let size = self.size;
-                    if let Err(err) = apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size) {
+                    if let Err(err) =
+                        apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size, true)
+                    {
                         log::error!("failed to resize panes after rotation: {err:#}");
                     }
                     break;
@@ -2114,6 +2233,12 @@ impl TabInner {
     }
 
     fn resize(&mut self, size: TerminalSize) -> bool {
+        self.resize_tree(size, true)
+    }
+
+    /// `resize`, for a tree that runs along the bottom edge of the whole
+    /// only if `along_bottom`: one about to have a pane put under it.
+    fn resize_tree(&mut self, size: TerminalSize, along_bottom: bool) -> bool {
         if size.rows == 0 || size.cols == 0 {
             // Ignore "impossible" resize requests
             return false;
@@ -2196,7 +2321,9 @@ impl TabInner {
             self.size = size;
 
             // And then resize the individual panes to match
-            if let Err(err) = apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size) {
+            if let Err(err) =
+                apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size, along_bottom)
+            {
                 log::error!("failed to resize panes after split adjustment: {err:#}");
             }
         }
@@ -2715,8 +2842,9 @@ impl TabInner {
 
             if cursor.is_leaf() {
                 // Apply our size to the tty
+                let along_bottom = runs_along_bottom(&cursor);
                 if let Some(stack) = cursor.leaf_mut() {
-                    if let Err(err) = stack.resize(pane_size) {
+                    if let Err(err) = stack.resize(pane_size, along_bottom) {
                         log::error!("failed to resize pane stack: {err:#}");
                     }
                 }
@@ -3036,8 +3164,9 @@ impl TabInner {
                             dpi: cell_dims.dpi,
                         };
 
+                        let along_bottom = runs_along_bottom(&cursor);
                         if let Some(stack) = cursor.leaf_mut() {
-                            if let Err(err) = stack.resize(size) {
+                            if let Err(err) = stack.resize(size, along_bottom) {
                                 log::error!("failed to resize pane stack after removal: {err:#}");
                             }
                         } else {
@@ -3045,8 +3174,9 @@ impl TabInner {
                         }
                     } else if !dead_panes.is_empty() {
                         // Apply our revised size to the tty
+                        let along_bottom = runs_along_bottom(&cursor);
                         if let Some(stack) = cursor.leaf_mut() {
-                            if let Err(err) = stack.resize(pane_size) {
+                            if let Err(err) = stack.resize(pane_size, along_bottom) {
                                 log::error!("failed to resize pane stack after removal: {err:#}");
                             }
                         }
@@ -3074,6 +3204,9 @@ impl TabInner {
         }
 
         if !dead_panes.is_empty() {
+            for pane in &dead_panes {
+                self.delegated_panes.remove(&pane.pane_id());
+            }
             self.advise_focus_change(prior);
         }
 
@@ -3426,9 +3559,13 @@ impl TabInner {
         }
 
         // Detach: remove_pane handles emptied-stack pruning and geometry.
+        let membership = self.delegated_panes.remove(&src_pane_id);
         let removed = self.remove_pane(src_pane_id).ok_or_else(|| {
             anyhow::anyhow!("pane {src_pane_id} vanished while moving between stacks")
         })?;
+        if let Some(membership) = membership {
+            self.delegated_panes.insert(src_pane_id, membership);
+        }
 
         // Attach: walk the (possibly restructured) tree and push into the
         // target stack. No fallible steps; resize after the removal's
@@ -3631,6 +3768,8 @@ impl TabInner {
     }
 
     fn assign_pane(&mut self, pane: &Arc<dyn Pane>) {
+        self.delegated_panes
+            .retain(|id, token| *id == pane.pane_id() && token.strong_count() > 0);
         match Tree::new()
             .cursor()
             .assign_top(PaneStack::new(Arc::clone(pane)))
@@ -3687,7 +3826,7 @@ impl TabInner {
 
             // Advise the panes of their new sizes
             let size = self.size;
-            if let Err(err) = apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size) {
+            if let Err(err) = apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size, true) {
                 log::error!("failed to resize panes after moving active pane: {err:#}");
             }
         }
@@ -3835,14 +3974,20 @@ impl TabInner {
                 false
             };
 
+            // A split that puts the new pane under the rest takes the rest
+            // off the tree's bottom edge, before they are resized to make
+            // room for it.
+            let goes_below =
+                request.direction == SplitDirection::Vertical && request.target_is_second;
+
             if needs_resize {
                 // Pre-emptively resize the tab contents down to
                 // match the target size; it's easier to reuse
                 // existing resize logic that way
                 if request.target_is_second {
-                    self.resize(split_info.first.clone());
+                    self.resize_tree(split_info.first.clone(), !goes_below);
                 } else {
-                    self.resize(split_info.second.clone());
+                    self.resize_tree(split_info.second.clone(), true);
                 }
             }
 
@@ -3885,6 +4030,11 @@ impl TabInner {
                 }
             };
 
+            // The pane split, and so both halves when they stand side by
+            // side; stacked, only the lower.
+            let along_bottom = runs_along_bottom(&cursor);
+            let first_along_bottom =
+                along_bottom && split_info.direction != SplitDirection::Vertical;
             let existing_stack = cursor.leaf_mut().unwrap().clone();
             let new_stack = PaneStack::new(pane);
 
@@ -3894,8 +4044,8 @@ impl TabInner {
                 (new_stack, existing_stack)
             };
 
-            stack1.resize(split_info.first)?;
-            stack2.resize(split_info.second)?;
+            stack1.resize(split_info.first, first_along_bottom)?;
+            stack2.resize(split_info.second, along_bottom)?;
 
             *cursor.leaf_mut().unwrap() = stack1;
 
@@ -4403,10 +4553,44 @@ mod test {
         // test threads would register their windows and panes into whichever
         // instance is installed at that moment, corrupting each other's
         // still-referenced scans — so global-Mux tests run one at a time.
-        static SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-        let serial = SERIAL.lock();
+        let serial = crate::GLOBAL_MUX_TESTS.lock();
         Mux::set_mux(&Arc::new(Mux::new(None)));
         MuxTestGuard { _serial: serial }
+    }
+
+    /// `set_title` changes the title and tells the mux about it. A
+    /// subscriber is allowed to read the tab it was told about: the client
+    /// domain does exactly that when a mirror's remote-id mapping is
+    /// missing, falling back to the panes' own remote tab id. Holding the
+    /// tab's lock across `Mux::notify` turns that read into a self-deadlock
+    /// on the GUI thread, with the rename never reaching the server.
+    #[test]
+    fn set_title_notifies_without_holding_the_tab_lock() {
+        let _mux = install_mux();
+        let size = test_size();
+        let tab = Arc::new(Tab::new(&size));
+        let watcher = Arc::clone(&tab);
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen_in_callback = Arc::clone(&seen);
+        Mux::get().subscribe(move |n| {
+            if matches!(n, MuxNotification::TabTitleChanged { .. }) {
+                seen_in_callback.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                assert!(
+                    watcher.count_panes().is_some(),
+                    "Tab::set_title held the tab lock while notifying; a \
+                     subscriber that reads the tab deadlocks"
+                );
+            }
+            true
+        });
+
+        tab.set_title("renamed");
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the title change must reach subscribers"
+        );
+        assert_eq!(tab.get_title(), "renamed");
     }
 
     #[test]
@@ -5767,6 +5951,7 @@ mod test {
         mux.add_tab_no_panes(&tab);
         mux.add_pane(&target).unwrap();
         mux.add_pane(&src).unwrap();
+        let membership = tab.capture_delegated_pane(src.pane_id()).unwrap();
 
         let moved = mux
             .move_pane_to_split(
@@ -5782,6 +5967,110 @@ mod test {
         assert_eq!(tab.iter_panes().len(), 2);
         assert!(tab.pane_index_for_pane(target.pane_id()).is_some());
         assert!(tab.pane_index_for_pane(src.pane_id()).is_some());
+        assert!(tab
+            .with_delegated_panes(&[(src.pane_id(), &membership)], || ())
+            .is_ok());
+    }
+
+    #[test]
+    fn delegated_membership_does_not_survive_a_tab_round_trip() {
+        use thinkterm_reverse_access::Error;
+        let _guard = install_mux();
+        let mux = Mux::get();
+        let size = test_size();
+        let first = Arc::new(Tab::new(&size));
+        let second = Arc::new(Tab::new(&size));
+        let pane = FakePane::new(10_051, size);
+        let spare = FakePane::new(10_052, size);
+        let target = FakePane::new(10_053, size);
+        first.assign_pane(&spare);
+        first
+            .add_pane_to_stack(spare.pane_id(), pane.clone())
+            .unwrap();
+        second.assign_pane(&target);
+        for tab in [&first, &second] {
+            mux.add_tab_no_panes(tab);
+        }
+        for pane in [&pane, &spare, &target] {
+            mux.add_pane(pane).unwrap();
+        }
+        let membership = first.capture_delegated_pane(pane.pane_id()).unwrap();
+        let unaffected = first.capture_delegated_pane(spare.pane_id()).unwrap();
+        {
+            let _lock = first.inner.lock();
+            assert_eq!(
+                first.with_delegated_panes(&[(pane.pane_id(), &membership)], || ()),
+                Err(Error::Busy)
+            );
+        }
+        mux.move_pane_to_split(
+            pane.pane_id(),
+            second.tab_id(),
+            target.pane_id(),
+            SplitRequest::default(),
+        )
+        .unwrap();
+        mux.move_pane_to_split(
+            pane.pane_id(),
+            first.tab_id(),
+            spare.pane_id(),
+            SplitRequest::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            first.with_delegated_panes(&[(pane.pane_id(), &membership)], || ()),
+            Err(Error::Unavailable)
+        );
+        assert!(first
+            .with_delegated_panes(&[(spare.pane_id(), &unaffected)], || ())
+            .is_ok());
+        let fresh = first.capture_delegated_pane(pane.pane_id()).unwrap();
+        assert!(first
+            .with_delegated_panes(&[(pane.pane_id(), &fresh)], || ())
+            .is_ok());
+        first.remove_pane(pane.pane_id()).unwrap();
+        assert_eq!(
+            first.with_delegated_panes(&[(pane.pane_id(), &fresh)], || ()),
+            Err(Error::Unavailable)
+        );
+    }
+
+    #[test]
+    fn delegated_membership_tracks_tree_replacement_but_not_layout_changes() {
+        use thinkterm_reverse_access::Error;
+        let _guard = install_mux();
+        let size = test_size();
+        let tab = Tab::new(&size);
+        let first = FakePane::new(1, size);
+        let second = FakePane::new(2, size);
+        tab.assign_pane(&first);
+        let membership = tab.capture_delegated_pane(1).unwrap();
+        tab.split_and_insert(0, SplitRequest::default(), second.clone())
+            .unwrap();
+        tab.move_pane_to_stack(1, 2).unwrap();
+        tab.resize(TerminalSize { cols: 100, ..size });
+        assert!(tab.with_delegated_panes(&[(1, &membership)], || ()).is_ok());
+        tab.sync_with_pane_tree(size, PaneNode::Leaf(pane_entry(1, size, true)), |_| {
+            first.clone()
+        });
+        assert!(tab.with_delegated_panes(&[(1, &membership)], || ()).is_ok());
+        tab.sync_with_pane_tree(size, PaneNode::Leaf(pane_entry(2, size, true)), |_| {
+            second.clone()
+        });
+        tab.sync_with_pane_tree(size, PaneNode::Leaf(pane_entry(1, size, true)), |_| {
+            first.clone()
+        });
+        assert_eq!(
+            tab.with_delegated_panes(&[(1, &membership)], || ()),
+            Err(Error::Unavailable)
+        );
+        let fresh = tab.capture_delegated_pane(1).unwrap();
+        tab.assign_pane(&second);
+        tab.assign_pane(&first);
+        assert_eq!(
+            tab.with_delegated_panes(&[(1, &fresh)], || ()),
+            Err(Error::Unavailable)
+        );
     }
 
     #[test]
