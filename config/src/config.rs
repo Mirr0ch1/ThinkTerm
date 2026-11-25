@@ -641,7 +641,15 @@ pub struct Config {
     #[dynamic(default)]
     pub macos_window_glass: MacosWindowGlass,
 
-    /// Only works on KDE Wayland
+    /// Only works on Wayland, and on KDE X11: asks the compositor to blur
+    /// behind a see-through window. The blur is done by the compositor, so it
+    /// costs no extra work in ThinkTerm.
+    #[dynamic(default)]
+    pub window_background_blur: bool,
+
+    /// Deprecated alias for `window_background_blur` from when only KDE
+    /// Wayland was supported. Kept so existing configuration files keep
+    /// working.
     #[dynamic(default)]
     pub kde_window_background_blur: bool,
 
@@ -1074,6 +1082,12 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Whether a see-through window should ask its compositor for background
+    /// blur. `kde_window_background_blur` is the old name for the same switch.
+    pub fn background_blur_enabled(&self) -> bool {
+        self.window_background_blur || self.kde_window_background_blur
+    }
+
     pub fn inactive_pane_hsb_for_background(&self, background: SrgbaTuple) -> HsbTransform {
         self.inactive_pane_hsb
             .unwrap_or_else(|| HsbTransform::for_inactive_pane(background))

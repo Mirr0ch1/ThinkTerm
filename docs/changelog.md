@@ -22,6 +22,11 @@ usually the best available version.
 As features stabilize some brief notes about them will accumulate here.
 
 #### Changed
+* Linux: [window_background_blur](config/lua/config/kde_window_background_blur.md)
+  now uses the standard Wayland `ext-background-effect-v1` protocol, which
+  covers GNOME 51+, KDE Plasma 6.7+, Hyprland, niri and COSMIC. KWin's older
+  protocol remains as a fallback, and KWin X11 is supported through its window
+  property. `kde_window_background_blur` remains as an alias.
 * DECRQCRA is now disabled by default to prevent silent screen scraping.
   Set `enable_checksum_rectangular_area = true` to re-enable it.
   Thanks to @jquast! #7701

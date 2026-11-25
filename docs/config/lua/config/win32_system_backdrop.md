@@ -32,8 +32,8 @@ for the backdrop effect to work.  For best results with both `"Mica"` and
 See also [macos_window_background_blur](macos_window_background_blur.md) for
 a similar effect on macOS.
 
-See also [kde_window_background_blur](kde_window_background_blur.md) for a similar
-effect on KDE Wayland.
+See also [window_background_blur](kde_window_background_blur.md) for a similar
+effect on Wayland and KDE X11.
 
 ## Acrylic
 

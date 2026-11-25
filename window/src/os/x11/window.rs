@@ -2248,6 +2248,7 @@ impl XWindow {
             .lock()
             .unwrap()
             .adjust_decorations(config.window_decorations)?;
+        window.lock().unwrap().update_background_blur();
 
         let window_handle = Window::X11(XWindow::from_id(window_id));
 
@@ -2418,6 +2419,7 @@ impl XWindowInner {
             self.config.dpi != config.dpi || self.config.dpi_by_screen != config.dpi_by_screen;
         self.config = config.clone();
         let _ = self.adjust_decorations(config.window_decorations);
+        self.update_background_blur();
 
         if dpi_changed {
             let _ = self.configure_notify("config reload", self.width, self.height);
@@ -2547,6 +2549,31 @@ impl XWindowInner {
             r#type: conn.atom_utf8_string,
             data: title.as_bytes(),
         });
+    }
+
+    /// Ask KWin X11 to blur behind this window. The property is ignored by
+    /// other compositors, so it is safe to set everywhere; a see-through
+    /// window on GNOME X11 or Xfwm4 still gets plain transparency.
+    fn update_background_blur(&self) {
+        let conn = self.conn();
+        let enabled = self.config.background_blur_enabled()
+            && self.config.window_background_opacity < 1.0;
+        if enabled {
+            conn.send_request_no_reply_log(&xcb::x::ChangeProperty {
+                mode: PropMode::Replace,
+                window: self.window_id,
+                property: conn.atom_kde_net_wm_blur_behind_region,
+                r#type: xcb::x::ATOM_CARDINAL,
+                // 0 asks KWin for the whole window; the property is a list of
+                // rectangles, and a single zero is the documented shorthand.
+                data: &[0u32],
+            });
+        } else {
+            conn.send_request_no_reply_log(&xcb::x::DeleteProperty {
+                window: self.window_id,
+                property: conn.atom_kde_net_wm_blur_behind_region,
+            });
+        }
     }
 
     fn set_text_cursor_position(&mut self, cursor: Rect) {

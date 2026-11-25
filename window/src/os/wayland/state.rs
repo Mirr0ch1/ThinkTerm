@@ -31,6 +31,7 @@ use wayland_client::globals::GlobalList;
 use wayland_client::protocol::wl_keyboard::WlKeyboard;
 use wayland_client::protocol::wl_output::WlOutput;
 use wayland_client::{delegate_dispatch, Connection, QueueHandle};
+use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1;
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur_manager::OrgKdeKwinBlurManager;
@@ -74,6 +75,10 @@ pub(super) struct WaylandState {
     pub(super) primary_selection_source: Option<(PrimarySelectionSource, String)>,
     pub(super) shm: Shm,
     pub(super) mem_pool: RefCell<SlotPool>,
+    /// Current compositor blur protocol; KWin 6.7 and GNOME 51+ offer it.
+    pub(super) ext_background_effect_manager: Option<ExtBackgroundEffectManagerV1>,
+    pub(super) ext_background_blur_available: bool,
+    /// Plasma 6.6 and older only had KWin's private protocol.
     pub(super) kde_blur_manager: Option<OrgKdeKwinBlurManager>,
     /// xdg-activation, when the compositor offers it: how a window comes
     /// forward with a token another program handed on.
@@ -89,6 +94,8 @@ impl WaylandState {
         let subcompositor =
             SubcompositorState::bind(compositor.wl_compositor().clone(), globals, qh)?;
 
+        let ext_background_effect_manager: Option<ExtBackgroundEffectManagerV1> =
+            globals.bind(qh, 1..=1, GlobalData).ok();
         let blur_manager: Option<OrgKdeKwinBlurManager> = globals.bind(qh, 1..=1, GlobalData).ok();
         let wayland_state = WaylandState {
             registry: RegistryState::new(globals),
@@ -122,6 +129,8 @@ impl WaylandState {
             primary_selection_source: None,
             shm,
             mem_pool: RefCell::new(mem_pool),
+            ext_background_effect_manager,
+            ext_background_blur_available: false,
             kde_blur_manager: blur_manager,
             activation: ActivationState::bind(globals, qh).ok(),
         };

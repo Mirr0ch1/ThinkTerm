@@ -96,6 +96,8 @@ pub struct XConnection {
     pub atom_net_wm_icon: Atom,
     pub atom_net_move_resize_window: Atom,
     pub atom_net_wm_moveresize: Atom,
+    /// KWin X11's private per-window blur request.
+    pub atom_kde_net_wm_blur_behind_region: Atom,
     pub atom_wm_change_state: Atom,
     pub atom_net_wm_cm: Atom,
     pub atom_net_supported: Atom,
@@ -730,6 +732,8 @@ impl XConnection {
         let atom_net_wm_icon = Self::intern_atom(&conn, "_NET_WM_ICON")?;
         let atom_net_move_resize_window = Self::intern_atom(&conn, "_NET_MOVERESIZE_WINDOW")?;
         let atom_net_wm_moveresize = Self::intern_atom(&conn, "_NET_WM_MOVERESIZE")?;
+        let atom_kde_net_wm_blur_behind_region =
+            Self::intern_atom(&conn, "_KDE_NET_WM_BLUR_BEHIND_REGION")?;
         let atom_wm_change_state = Self::intern_atom(&conn, "WM_CHANGE_STATE")?;
         let atom_net_wm_cm = Self::intern_atom(&conn, &format!("_NET_WM_CM_S{}", screen_num))?;
         let atom_net_supported = Self::intern_atom(&conn, "_NET_SUPPORTED")?;
@@ -868,6 +872,7 @@ impl XConnection {
             atom_net_wm_name,
             atom_net_move_resize_window,
             atom_net_wm_moveresize,
+            atom_kde_net_wm_blur_behind_region,
             atom_wm_change_state,
             atom_net_wm_cm,
             atom_net_supported,

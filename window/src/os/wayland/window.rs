@@ -42,6 +42,11 @@ use wayland_client::protocol::wl_region::WlRegion;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection as WConnection, Dispatch, Proxy, QueueHandle};
 use wayland_egl::{is_available as egl_is_available, WlEglSurface};
+use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1::{
+    Capability as BackgroundEffectCapability, Event as BackgroundEffectEvent,
+    ExtBackgroundEffectManagerV1,
+};
+use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1;
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur::OrgKdeKwinBlur;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur_manager::OrgKdeKwinBlurManager;
@@ -422,6 +427,7 @@ impl WaylandWindow {
 
             wegl_surface: None,
             gl_state: None,
+            background_effect: None,
         }));
 
         let window_handle = Window::Wayland(WaylandWindow(window_id));
@@ -431,14 +437,15 @@ impl WaylandWindow {
             .events
             .assign_window(window_handle.clone());
 
-        inner.borrow().update_window_background_blur();
-
         {
             let windows = &conn.wayland_state.borrow().windows;
             windows.borrow_mut().insert(window_id, inner.clone());
         };
 
         wait_configure.recv().await?;
+        // The xdg surface must be configured before it is committed, and the
+        // blur region is applied on a surface commit.
+        inner.borrow_mut().update_window_background_blur();
 
         // Nothing presents before the first configure, and a window that
         // never got one leaves no flag behind.
@@ -812,6 +819,9 @@ pub struct WaylandWindowInner {
     // libraries will segfault on shutdown
     wegl_surface: Option<WlEglSurface>,
     gl_state: Option<Rc<glium::backend::Context>>,
+    /// Kept for the window's lifetime: destroying it removes the blur on the
+    /// next commit, so it cannot be created and thrown away per config change.
+    background_effect: Option<ExtBackgroundEffectSurfaceV1>,
 }
 
 impl WaylandWindowInner {
@@ -1703,13 +1713,48 @@ impl WaylandWindowInner {
         self.update_window_background_blur();
     }
 
-    fn update_window_background_blur(&self) {
+    fn update_window_background_blur(&mut self) {
         let conn = WaylandConnection::get().unwrap().wayland();
         let qh = conn.event_queue.borrow().handle();
         let wayland_state = conn.wayland_state.borrow();
+        let enabled = self.config.background_blur_enabled()
+            && self.config.window_background_opacity < 1.0;
+        let Some(surface) = self.window.as_ref().map(|window| window.wl_surface().clone()) else {
+            return;
+        };
+
+        // GNOME 51, KWin 6.7 and the newer wlroots compositors speak the
+        // standard protocol. Plasma 6.6 and older only had KWin's own.
+        if let Some(manager) = wayland_state
+            .ext_background_effect_manager
+            .as_ref()
+            .filter(|_| wayland_state.ext_background_blur_available)
+        {
+            if enabled {
+                let effect = self.background_effect.get_or_insert_with(|| {
+                    manager.get_background_effect(&surface, &qh, GlobalData)
+                });
+                let region = wayland_state
+                    .compositor
+                    .wl_compositor()
+                    .create_region(&qh, GlobalData);
+                // The compositor clips this to the surface; a region that is
+                // always large enough needs no update on resize.
+                region.add(0, 0, i32::MAX, i32::MAX);
+                effect.set_blur_region(Some(&region));
+                region.destroy();
+            } else if let Some(effect) = self.background_effect.as_ref() {
+                effect.set_blur_region(None);
+            } else {
+                return;
+            }
+            surface.commit();
+            return;
+        }
+
         if let Some(manager) = &wayland_state.kde_blur_manager {
-            let kde_blur = manager.create(self.surface(), &qh, GlobalData);
-            if self.config.kde_window_background_blur {
+            let kde_blur = manager.create(&surface, &qh, GlobalData);
+            if enabled {
                 kde_blur.set_region(None);
             } else {
                 kde_blur.release();
@@ -1879,6 +1924,37 @@ impl WindowHandler for WaylandState {
         _serial: u32,
     ) {
         self.handle_window_event(window, WaylandWindowEvent::Request(configure));
+    }
+}
+
+impl Dispatch<ExtBackgroundEffectManagerV1, GlobalData> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _proxy: &ExtBackgroundEffectManagerV1,
+        event: <ExtBackgroundEffectManagerV1 as Proxy>::Event,
+        _data: &GlobalData,
+        _conn: &WConnection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let BackgroundEffectEvent::Capabilities { flags } = event {
+            if let Ok(flags) = flags.into_result() {
+                state.ext_background_blur_available =
+                    flags.contains(BackgroundEffectCapability::Blur);
+            }
+        }
+    }
+}
+
+impl Dispatch<ExtBackgroundEffectSurfaceV1, GlobalData> for WaylandState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtBackgroundEffectSurfaceV1,
+        _event: <ExtBackgroundEffectSurfaceV1 as Proxy>::Event,
+        _data: &GlobalData,
+        _conn: &WConnection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        // No events from the surface effect.
     }
 }
 
